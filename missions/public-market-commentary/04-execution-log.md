@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 13 / 34
+- Tasks completed: 14 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -140,3 +140,13 @@
 - Spec review: passed after signed spread impact and deterministic residual slippage made every BUY/SELL record reconstruct its final cent-rounded fill, fractional shares were supported, and sub-cent inputs/results failed closed.
 - Quality review: passed after every runtime input property was snapshotted exactly once before validation, arithmetic, and immutable audit projection; the final timeout-only harness adjustment received a clean narrow re-review.
 - Scope: decimal.js-backed pure v1 calculations for $0.005/share commission with a $1 minimum, observed or synthetic spread, 5-basis-point adverse slippage, 5%/365 UTC-day short borrow, componentized immutable audit records with normalized inputs and policy version, and no order lifecycle, execution, external call, clock, or randomness.
+
+### T14 — Enforce deterministic Challenge risk gates
+
+- Status: completed
+- Commit: `T14: add deterministic Challenge risk gates` (resolve the single-task commit from Git history)
+- Red: the focused test first failed before the risk module existed; later regressions exposed a source-scan false positive, arbitrary profile provenance, zero-position snapshots carrying existing risk/exposure/active-symbol/open-loss state, and one transient Windows PostgreSQL teardown contention before each product boundary was corrected or the harness symptom was isolated.
+- Green: 32 targeted risk-gate tests passed; the full suite passed 291/291 across 20 files; strict TypeScript, the Next.js production build, frozen install, diff/whitespace, and zero-active-test-PostgreSQL gates passed under Node 24.14.0 and pnpm 11.16.0.
+- Spec review: passed after exact v1 profile provenance binding and deterministic cross-field snapshot consistency checks were added without changing approved boundary semantics.
+- Quality review: passed after nonzero current open loss with zero pending/open positions joined the same fail-closed consistency boundary; Decimal limits, reason ordering, one-read inputs, and immutable results remained clean.
+- Scope: pure stable-order evaluation of Main-only actor, daily/overall loss, position/portfolio risk, gross notional, position count, and per-symbol duplication against one captured ledger snapshot, with optional exact audit provenance and no persistence, model override, execution, network, clock, or randomness.

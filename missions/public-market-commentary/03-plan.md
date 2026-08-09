@@ -833,7 +833,7 @@ Yes. The functions are pure and independent of order state.
 ### T14 — Enforce deterministic Challenge risk gates
 
 **Maps to:** R31, R33, R37, R40, R49, R83, R84
-**Files touched:** `lib/server/challenge/risk.ts` (new), `tests/challenge/risk-gates.test.ts` (new)
+**Files touched:** `lib/server/challenge/risk.ts` (new), `tests/challenge/risk-gates.test.ts` (new), `missions/public-market-commentary/debug-t14-source-scan.md` (new; mcax-debug artifact), `missions/public-market-commentary/debug-t14-full-suite-cleanup.md` (new; mcax-debug artifact), `missions/public-market-commentary/03-plan.md` (modify; approved debug scope expansions)
 
 #### Red — failing test
 
