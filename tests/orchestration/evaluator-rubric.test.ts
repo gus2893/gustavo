@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendMessage } from "../../lib/server/history/messages";
 import { appendEvent, readEventBody } from "../../lib/server/events/store";
 import { routeNodeReply } from "../../lib/server/node-brains/router";
+import { INITIAL_PROFILE } from "../../lib/server/challenge/profile";
 import {
   createDisclosureAuthorization,
   createProposal,
@@ -15,6 +16,7 @@ import {
   selectWinner,
 } from "../../lib/server/orchestration/rubric";
 import {
+  DECISION_POLICY_VERSION,
   commitMainBaseline,
   evaluationPacket,
   getDecisionWindow,
@@ -89,6 +91,64 @@ describe("approved evaluator rubric", () => {
       ],
     })).toBe("candidate_a");
   });
+
+  it("binds every decision window to an authoritative Challenge profile UUID", async () => {
+    const fixture = await createConversationFixture("decision-profile-binding");
+    const input = {
+      marketObservationIds: ["observation-profile-binding"],
+      evidence: [{ kind: "SOURCE_EVENT" as const, referenceId: randomUUID() }],
+      portfolioSnapshot: { cashCents: "250000", positions: [] },
+      costModelSnapshot: { policyVersion: "stock-etf-cost-v1" },
+      stageProfileVersion: INITIAL_PROFILE.profileVersionId,
+      eligibleInstruments: ["AAPL"],
+      idempotencyKey: "decision-profile-binding-valid",
+    };
+
+    const window = await openDecisionWindow({ db: fixture.db }, input);
+    expect(window.stageProfileVersion).toBe(INITIAL_PROFILE.profileVersionId);
+    expect(await fixture.db.one(
+      "select stage_profile_version::text as profile_id from decision_windows where id=$1",
+      [window.id],
+    )).toEqual({ profile_id: INITIAL_PROFILE.profileVersionId });
+
+    await expect(openDecisionWindow(
+      { db: fixture.db },
+      { ...input, stageProfileVersion: "challenge-profile-v1", idempotencyKey: "decision-profile-label" },
+    )).rejects.toThrow("DECISION_PROFILE_VERSION_INVALID");
+
+    const nonexistentProfileId = randomUUID();
+    await expect(openDecisionWindow(
+      { db: fixture.db },
+      { ...input, stageProfileVersion: nonexistentProfileId, idempotencyKey: "decision-profile-missing" },
+    )).rejects.toThrow("DECISION_PROFILE_VERSION_NOT_FOUND");
+    expect(await fixture.db.one(
+      "select count(*)::int as count from decision_windows",
+    )).toEqual({ count: 1 });
+
+    const directWindowId = randomUUID();
+    await expect(fixture.db.transaction(async (transaction) => {
+      const event = await appendEvent(transaction, {
+        aggregateId: directWindowId,
+        actor: { type: "SYSTEM", id: "gustavo-decision-orchestrator" },
+        type: "decision.window.opened",
+        visibility: "OPERATOR",
+        body: {},
+        idempotencyKey: "decision-profile-direct-event",
+        policyVersion: DECISION_POLICY_VERSION,
+      });
+      await transaction.query(
+        `insert into decision_windows (
+           id, market_observation_ids, evidence_count, portfolio_snapshot_digest,
+           cost_model_snapshot_digest, stage_profile_version, eligible_instruments,
+           snapshot_digest, opened_event_id, policy_version,
+           idempotency_key, request_digest, created_at
+         ) values ($1,$2::jsonb,1,$3,$3,$4,$5::jsonb,$3,$6,$7,$8,$3,$9)`,
+        [directWindowId, JSON.stringify(["observation-direct"]), "0".repeat(64),
+          nonexistentProfileId, JSON.stringify(["AAPL"]), event.id,
+          DECISION_POLICY_VERSION, "decision-profile-direct-window", event.occurredAt],
+      );
+    })).rejects.toThrow("DECISION_PROFILE_VERSION_NOT_FOUND");
+  }, 30_000);
 
   it("freezes the snapshot and Main baseline before blind scoring an authorized contender", async () => {
     const fixture = await createConversationFixture("decision-window");
@@ -187,7 +247,7 @@ describe("approved evaluator rubric", () => {
         evidence: [{ kind: "SOURCE_EVENT", referenceId: source.eventId }],
         portfolioSnapshot: mutablePortfolio,
         costModelSnapshot: { commissionMicrousdPerShare: "5000", slippageBps: 5 },
-        stageProfileVersion: "challenge-profile-v1",
+        stageProfileVersion: INITIAL_PROFILE.profileVersionId,
         eligibleInstruments: ["AAPL", "SPY"],
         idempotencyKey: "decision-window-open",
       },
@@ -449,8 +509,8 @@ describe("approved evaluator rubric", () => {
       [window.id],
     )).rejects.toThrow("IMMUTABLE_DECISION_SELECTION");
     await expect(fixture.db.query(
-      "update decision_windows set stage_profile_version='changed' where id=$1",
-      [window.id],
+      "update decision_windows set stage_profile_version=$2 where id=$1",
+      [window.id, randomUUID()],
     )).rejects.toThrow("IMMUTABLE_DECISION_WINDOW");
     await expect(fixture.db.query(
       "update decision_candidates set disposition='NO_PAPER_TRADE' where window_id=$1 and candidate_id='main'",
@@ -486,7 +546,7 @@ describe("approved evaluator rubric", () => {
         evidence: [{ kind: "SOURCE_EVENT", referenceId: source.eventId }],
         portfolioSnapshot: { cashCents: "250000", positions: [] },
         costModelSnapshot: { commissionMicrousdPerShare: "5000", slippageBps: 5 },
-        stageProfileVersion: "challenge-profile-v1",
+        stageProfileVersion: INITIAL_PROFILE.profileVersionId,
         eligibleInstruments: ["AAPL"],
         idempotencyKey: "decision-rollback-window",
       },
@@ -562,7 +622,7 @@ describe("approved evaluator rubric", () => {
         evidence: [{ kind: "SOURCE_EVENT", referenceId: source.eventId }],
         portfolioSnapshot: { cashCents: "250000", positions: [] },
         costModelSnapshot: { commissionMicrousdPerShare: "5000", slippageBps: 5 },
-        stageProfileVersion: "challenge-profile-v1",
+        stageProfileVersion: INITIAL_PROFILE.profileVersionId,
         eligibleInstruments: ["AAPL"],
         idempotencyKey: "decision-invalid-batch-window",
       },
@@ -689,7 +749,7 @@ describe("approved evaluator rubric", () => {
         evidence: [{ kind: "SOURCE_EVENT", referenceId: source.eventId }],
         portfolioSnapshot: { cashCents: "250000", positions: [] },
         costModelSnapshot: { commissionMicrousdPerShare: "5000", slippageBps: 5 },
-        stageProfileVersion: "challenge-profile-v1",
+        stageProfileVersion: INITIAL_PROFILE.profileVersionId,
         eligibleInstruments: ["AAPL"],
         idempotencyKey: "decision-concurrency-window",
       },

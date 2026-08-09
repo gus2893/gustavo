@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 11 / 34
+- Tasks completed: 12 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -120,3 +120,13 @@
 - Spec review: passed after corrections made freshness a frozen evaluated projection with exact millisecond boundaries and required completed bars to be temporally supported by their linked source observation in PostgreSQL.
 - Quality review: passed after corrections required a branded immutable provider-and-license authority, revalidated current license and redistribution rights at Challenge admission, bound Map-only allowlists to symbol and asset class, and deeply cloned/froze bounded JSON bar evidence.
 - Scope: canonical fixed-decimal US stock/ETF observations, canonical UTC timestamps, licensed raw-source provenance, delay/rights/session/freshness metadata, trusted current source authority, immutable completed bars versus provisional active bars, and no external provider calls, analysis, Challenge mutation, credentials, or execution.
+
+### T12 — Encode the approved Challenge profile and doubling ladder
+
+- Status: completed
+- Commit: `T12: add versioned Challenge profiles` (resolve the single-task commit from Git history)
+- Red: the focused test first failed before the Challenge profile module existed; later focused and upgrade regressions exposed parallel disposable-PostgreSQL timeout pressure, free-text evaluation provenance, unpublished/incomplete profile use, mutable stage collections, arbitrary legacy-label migration failure, broken cross-deployment idempotent replay, and a nullable predecessor-chain bypass before each boundary was corrected.
+- Green: 12 combined focused profile/upgrade/evaluator tests passed; the full suite passed 229/229 across 18 files; strict TypeScript, the Next.js production build, frozen install, `git diff --check`, trailing-whitespace, and zero-temporary-PostgreSQL gates passed under Node 24.14.0 and pnpm 11.16.0.
+- Spec review: passed after binding every decision window to the authoritative immutable profile UUID while preserving legacy encrypted-body digests and historical v1 references after later versions are appended.
+- Quality review: passed after immutable publication required all ten stages, profile/stage/publication writes serialized on shared row locks, published stages became closed to insertion, arbitrary old labels remained auditable through a real 0001–0008 to 0009 upgrade, exact old retries replayed safely, new legacy writes were rejected, and null-safe predecessor validation closed the SQL chain bypass.
+- Scope: one Main-owned account-independent Challenge, append-only versioned profiles, exact capped $2,500-to-$1,000,000 ladder, conservative integer-cent/basis-point arithmetic, approved 10%/6%/4%/3%/1%/0.25% rules, UTC reset, three qualifying days, no deadline, 1× gross exposure, US stocks/ETFs, three positions with one per symbol, exact profile provenance in later evaluations, and no execution or external calls.

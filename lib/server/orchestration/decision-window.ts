@@ -113,6 +113,8 @@ export interface DecisionSelection {
 
 interface WindowRow extends Record<string, unknown> {
   readonly id: string;
+  readonly legacy_stage_profile_label: string | null;
+  readonly stage_profile_version: string;
   readonly snapshot_digest: string;
   readonly opened_event_id: string;
   readonly policy_version: string;
@@ -255,7 +257,9 @@ function parseWindowBody(body: JsonValue): Omit<DecisionWindowProjection, "id" |
   const stageProfileVersion = boundedText(
     record.stageProfileVersion, 128, "DECISION_WINDOW_INTEGRITY_FAILURE",
   );
-  if (!PROFILE_PATTERN.test(stageProfileVersion)) throw new Error("DECISION_WINDOW_INTEGRITY_FAILURE");
+  if (!PROFILE_PATTERN.test(stageProfileVersion)) {
+    throw new Error("DECISION_WINDOW_INTEGRITY_FAILURE");
+  }
   const portfolioSnapshot = snapshotJson(record.portfolioSnapshot, "DECISION_WINDOW_INTEGRITY_FAILURE");
   const costModelSnapshot = snapshotJson(record.costModelSnapshot, "DECISION_WINDOW_INTEGRITY_FAILURE");
   const snapshotDigest = canonicalContentDigest({
@@ -273,12 +277,15 @@ async function hydrateWindow(database: EventDatabase, row: WindowRow): Promise<D
   const body = parseWindowBody(await readEventBody(database, row.opened_event_id, {
     actor: { role: "SYSTEM" },
   }));
-  if (!digestsEqual(body.snapshotDigest, row.snapshot_digest)) {
+  const storedProfileReference = row.legacy_stage_profile_label ?? row.stage_profile_version;
+  if (!digestsEqual(body.snapshotDigest, row.snapshot_digest)
+    || body.stageProfileVersion !== storedProfileReference) {
     throw new Error("DECISION_WINDOW_INTEGRITY_FAILURE");
   }
   return Object.freeze({
     id: row.id,
     ...body,
+    stageProfileVersion: row.stage_profile_version,
     openedEventId: row.opened_event_id,
     createdAt: new Date(row.created_at).toISOString(),
   });
@@ -295,10 +302,16 @@ export async function openDecisionWindow(
   const evidence = canonicalEvidenceReferences(input?.evidence, { max: 128, allowEmpty: false });
   const portfolioSnapshot = snapshotJson(input?.portfolioSnapshot, "DECISION_PORTFOLIO_SNAPSHOT_INVALID");
   const costModelSnapshot = snapshotJson(input?.costModelSnapshot, "DECISION_COST_SNAPSHOT_INVALID");
-  const stageProfileVersion = boundedText(
+  const suppliedProfileReference = boundedText(
     input?.stageProfileVersion, 128, "DECISION_PROFILE_VERSION_INVALID",
   );
-  if (!PROFILE_PATTERN.test(stageProfileVersion)) throw new Error("DECISION_PROFILE_VERSION_INVALID");
+  if (!PROFILE_PATTERN.test(suppliedProfileReference)) {
+    throw new Error("DECISION_PROFILE_VERSION_INVALID");
+  }
+  const authoritativeProfileId = UUID_PATTERN.test(suppliedProfileReference)
+    ? suppliedProfileReference.toLowerCase()
+    : null;
+  const stageProfileVersion = authoritativeProfileId ?? suppliedProfileReference;
   const eligibleInstruments = canonicalStrings(
     input?.eligibleInstruments, 128, INSTRUMENT_PATTERN, "DECISION_INSTRUMENTS_INVALID",
   );
@@ -310,11 +323,35 @@ export async function openDecisionWindow(
   const snapshotDigest = canonicalContentDigest(body);
   const requestDigest = canonicalContentDigest({ snapshotDigest });
   return database.transaction(async (transaction) => {
+    const priorClaim = await transaction.query<{ readonly exists: boolean }>(
+      `select exists(
+         select 1 from decision_operation_idempotency where idempotency_key=$1
+       ) as exists`,
+      [key],
+    );
+    if (!priorClaim[0]?.exists) {
+      if (!authoritativeProfileId) throw new Error("DECISION_PROFILE_VERSION_INVALID");
+      const profile = await transaction.query<{
+        readonly profile_exists: boolean;
+        readonly published: boolean;
+      }>(
+        `select exists(
+           select 1 from challenge_profile_versions where id=$1
+         ) as profile_exists,
+         exists(
+           select 1 from challenge_profile_publications where profile_version_id=$1
+         ) as published`,
+        [authoritativeProfileId],
+      );
+      if (!profile[0]?.profile_exists) throw new Error("DECISION_PROFILE_VERSION_NOT_FOUND");
+      if (!profile[0].published) throw new Error("DECISION_PROFILE_VERSION_NOT_PUBLISHED");
+    }
     await claimOperation(transaction, {
       key, operation: "WINDOW_OPEN", scope: "shared-challenge", requestDigest,
     });
     const existing = await transaction.query<WindowRow>(
-      `select id::text, snapshot_digest, opened_event_id::text, policy_version,
+      `select id::text, legacy_stage_profile_label, stage_profile_version::text, snapshot_digest,
+              opened_event_id::text, policy_version,
               request_digest, created_at from decision_windows where idempotency_key=$1`,
       [key],
     );
@@ -322,6 +359,7 @@ export async function openDecisionWindow(
       if (!digestsEqual(existing[0].request_digest, requestDigest)) throw new Error("DECISION_IDEMPOTENCY_KEY_REUSED");
       return hydrateWindow(transaction, existing[0]);
     }
+    if (!authoritativeProfileId) throw new Error("DECISION_PROFILE_VERSION_INVALID");
     const id = randomUUID();
     const event = await appendEvent(transaction, {
       aggregateId: id,
@@ -339,11 +377,13 @@ export async function openDecisionWindow(
          snapshot_digest, opened_event_id, policy_version,
          idempotency_key, request_digest, created_at
        ) values ($1,$2::jsonb,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13)
-       returning id::text, snapshot_digest, opened_event_id::text, policy_version,
+       returning id::text, legacy_stage_profile_label,
+                 stage_profile_version::text, snapshot_digest,
+                 opened_event_id::text, policy_version,
                  request_digest, created_at`,
       [id, JSON.stringify(marketObservationIds), evidence.length,
         canonicalContentDigest(portfolioSnapshot), canonicalContentDigest(costModelSnapshot),
-        stageProfileVersion, JSON.stringify(eligibleInstruments), snapshotDigest,
+        authoritativeProfileId, JSON.stringify(eligibleInstruments), snapshotDigest,
         event.id, DECISION_POLICY_VERSION, key, requestDigest, event.occurredAt],
     );
     return hydrateWindow(transaction, rows[0]);
@@ -357,7 +397,8 @@ export async function getDecisionWindow(
   const database = databaseFrom(context);
   const id = uuid(windowId, "DECISION_WINDOW_ID_INVALID");
   const rows = await database.query<WindowRow>(
-    `select id::text, snapshot_digest, opened_event_id::text, policy_version,
+    `select id::text, legacy_stage_profile_label, stage_profile_version::text, snapshot_digest,
+            opened_event_id::text, policy_version,
             request_digest, created_at from decision_windows where id=$1`,
     [id],
   );
@@ -468,7 +509,8 @@ async function hydrateCandidate(database: EventDatabase, row: CandidateRow): Pro
 
 async function windowRow(database: EventDatabase, windowId: string): Promise<WindowRow> {
   const rows = await database.query<WindowRow>(
-    `select id::text, snapshot_digest, opened_event_id::text, policy_version,
+    `select id::text, legacy_stage_profile_label, stage_profile_version::text, snapshot_digest,
+            opened_event_id::text, policy_version,
             request_digest, created_at from decision_windows where id=$1`,
     [windowId],
   );

@@ -722,7 +722,7 @@ Yes. It defines evidence truth and rights metadata without analysis logic.
 ### T12 — Encode the approved Challenge profile and doubling ladder
 
 **Maps to:** R28, R29, R30, R31, R83
-**Files touched:** `db/migrations/0009_challenge_profile.sql` (new), `lib/server/challenge/profile.ts` (new), `tests/challenge/profile.test.ts` (new)
+**Files touched:** `db/migrations/0009_challenge_profile.sql` (new), `lib/server/challenge/profile.ts` (new), `lib/server/orchestration/decision-window.ts` (modify), `tests/challenge/profile.test.ts` (new), `tests/challenge/profile-upgrade.test.ts` (new), `tests/orchestration/evaluator-rubric.test.ts` (modify), `missions/public-market-commentary/debug-t12-full-suite-timeout.md` (new; mcax-debug artifact)
 
 #### Red — failing test
 
