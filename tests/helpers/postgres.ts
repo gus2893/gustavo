@@ -23,9 +23,18 @@ const execFileAsync = promisify(execFile);
 const TEST_CLUSTER_PREFIX = "gustavo-postgres-";
 const originalRootKey = process.env.GUSTAVO_EVENT_ROOT_KEY_V1;
 const originalRootKeyVersion = process.env.GUSTAVO_EVENT_ROOT_KEY_VERSION;
+const originalCursorSigningKey = process.env.GUSTAVO_CURSOR_SIGNING_KEY;
 
 export interface TestDatabase extends EventDatabase {
   readonly schema: string;
+}
+
+export interface ConversationFixture {
+  readonly db: TestDatabase;
+  readonly accountId: string;
+  readonly nodeBrainId: string;
+  readonly conversationId: string;
+  readonly sessionToken: string;
 }
 
 interface PartialTestPostgresServer {
@@ -173,6 +182,11 @@ function restoreRootKeyEnvironment(): void {
     delete process.env.GUSTAVO_EVENT_ROOT_KEY_VERSION;
   } else {
     process.env.GUSTAVO_EVENT_ROOT_KEY_VERSION = originalRootKeyVersion;
+  }
+  if (originalCursorSigningKey === undefined) {
+    delete process.env.GUSTAVO_CURSOR_SIGNING_KEY;
+  } else {
+    process.env.GUSTAVO_CURSOR_SIGNING_KEY = originalCursorSigningKey;
   }
 }
 
@@ -377,11 +391,68 @@ export async function openTestDb(): Promise<TestDatabase> {
   }
   process.env.GUSTAVO_EVENT_ROOT_KEY_VERSION = "1";
   process.env.GUSTAVO_EVENT_ROOT_KEY_V1 = randomBytes(32).toString("base64");
+  process.env.GUSTAVO_CURSOR_SIGNING_KEY ??= randomBytes(32).toString("base64");
   return database;
 }
 
 export async function testContext(): Promise<{ readonly db: TestDatabase }> {
   return { db: await openTestDb() };
+}
+
+export async function createConversationFixture(
+  label: string,
+  database?: TestDatabase,
+): Promise<ConversationFixture> {
+  const db = database ?? await openTestDb();
+  const accountId = randomUUID();
+  const nodeBrainId = randomUUID();
+  const conversationId = randomUUID();
+  const sessionId = randomUUID();
+  const sessionToken = generateOpaqueToken();
+  const now = new Date();
+  const sessionExpiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1_000);
+
+  await db.transaction(async (transaction) => {
+    await transaction.query(
+      "insert into accounts (id, display_name, created_at) values ($1, $2, $3)",
+      [accountId, label, now],
+    );
+    await transaction.query(
+      `insert into entitlements (id, account_id, active_from, created_at)
+       values ($1, $2, $3, $3)`,
+      [randomUUID(), accountId, now],
+    );
+    await transaction.query(
+      `insert into node_brains (id, account_id, name, created_at)
+       values ($1, $2, $3, $4)`,
+      [nodeBrainId, accountId, `${label} Node`, now],
+    );
+    await transaction.query(
+      `insert into conversations (id, account_id, node_brain_id, created_at)
+       values ($1, $2, $3, $4)`,
+      [conversationId, accountId, nodeBrainId, now],
+    );
+    await transaction.query(
+      `insert into sessions
+        (id, account_id, token_hash, created_at, expires_at, last_rotated_at)
+       values ($1, $2, $3, $4, $5, $4)`,
+      [
+        sessionId,
+        accountId,
+        hashOpaqueToken(sessionToken),
+        now,
+        sessionExpiresAt,
+      ],
+    );
+  });
+
+  return {
+    db,
+    accountId,
+    nodeBrainId,
+    conversationId,
+    sessionToken,
+  };
 }
 
 export async function seedInvitation(

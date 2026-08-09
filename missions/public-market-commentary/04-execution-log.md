@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 4 / 34
+- Tasks completed: 5 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -50,3 +50,13 @@
 - Spec review: passed with no Critical or Important findings.
 - Quality review: passed with no Critical or Important findings.
 - Scope: exhaustive actor roles, authorization-first SQL filters, account ownership enforcement, irreversible public placeholder DTOs, minimum protected-role DTOs, structural response whitelisting, public-safe cache headers, and a public Route Handler with no protected-body or decryption path.
+
+### T5 — Persist native conversation turns and reconstruct paginated history
+
+- Status: completed
+- Commit: `T5: persist native conversation history` (resolve the single-task commit from Git history)
+- Red: the history integration test failed before the message service and conversation Route Handler existed; a later route regression failed before conflicting idempotency-key reuse mapped to HTTP 409.
+- Green: 7 targeted history tests passed; the full suite passed 29/29 across 9 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; zero temporary Gustavo PostgreSQL processes remained.
+- Spec review: passed with no Critical, Important, or optional findings.
+- Quality review: passed after one correction round that made conflicting idempotency reuse a stable non-leaking 409 while preserving exact replay and generic unexpected-failure 500s.
+- Scope: encrypted native turns linked to immutable events, atomic event/body/message/outbox commits, completion and abort metadata, account/conversation authorization, per-conversation idempotency, bounded UUIDv7 keyset pagination, HMAC-signed scope-bound cursors, private no-store GET/POST routes, origin protection, and rollback-safe acknowledgement.

@@ -346,7 +346,7 @@ Yes. It proves the principal content-protection boundary independently of UI ren
 ### T5 — Persist native conversation turns and reconstruct paginated history
 
 **Maps to:** R2, R15, R69
-**Files touched:** `db/migrations/0003_messages.sql` (new), `lib/server/history/messages.ts` (new), `app/api/conversations/[conversationId]/messages/route.ts` (new), `tests/helpers/postgres.ts` (modify), `tests/conversations/native-history.test.ts` (new)
+**Files touched:** `db/migrations/0003_messages.sql` (new), `lib/server/history/cursor.ts` (new), `lib/server/history/messages.ts` (new), `app/api/conversations/[conversationId]/messages/route.ts` (new), `tests/helpers/postgres.ts` (modify), `tests/conversations/native-history.test.ts` (new)
 
 #### Red — failing test
 
