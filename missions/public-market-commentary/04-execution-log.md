@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 7 / 34
+- Tasks completed: 8 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -80,3 +80,13 @@
 - Spec review: passed with no Critical or Important findings.
 - Quality review: passed after one correction round covering exact active account/entitlement/Node/conversation/source-message authorization and exactly-one routing decision across retries and concurrency.
 - Scope: deterministic Main-default, non-canonical Node-exploration, and upstream-proposal modes; hard exclusion of agreement/popularity/repetition/payment; confidence and provenance metadata; transactional authorization and durable `node.reply.routed` persistence before generation; canonical bounded sources; inherited correlation; and internal `node-route:<source-event-id>` idempotency.
+
+### T8 — Commit one Main-authored broadcast before fan-out
+
+- Status: completed
+- Commit: `T8: add immutable Main broadcasts` (resolve the single-task commit from Git history)
+- Red: the initial test failed before broadcast modules existed; focused policy, transport-idempotency, request-bound, locale-authority, audit-chain, Unicode/confusable, claim-polarity, clause-scope, and capitalization regressions then failed before each boundary was corrected.
+- Green: 82 targeted broadcast tests passed; the full suite passed 187/187 across 13 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; zero temporary Gustavo PostgreSQL processes remained.
+- Spec review: passed with no Critical or Important findings.
+- Quality review: passed after correction rounds covering normalized commit-time editorial policy, canonical locale authority, full transport request idempotency, bounded route inputs, delivery audit causation/policy, clause-local certainty polarity, protected Unicode confusables, context-aware action language, and case-independent directive handling.
+- Scope: immutable versioned Main state and broadcasts, Main-only authorship, canonical sources and shared content integrity, policy-validated semantic bodies, per-account delivery projections with transport-only metadata, active entitlement/Node authorization, event/outbox/projection atomicity, SQL mutation guards, concurrency-safe idempotency, bounded private no-store route input, and no Node-authored body or external validation call.

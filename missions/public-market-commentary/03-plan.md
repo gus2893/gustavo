@@ -505,7 +505,7 @@ Yes. It contains only routing policy and its audit shape.
 ### T8 — Commit one Main-authored broadcast before fan-out
 
 **Maps to:** R15, R43, R44, R49
-**Files touched:** `db/migrations/0005_broadcasts.sql` (new), `lib/server/main-brain/broadcasts.ts` (new), `app/api/broadcasts/route.ts` (new), `tests/broadcasts/main-authorship.test.ts` (new)
+**Files touched:** `db/migrations/0005_broadcasts.sql` (new), `lib/server/events/integrity.ts` (new), `lib/server/events/store.ts` (modify), `lib/server/main-brain/editorial-validator.ts` (new), `lib/server/main-brain/broadcasts.ts` (new), `app/api/broadcasts/route.ts` (new), `tests/broadcasts/main-authorship.test.ts` (new), `tests/broadcasts/editorial-validator.test.ts` (new)
 
 #### Red — failing test
 

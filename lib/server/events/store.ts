@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import {
   createAndWrapDataKey,
   decryptEventBody,
@@ -15,6 +15,11 @@ import type {
   JsonValue,
   StoredEvent,
 } from "./types";
+import {
+  canonicalContentDigest,
+  canonicalJson,
+  digestsEqual,
+} from "./integrity";
 
 interface EventRow extends Record<string, unknown> {
   id: string;
@@ -105,52 +110,6 @@ function requireNonEmpty(value: string, field: string): string {
     throw new Error(`INVALID_EVENT_${field.toUpperCase()}`);
   }
   return value;
-}
-
-function canonicalize(value: unknown, ancestors: Set<object>): string {
-  if (value === null) {
-    return "null";
-  }
-  if (typeof value === "string" || typeof value === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      throw new Error("INVALID_JSON_NUMBER");
-    }
-    return JSON.stringify(value);
-  }
-  if (typeof value !== "object") {
-    throw new Error("INVALID_JSON_VALUE");
-  }
-  if (ancestors.has(value)) {
-    throw new Error("CYCLIC_JSON_VALUE");
-  }
-  ancestors.add(value);
-  try {
-    if (Array.isArray(value)) {
-      return `[${value.map((entry) => canonicalize(entry, ancestors)).join(",")}]`;
-    }
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new Error("INVALID_JSON_OBJECT");
-    }
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalize(record[key], ancestors)}`)
-      .join(",")}}`;
-  } finally {
-    ancestors.delete(value);
-  }
-}
-
-function canonicalJson(value: unknown): string {
-  return canonicalize(value, new Set<object>());
-}
-
-function sha256(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function requestDocument(input: AppendEventInput, accountId: string | null): unknown {
@@ -276,7 +235,7 @@ export async function appendEvent(
   requireNonEmpty(input.type, "type");
   requireNonEmpty(input.idempotencyKey, "idempotency_key");
   const accountId = eventOwner(input);
-  const requestHash = sha256(canonicalJson(requestDocument(input, accountId)));
+  const requestHash = canonicalContentDigest(requestDocument(input, accountId));
 
   return database.transaction(async (transaction) => {
     await transaction.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
@@ -356,7 +315,9 @@ export async function appendEvent(
       policyVersion: input.policyVersion ?? null,
     };
     const canonicalBody = canonicalJson(input.body);
-    const integrityHash = sha256(canonicalJson(integrityDocument(eventWithoutHash, input.body)));
+    const integrityHash = canonicalContentDigest(
+      integrityDocument(eventWithoutHash, input.body),
+    );
     const encrypted = encryptEventBody(
       id,
       integrityHash,
@@ -456,30 +417,26 @@ export async function readEventBody(
     dataKey,
   );
   const body = JSON.parse(plaintext.toString("utf8")) as JsonValue;
-  const calculatedHash = sha256(
-    canonicalJson(
-      integrityDocument(
-        {
-          id: event.id,
-          aggregateId: event.aggregateId,
-          accountId: event.accountId,
-          actor: event.actor,
-          type: event.type,
-          visibility: event.visibility,
-          occurredAt: event.occurredAt,
-          causationId: event.causationId,
-          correlationId: event.correlationId,
-          promptVersion: event.promptVersion,
-          modelVersion: event.modelVersion,
-          policyVersion: event.policyVersion,
-        },
-        body,
-      ),
+  const calculatedHash = canonicalContentDigest(
+    integrityDocument(
+      {
+        id: event.id,
+        aggregateId: event.aggregateId,
+        accountId: event.accountId,
+        actor: event.actor,
+        type: event.type,
+        visibility: event.visibility,
+        occurredAt: event.occurredAt,
+        causationId: event.causationId,
+        correlationId: event.correlationId,
+        promptVersion: event.promptVersion,
+        modelVersion: event.modelVersion,
+        policyVersion: event.policyVersion,
+      },
+      body,
     ),
   );
-  const expected = Buffer.from(event.integrityHash, "hex");
-  const actual = Buffer.from(calculatedHash, "hex");
-  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+  if (!digestsEqual(event.integrityHash, calculatedHash)) {
     throw new Error("EVENT_INTEGRITY_FAILURE");
   }
   return body;
