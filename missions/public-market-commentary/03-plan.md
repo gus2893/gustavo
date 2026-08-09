@@ -778,7 +778,7 @@ Yes. It adds configuration and pure arithmetic only.
 ### T13 — Calculate the approved stock/ETF simulation costs
 
 **Maps to:** R31, R86
-**Files touched:** `lib/server/challenge/costs.ts` (new), `tests/challenge/cost-model.test.ts` (new)
+**Files touched:** `lib/server/challenge/costs.ts` (new), `tests/challenge/cost-model.test.ts` (new), `package.json` (modify), `pnpm-lock.yaml` (modify), `tests/market-data/observation-policy.test.ts` (modify; test-harness timeout only), `missions/public-market-commentary/debug-t13-node-path.md` (new; mcax-debug artifact), `missions/public-market-commentary/debug-t13-market-data-suite-timeout.md` (new; mcax-debug artifact)
 
 #### Red — failing test
 

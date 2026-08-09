@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 12 / 34
+- Tasks completed: 13 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -130,3 +130,13 @@
 - Spec review: passed after binding every decision window to the authoritative immutable profile UUID while preserving legacy encrypted-body digests and historical v1 references after later versions are appended.
 - Quality review: passed after immutable publication required all ten stages, profile/stage/publication writes serialized on shared row locks, published stages became closed to insertion, arbitrary old labels remained auditable through a real 0001–0008 to 0009 upgrade, exact old retries replayed safely, new legacy writes were rejected, and null-safe predecessor validation closed the SQL chain bypass.
 - Scope: one Main-owned account-independent Challenge, append-only versioned profiles, exact capped $2,500-to-$1,000,000 ladder, conservative integer-cent/basis-point arithmetic, approved 10%/6%/4%/3%/1%/0.25% rules, UTC reset, three qualifying days, no deadline, 1× gross exposure, US stocks/ETFs, three positions with one per symbol, exact profile provenance in later evaluations, and no execution or external calls.
+
+### T13 — Calculate the approved stock/ETF simulation costs
+
+- Status: completed
+- Commit: `T13: add deterministic simulation costs` (resolve the single-task commit from Git history)
+- Red: the focused test first failed before the cost module existed; later regressions exposed oversized decimal input, independently rounded components that could not reconstruct fills, unsigned favorable spread, an unapproved whole-share restriction, sub-cent zero fills, mutable-getter audit drift, a system-Node child-process mismatch, and full-suite disposable-database timeout pressure before each boundary was corrected or isolated.
+- Green: 30 targeted cost-model tests passed; the full suite passed 259/259 across 19 files; strict TypeScript, the Next.js production build, frozen install, `git diff --check`, trailing-whitespace, and zero-temporary-PostgreSQL gates passed under Node 24.14.0 and pnpm 11.16.0.
+- Spec review: passed after signed spread impact and deterministic residual slippage made every BUY/SELL record reconstruct its final cent-rounded fill, fractional shares were supported, and sub-cent inputs/results failed closed.
+- Quality review: passed after every runtime input property was snapshotted exactly once before validation, arithmetic, and immutable audit projection; the final timeout-only harness adjustment received a clean narrow re-review.
+- Scope: decimal.js-backed pure v1 calculations for $0.005/share commission with a $1 minimum, observed or synthetic spread, 5-basis-point adverse slippage, 5%/365 UTC-day short borrow, componentized immutable audit records with normalized inputs and policy version, and no order lifecycle, execution, external call, clock, or randomness.

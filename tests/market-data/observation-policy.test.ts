@@ -490,5 +490,5 @@ describe("market observation policy", () => {
       "delete from market_bars where id=$1",
       [activeId],
     )).rejects.toThrow("IMMUTABLE_COMPLETED_MARKET_BAR");
-  }, 15_000);
+  }, 30_000);
 });
