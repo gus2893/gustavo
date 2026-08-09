@@ -1,0 +1,39 @@
+{
+  "asOfIsoUtc": "2026-08-08T23:49:40.016Z",
+  "universeReady": 95,
+  "universeMapped": 95,
+  "activeOrPendingPaperTrades": [],
+  "providers": {
+    "crypto": "Coinbase live public exchange data",
+    "nonCrypto": "Yahoo potentially delayed public intraday data; relevant sessions were closed"
+  },
+  "candidates": [
+    {
+      "symbol": "ETH-USD",
+      "observedPrice": 1917.18,
+      "quality": "standard",
+      "status": "NO TRADE",
+      "reason": "Inside confirmed 1911.30-1917.42 structure; no completed breakout and retest"
+    },
+    {
+      "symbol": "ADA-USD",
+      "observedPrice": 0.1994,
+      "quality": "standard",
+      "status": "SETUP FORMING",
+      "sourceKey": "scan:ADA-USD:1786231800:long:19931-breakout-retest-forming",
+      "reason": "23:30 UTC candle completed above 0.19930-0.19931; active retest was unfinished"
+    },
+    {
+      "symbol": "XRP-USD",
+      "observedPrice": 1.0385,
+      "quality": "standard",
+      "status": "SETUP FORMING",
+      "sourceKey": "scan:XRP-USD:1786229100:short:10386-zone-break-retest-forming",
+      "reason": "Retest closed exactly at the 1.0386 resistance edge; no clear completed rejection"
+    }
+  ],
+  "syncedPotentialSetupCards": 2,
+  "paperOrderPlaced": false,
+  "jsonExportCreated": false
+}
+

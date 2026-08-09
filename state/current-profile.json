@@ -1,0 +1,59 @@
+{
+  "asOfIsoUtc": "2026-08-08T23:49:40.016Z",
+  "profileStartEpochMs": 1786113002011,
+  "startingEquityUsd": 5000,
+  "targetEquityUsd": 5500,
+  "realizedPnlUsd": -255.3959113322917,
+  "simulatedEquityUsd": 4744.604088667708,
+  "distanceToTargetUsd": 755.3959113322917,
+  "distanceAboveInternalFloorUsd": 14.6040886677081,
+  "pendingTradeCount": 0,
+  "openTradeCount": 0,
+  "riskDay": {
+    "startIsoUtc": "2026-08-08T00:05:00Z",
+    "realizedLossesUsd": 75,
+    "openLossesUsd": 0,
+    "remainingPendingAndOpenStopRiskUsd": 0,
+    "portfolioRiskUsd": 75,
+    "fullStoppedAttempts": 1,
+    "maximumFullStoppedAttempts": 2
+  },
+  "trades": [
+    {
+      "symbol": "V",
+      "sourceKey": "scan:V:1786113900:long:365.25-zone-rejection",
+      "status": "stopped",
+      "riskUsd": 52.019,
+      "pnlContributionUsd": -52.019
+    },
+    {
+      "symbol": "USDJPY",
+      "sourceKey": "scan:USDJPY:1786114800:short:157.814-zone-rejection",
+      "status": "cancelled",
+      "riskUsd": 75,
+      "pnlContributionUsd": 0
+    },
+    {
+      "symbol": "USOIL",
+      "sourceKey": "scan:USOIL:1786118400:short:78.43-zone-rejection",
+      "status": "stopped",
+      "riskUsd": 75,
+      "pnlContributionUsd": -75
+    },
+    {
+      "symbol": "RUSSELL2000",
+      "sourceKey": "scan:RUSSELL2000:1786125600:short:3032.22-zone-rejection",
+      "status": "stopped",
+      "riskUsd": 53.376911332291684,
+      "pnlContributionUsd": -53.376911332291684
+    },
+    {
+      "symbol": "AVAX-USD",
+      "sourceKey": "scan:AVAX-USD:1786217400:long:6.518-breakout-retest-forming",
+      "status": "stopped",
+      "riskUsd": 75,
+      "pnlContributionUsd": -75
+    }
+  ]
+}
+
