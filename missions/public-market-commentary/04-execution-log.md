@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 6 / 34
+- Tasks completed: 7 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -70,3 +70,13 @@
 - Spec review: passed after correction rounds covering automatic production identity validation, exact reservation-month finalization, non-cooperative cancellation, provider-overrun evidence, and cleanup from every streaming lifecycle entry point.
 - Quality review: passed after adversarial correction rounds covering fail-closed budget accounting, immutable request/config/event/usage snapshots, provider error sanitization, pre-yield output limits, PostgreSQL numeric bounds, best-effort iterator cleanup, and sticky concurrent budget saturation.
 - Scope: provider-neutral streaming for Main/Node/Evaluator roles, validated production role identities, prompt/policy version metadata, correlation IDs, fully audited terminal states, concurrency-safe monthly role budgets, per-call ceilings, conservative reservations and actual-cost accounting, deterministic fake-provider tests, and no prompt/output/hidden-reasoning persistence or external model calls.
+
+### T7 — Route Node replies through exactly one approved mode
+
+- Status: completed
+- Commit: `T7: add deterministic Node routing` (resolve the single-task commit from Git history)
+- Red: the router test failed before Node routing modules existed; integration regressions later failed before authoritative identity/message authorization, canonical sources, and internally derived per-message idempotency were implemented.
+- Green: 38 targeted routing tests passed; the full suite passed 105/105 across 11 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; zero temporary Gustavo PostgreSQL processes remained.
+- Spec review: passed with no Critical or Important findings.
+- Quality review: passed after one correction round covering exact active account/entitlement/Node/conversation/source-message authorization and exactly-one routing decision across retries and concurrency.
+- Scope: deterministic Main-default, non-canonical Node-exploration, and upstream-proposal modes; hard exclusion of agreement/popularity/repetition/payment; confidence and provenance metadata; transactional authorization and durable `node.reply.routed` persistence before generation; canonical bounded sources; inherited correlation; and internal `node-route:<source-event-id>` idempotency.
