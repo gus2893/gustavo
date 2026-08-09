@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 3 / 34
+- Tasks completed: 4 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -40,3 +40,13 @@
 - Spec review: passed with no Critical or Important findings.
 - Quality review: passed after two correction rounds covering native Argon2 runtime compatibility, KDF abuse resistance, concurrent redemption, secure Route Handler cookies, fresh database-time expiry validation, and non-leaking HTTP error classification.
 - Scope: hashed single-use invitations, accounts, Argon2id credentials, entitlements, one account/one Node Brain/one conversation constraints, opaque hashed sessions with rotation/revocation/expiry, operator-only issuance auditing, production origin checks, and secure `__Host-` session cookies.
+
+### T4 — Enforce public and account DTO boundaries before projection
+
+- Status: completed
+- Commit: `T4: enforce feed data boundaries` (resolve the single-task commit from Git history)
+- Red: the feed-boundary test failed before the authorization and feed DAL modules existed.
+- Green: 7 targeted boundary tests passed; the full suite passed 22/22 across 8 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; zero temporary Gustavo PostgreSQL processes remained.
+- Spec review: passed with no Critical or Important findings.
+- Quality review: passed with no Critical or Important findings.
+- Scope: exhaustive actor roles, authorization-first SQL filters, account ownership enforcement, irreversible public placeholder DTOs, minimum protected-role DTOs, structural response whitelisting, public-safe cache headers, and a public Route Handler with no protected-body or decryption path.
