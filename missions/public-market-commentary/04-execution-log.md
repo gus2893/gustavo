@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 14 / 34
+- Tasks completed: 15 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -150,3 +150,13 @@
 - Spec review: passed after exact v1 profile provenance binding and deterministic cross-field snapshot consistency checks were added without changing approved boundary semantics.
 - Quality review: passed after nonzero current open loss with zero pending/open positions joined the same fail-closed consistency boundary; Decimal limits, reason ordering, one-read inputs, and immutable results remained clean.
 - Scope: pure stable-order evaluation of Main-only actor, daily/overall loss, position/portfolio risk, gross notional, position count, and per-symbol duplication against one captured ledger snapshot, with optional exact audit provenance and no persistence, model override, execution, network, clock, or randomness.
+
+### T15 — Derive Challenge accounting from an immutable ledger
+
+- Status: completed
+- Commit: `T15: add immutable Challenge ledger replay` (resolve the single-task commit from Git history)
+- Red: the focused suite first failed before ledger modules existed; later regressions exposed incompatible stored/reducer event shapes, profile-balance and Main-identity bypasses, incomplete typed-source parity, orphan/invalid close history, numeric JSON coercion, invalid stream ordering, noncanonical timestamps, hostile payload/checkpoint inputs, future-profile prelude failure, dependency-sequence gaps, post-close position reuse, and reproducible Windows test-cluster cleanup pressure before each boundary was corrected.
+- Green: 57 focused ledger tests and 4 cleanup-lifecycle tests passed; the full suite passed 350/350 across 21 files; strict TypeScript, the Next.js production build, frozen install, `git diff --check`, trailing-whitespace, and zero-owned-test-process gates passed under Node 24.14.0 and pnpm 11.16.0.
+- Spec review: passed after real append/load/replay, stage/profile balance binding, exact Main authority, deferred typed-source completeness, full payload/source parity, immutable position closures, and canonical fixed-decimal JSON made every accepted source history replayable.
+- Quality review: passed after sequence-aware fill/closure/mark capacity and liveness, valid lifecycle preludes, strict round-trip timestamps, bounded canonical JSON snapshots, successor-stage causation, full licensed mark provenance, and recomputed monotonic checkpoints closed all adversarial and concurrent integrity gaps.
+- Scope: append-only shared Challenge stages/events/intents/orders/fills/positions/closures/marks/fees/financing/rule evaluations; exact fixed-decimal replay of balance, equity, realized/unrealized P&L, peak, exposure, drawdown, positions, and high-water state; disposable event-bound checkpoints; stage-locked sequence/idempotency; bounded provenance-preserving payloads; and no broker, exchange, external execution, model, credential, or network behavior. The accepted-risk-evaluation-to-order gate remains explicitly assigned to T16.

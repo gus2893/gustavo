@@ -897,7 +897,7 @@ Yes. It is pure policy evaluation with no persistence side effects.
 ### T15 — Derive Challenge accounting from an immutable ledger
 
 **Maps to:** R32, R51, R83
-**Files touched:** `db/migrations/0010_challenge_ledger.sql` (new), `lib/server/challenge/ledger.ts` (new), `lib/server/challenge/projection.ts` (new), `tests/challenge/ledger-replay.test.ts` (new)
+**Files touched:** `db/migrations/0010_challenge_ledger.sql` (new), `lib/server/challenge/ledger.ts` (new), `lib/server/challenge/projection.ts` (new), `tests/challenge/ledger-replay.test.ts` (new), `tests/helpers/postgres.ts` (authorized cleanup fix), `tests/helpers/postgres-lifecycle.test.ts` (authorized cleanup regression), `missions/public-market-commentary/debug-t15-checkpoint-fk.md` (authorized debug artifact), `missions/public-market-commentary/debug-t15-typecheck.md` (authorized debug artifact), `missions/public-market-commentary/debug-t15-full-suite-cleanup.md` (authorized debug artifact), `missions/public-market-commentary/debug-t15-json-type-guards.md` (authorized debug artifact)
 
 #### Red — failing test
 

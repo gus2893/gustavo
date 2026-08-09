@@ -61,6 +61,11 @@ interface SchemaResource {
   readonly pool: Pool;
 }
 
+interface SchemaCleanupAction {
+  readonly type: "close" | "drop";
+  readonly name: string;
+}
+
 let serverPromise: Promise<TestPostgresServer> | undefined;
 let partialServer: PartialTestPostgresServer | undefined;
 const schemas: SchemaResource[] = [];
@@ -85,6 +90,23 @@ export async function runCleanupSteps(steps: readonly CleanupStep[]): Promise<vo
       `TEST_RESOURCE_CLEANUP_FAILED:${failures.map(({ name }) => name).join(",")}`,
     );
   }
+}
+
+function planSchemaCleanupActions(
+  schemaNames: readonly string[],
+  includeDrops: boolean,
+): SchemaCleanupAction[] {
+  return schemaNames.flatMap((name) => [
+    { type: "close" as const, name },
+    ...(includeDrops ? [{ type: "drop" as const, name }] : []),
+  ]);
+}
+
+export function planSchemaCleanupActionsForTest(
+  schemaNames: readonly string[],
+  includeDrops: boolean,
+): SchemaCleanupAction[] {
+  return planSchemaCleanupActions(schemaNames, includeDrops);
 }
 
 function executable(directory: string, name: string): string {
@@ -172,6 +194,26 @@ function assertSafeDataDirectory(dataDirectory: string): void {
   }
 }
 
+function removePostgresTempDirectory(
+  dataDirectory: string,
+  removeDirectory: typeof rmSync = rmSync,
+): void {
+  assertSafeDataDirectory(dataDirectory);
+  removeDirectory(dataDirectory, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 100,
+  });
+}
+
+export function removePostgresTempDirectoryForTest(
+  dataDirectory: string,
+  removeDirectory: typeof rmSync,
+): void {
+  removePostgresTempDirectory(dataDirectory, removeDirectory);
+}
+
 function restoreRootKeyEnvironment(): void {
   if (originalRootKey === undefined) {
     delete process.env.GUSTAVO_EVENT_ROOT_KEY_V1;
@@ -210,10 +252,7 @@ function serverCleanupSteps(server: PartialTestPostgresServer): CleanupStep[] {
   }
   steps.push({
     name: "remove postgres temp directory",
-    run: () => {
-      assertSafeDataDirectory(server.dataDirectory);
-      rmSync(server.dataDirectory, { recursive: true, force: true });
-    },
+    run: () => removePostgresTempDirectory(server.dataDirectory),
   });
   return steps;
 }
@@ -490,16 +529,24 @@ afterAll(async () => {
     : undefined;
   const server = resolvedServer ?? partialServer;
   const steps: CleanupStep[] = [];
-  for (const resource of schemas) {
-    steps.push({ name: `close schema pool:${resource.name}`, run: () => resource.pool.end() });
-    if (server?.admin) {
+  const schemaAdmin = server?.admin;
+  const resourcesByName = new Map(schemas.map((resource) => [resource.name, resource]));
+  const schemaActions = planSchemaCleanupActions(
+    schemas.map((resource) => resource.name),
+    Boolean(schemaAdmin && server && !server.started),
+  );
+  for (const action of schemaActions) {
+    const resource = resourcesByName.get(action.name)!;
+    if (action.type === "close") {
+      steps.push({ name: `close schema pool:${resource.name}`, run: () => resource.pool.end() });
+    } else {
       steps.push({
         name: `drop schema:${resource.name}`,
         run: async () => {
           if (!/^test_[a-f0-9]{32}$/.test(resource.name)) {
             throw new Error("UNSAFE_TEST_SCHEMA_NAME");
           }
-          await server.admin!.query(`drop schema if exists ${resource.name} cascade`);
+          await schemaAdmin!.query(`drop schema if exists ${resource.name} cascade`);
         },
       });
     }

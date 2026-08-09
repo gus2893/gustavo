@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  planSchemaCleanupActionsForTest,
+  removePostgresTempDirectoryForTest,
   runCleanupSteps,
   startTestPostgresWithOverridesForTest,
 } from "./postgres";
@@ -45,6 +47,47 @@ describe("test PostgreSQL lifecycle cleanup", () => {
       "remove temp directory",
       "restore environment",
     ]);
+  });
+
+  it("does not serially drop schemas before discarding their owned cluster", () => {
+    const schemaNames = Array.from(
+      { length: 59 },
+      (_, index) => `test_${index.toString().padStart(32, "0")}`,
+    );
+
+    expect(planSchemaCleanupActionsForTest(schemaNames, false)).toEqual(
+      schemaNames.map((name) => ({ type: "close", name })),
+    );
+    expect(planSchemaCleanupActionsForTest(schemaNames.slice(0, 2), true)).toEqual([
+      { type: "close", name: schemaNames[0] },
+      { type: "drop", name: schemaNames[0] },
+      { type: "close", name: schemaNames[1] },
+      { type: "drop", name: schemaNames[1] },
+    ]);
+  });
+
+  it("uses bounded native retries for transient Windows directory locks", () => {
+    const dataDirectory = mkdtempSync(join(tmpdir(), "gustavo-postgres-retry-"));
+    let receivedOptions: Parameters<typeof rmSync>[1];
+    try {
+      removePostgresTempDirectoryForTest(
+        dataDirectory,
+        (_path, options) => {
+          receivedOptions = options;
+        },
+      );
+
+      expect(receivedOptions!).toMatchObject({
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 100,
+      });
+    } finally {
+      if (existsSync(dataDirectory)) {
+        rmSync(dataDirectory, { recursive: true, force: true });
+      }
+    }
   });
 
   it("removes a registered directory and restores keys when port reservation fails", async () => {
