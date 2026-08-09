@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 9 / 34
+- Tasks completed: 10 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -100,3 +100,13 @@
 - Spec review: passed after correction rounds covering current account-graph authorization before ciphertext reads, exact source disclosure, fail-closed market evidence until T11, evaluator-run causation, and app/SQL status authority.
 - Quality review: passed after correction rounds covering evaluator-only queueing, Main accept/reject only after evaluator queueing, short and multi-token private values with explicit scoped consent, numeric Main-state ordering, and app/SQL evidence-reference resolution.
 - Scope: immutable pseudonymous Node proposals, exact source and routing provenance, separately authorized/revocable private excerpts, canonical evidence and counterevidence, bounded clarification and review turns, evaluator-gated decision states, global operation idempotency, private no-store proposal creation route, SQL integrity/immutability triggers, and no Main-state or Challenge mutation capability.
+
+### T10 — Blind-score Main and Node theses with the approved rubric
+
+- Status: completed
+- Commit: `T10: add blind decision arbitration` (resolve the single-task commit from Git history)
+- Red: the rubric test first failed before the T10 modules existed; later focused regressions exposed a PostgreSQL keyword parse failure, event-body type mismatch, mixed evaluator provenance under sequential and concurrent inserts, downstream private-text persistence, actionable `NO_PAPER_TRADE`, unstable retry errors, and incomplete SQL phase authority before each boundary was corrected.
+- Green: 4 targeted evaluator tests passed; the full suite passed 212/212 across 15 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; zero temporary Gustavo PostgreSQL processes remained.
+- Spec review: passed after a two-connection regression led to one immutable evaluation-batch authority per window for evaluator run/event/prompt/model/policy provenance.
+- Quality review: passed after corrections made private-text access live and revocable, carried candidate disposition through app/SQL selection, returned deterministic replay/closed-window outcomes, and locked every database phase transition on the decision-window row.
+- Scope: immutable market/portfolio/cost/profile snapshots, Main-before-contender commitments, pseudonymous evaluator packets, rubric weights 25/20/20/15/10/10, hard-gate precedence, threshold 80, margin 5, deterministic tie handling, atomic evaluator/selection audit events, concurrency-safe one-pass provenance, revocable disclosure references without plaintext copying, and no Main-state or Challenge mutation.

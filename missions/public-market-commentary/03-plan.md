@@ -616,7 +616,7 @@ Yes. It creates the proposal/review record without selecting a winner.
 ### T10 — Blind-score Main and Node theses with the approved rubric
 
 **Maps to:** R5, R6, R10, R38, R39, R40, R41, R42, R49
-**Files touched:** `db/migrations/0007_evaluations.sql` (new), `lib/server/orchestration/rubric.ts` (new), `lib/server/orchestration/decision-window.ts` (new), `tests/orchestration/evaluator-rubric.test.ts` (new)
+**Files touched:** `db/migrations/0007_evaluations.sql` (new), `lib/server/orchestration/rubric.ts` (new), `lib/server/orchestration/decision-window.ts` (new), `tests/orchestration/evaluator-rubric.test.ts` (new), `missions/public-market-commentary/debug-t10-window-keyword.md` (new), `missions/public-market-commentary/debug-t10-evaluation-json-type.md` (new), `missions/public-market-commentary/debug-t10-mixed-evaluator-provenance.md` (new), `missions/public-market-commentary/debug-t10-quality-boundaries.md` (new)
 
 #### Red — failing test
 
