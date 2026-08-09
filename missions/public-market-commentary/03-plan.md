@@ -556,7 +556,7 @@ Yes. It isolates broadcast authorship and immutability.
 ### T9 — Persist privacy-safe Node proposals and bounded debate turns
 
 **Maps to:** R4, R5, R9, R37, R41, R48
-**Files touched:** `db/migrations/0006_proposals.sql` (new), `lib/server/orchestration/proposals.ts` (new), `app/api/proposals/route.ts` (new), `tests/orchestration/proposal-contract.test.ts` (new)
+**Files touched:** `db/migrations/0006_proposals.sql` (new), `lib/server/orchestration/evidence.ts` (new), `lib/server/orchestration/proposals.ts` (new), `lib/server/events/types.ts` (modify evaluator actor type), `lib/server/main-brain/broadcasts.ts` (modify shared evidence-reference typing), `app/api/proposals/route.ts` (new), `tests/orchestration/proposal-contract.test.ts` (new)
 
 #### Red — failing test
 

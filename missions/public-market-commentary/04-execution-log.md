@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 8 / 34
+- Tasks completed: 9 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -90,3 +90,13 @@
 - Spec review: passed with no Critical or Important findings.
 - Quality review: passed after correction rounds covering normalized commit-time editorial policy, canonical locale authority, full transport request idempotency, bounded route inputs, delivery audit causation/policy, clause-local certainty polarity, protected Unicode confusables, context-aware action language, and case-independent directive handling.
 - Scope: immutable versioned Main state and broadcasts, Main-only authorship, canonical sources and shared content integrity, policy-validated semantic bodies, per-account delivery projections with transport-only metadata, active entitlement/Node authorization, event/outbox/projection atomicity, SQL mutation guards, concurrency-safe idempotency, bounded private no-store route input, and no Node-authored body or external validation call.
+
+### T9 — Persist privacy-safe Node proposals and bounded debate turns
+
+- Status: completed
+- Commit: `T9: add privacy-safe Node proposals` (resolve the single-task commit from Git history)
+- Red: the proposal contract first failed before proposal persistence existed; later focused regressions exposed source/privacy authorization, disclosure revocation, route and Main-state binding, actor authority, evaluator provenance, private-copy detection, numeric canonicalization, and unresolved direct-SQL evidence links before each boundary was corrected.
+- Green: 21 targeted proposal tests passed; the full suite passed 208/208 across 14 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; temporary integration PostgreSQL processes were cleaned by the test harness.
+- Spec review: passed after correction rounds covering current account-graph authorization before ciphertext reads, exact source disclosure, fail-closed market evidence until T11, evaluator-run causation, and app/SQL status authority.
+- Quality review: passed after correction rounds covering evaluator-only queueing, Main accept/reject only after evaluator queueing, short and multi-token private values with explicit scoped consent, numeric Main-state ordering, and app/SQL evidence-reference resolution.
+- Scope: immutable pseudonymous Node proposals, exact source and routing provenance, separately authorized/revocable private excerpts, canonical evidence and counterevidence, bounded clarification and review turns, evaluator-gated decision states, global operation idempotency, private no-store proposal creation route, SQL integrity/immutability triggers, and no Main-state or Challenge mutation capability.

@@ -7,6 +7,7 @@ import {
 import { appendEvent, readEventBody } from "../events/store";
 import type { EventDatabase, JsonValue } from "../events/types";
 import { assertBroadcastEditorialPolicy } from "./editorial-validator";
+import type { EvidenceReferenceId } from "../orchestration/evidence";
 
 const MAIN_BRAIN_ID = "gustavo-main";
 export const BROADCAST_POLICY_VERSION = "main-broadcast-policy-v1";
@@ -28,7 +29,7 @@ export interface BroadcastContext {
 export interface CommitBroadcastInput {
   readonly mainStateVersion: number;
   readonly body: string;
-  readonly sourceIds: readonly string[];
+  readonly sourceIds: readonly EvidenceReferenceId[];
   readonly idempotencyKey?: string;
 }
 

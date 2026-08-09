@@ -5,6 +5,7 @@ export type EventActorType =
   | "USER"
   | "NODE_BRAIN"
   | "MAIN_BRAIN"
+  | "EVALUATOR"
   | "SYSTEM"
   | "OPERATOR";
 
