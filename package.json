@@ -5,12 +5,13 @@
   "type": "module",
   "packageManager": "pnpm@11.16.0",
   "engines": {
-    "node": ">=24.0.0 <25",
+    "node": ">=24.7.0 <25",
     "pnpm": ">=11.0.0 <12"
   },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "invitation:issue": "tsx scripts/issue-invitation.ts",
     "start": "next start",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
@@ -26,6 +27,7 @@
     "@types/pg": "8.15.6",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
+    "tsx": "4.20.6",
     "typescript": "7.0.2",
     "vitest": "4.1.10"
   }

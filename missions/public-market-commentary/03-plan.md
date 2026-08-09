@@ -223,7 +223,9 @@ Yes. It introduces the durable write primitive without domain-specific behavior.
 ### T3 — Redeem invitations into one account, Node Brain, and conversation
 
 **Maps to:** R2, R3, R43, R81
-**Files touched:** `db/migrations/0002_identity.sql` (new), `lib/server/auth/invitations.ts` (new), `lib/server/auth/sessions.ts` (new), `app/api/account/redeem/route.ts` (new), `scripts/issue-invitation.ts` (new), `tests/helpers/postgres.ts` (modify), `tests/auth/invitation-redemption.test.ts` (new)
+**Files touched:** `db/migrations/0002_identity.sql` (new), `lib/server/auth/invitations.ts` (new), `lib/server/auth/sessions.ts` (new), `lib/server/db/postgres.ts` (new), `app/api/account/redeem/route.ts` (new), `scripts/issue-invitation.ts` (new), `package.json` (modify), `pnpm-lock.yaml` (modify), `pnpm-workspace.yaml` (new), `tests/helpers/postgres.ts` (modify), `tests/auth/invitation-redemption.test.ts` (new), `tests/auth/invitation-boundaries.test.ts` (new), `tests/auth/invitation-route.test.ts` (new), `tests/auth/runtime-compatibility.test.ts` (new)
+
+The shared server-only PostgreSQL adapter is required so the Route Handler and operator CLI use the same transaction semantics as the event store without duplicating connection code. `tsx` is added as a development dependency so the operator-only TypeScript CLI is executable on the pinned Node 24 runtime; the pnpm workspace policy explicitly permits only its pinned `esbuild` dependency's required install script. Boundary tests cover the native Argon2 runtime floor, KDF preflight, concurrent single-use redemption, and the actual Route Handler cookie/body contract.
 
 #### Red — failing test
 

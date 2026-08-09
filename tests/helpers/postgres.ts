@@ -13,6 +13,10 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll } from "vitest";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
+import {
+  generateOpaqueToken,
+  hashOpaqueToken,
+} from "../../lib/server/auth/sessions";
 import type { EventDatabase } from "../../lib/server/events/types";
 
 const execFileAsync = promisify(execFile);
@@ -344,9 +348,9 @@ function poolDatabase(pool: Pool, schema: string): TestDatabase {
 }
 
 function clientDatabase(client: PoolClient, schema: string): TestDatabase {
-  return databaseFor(client, schema, async () => {
-    throw new Error("NESTED_TEST_TRANSACTION_NOT_SUPPORTED");
-  });
+  let database: TestDatabase;
+  database = databaseFor(client, schema, async (work) => work(database));
+  return database;
 }
 
 export async function openTestDb(): Promise<TestDatabase> {
@@ -363,11 +367,50 @@ export async function openTestDb(): Promise<TestDatabase> {
   });
   schemas.push({ name: schema, pool });
   const database = poolDatabase(pool, schema);
-  const migration = await readFile("db/migrations/0001_events.sql", "utf8");
-  await database.query(migration);
+  const migrationDirectory = join("db", "migrations");
+  const migrations = readdirSync(migrationDirectory)
+    .filter((name) => /^\d+_.+\.sql$/.test(name))
+    .sort();
+  for (const migrationName of migrations) {
+    const migration = await readFile(join(migrationDirectory, migrationName), "utf8");
+    await database.query(migration);
+  }
   process.env.GUSTAVO_EVENT_ROOT_KEY_VERSION = "1";
   process.env.GUSTAVO_EVENT_ROOT_KEY_V1 = randomBytes(32).toString("base64");
   return database;
+}
+
+export async function testContext(): Promise<{ readonly db: TestDatabase }> {
+  return { db: await openTestDb() };
+}
+
+export async function seedInvitation(
+  database: TestDatabase,
+  options: {
+    readonly expiresAt: Date;
+    readonly revokedAt?: Date;
+  },
+): Promise<string> {
+  const token = generateOpaqueToken();
+  const invitationId = randomUUID();
+  const expiresAt = new Date(options.expiresAt);
+  const issuedAt = new Date(
+    Math.min(Date.now(), expiresAt.getTime() - 24 * 60 * 60 * 1_000),
+  );
+  await database.query(
+    `insert into invitations
+      (id, token_hash, issued_by_actor_id, issued_at, expires_at, revoked_at)
+     values ($1, $2, $3, $4, $5, $6)`,
+    [
+      invitationId,
+      hashOpaqueToken(token),
+      "test-operator",
+      issuedAt,
+      expiresAt,
+      options.revokedAt ?? null,
+    ],
+  );
+  return token;
 }
 
 afterAll(async () => {
