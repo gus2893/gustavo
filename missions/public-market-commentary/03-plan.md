@@ -666,7 +666,7 @@ Yes. The rubric and commitment protocol form one auditable arbitration subsystem
 ### T11 — Normalize licensed stock observations and completed-bar evidence
 
 **Maps to:** R9, R10, R82
-**Files touched:** `db/migrations/0008_market_data.sql` (new), `lib/server/market-data/types.ts` (new), `lib/server/market-data/policy.ts` (new), `lib/server/market-data/provider.ts` (new), `tests/market-data/observation-policy.test.ts` (new)
+**Files touched:** `db/migrations/0008_market_data.sql` (new), `lib/server/market-data/types.ts` (new), `lib/server/market-data/policy.ts` (new), `lib/server/market-data/provider.ts` (new), `tests/market-data/observation-policy.test.ts` (new), `missions/public-market-commentary/debug-t11-postgres-null-check.md` (new), `missions/public-market-commentary/debug-t11-full-suite-timeout.md` (new)
 
 #### Red — failing test
 

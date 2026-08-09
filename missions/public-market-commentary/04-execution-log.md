@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 10 / 34
+- Tasks completed: 11 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -110,3 +110,13 @@
 - Spec review: passed after a two-connection regression led to one immutable evaluation-batch authority per window for evaluator run/event/prompt/model/policy provenance.
 - Quality review: passed after corrections made private-text access live and revocable, carried candidate disposition through app/SQL selection, returned deterministic replay/closed-window outcomes, and locked every database phase transition on the decision-window row.
 - Scope: immutable market/portfolio/cost/profile snapshots, Main-before-contender commitments, pseudonymous evaluator packets, rubric weights 25/20/20/15/10/10, hard-gate precedence, threshold 80, margin 5, deterministic tie handling, atomic evaluator/selection audit events, concurrency-safe one-pass provenance, revocable disclosure references without plaintext copying, and no Main-state or Challenge mutation.
+
+### T11 — Normalize licensed stock observations and completed-bar evidence
+
+- Status: completed
+- Commit: `T11: add licensed market evidence` (resolve the single-task commit from Git history)
+- Red: the focused test first failed before the market-data policy module existed; later focused regressions exposed an impossible PostgreSQL null-character expression, the full-suite integration timeout boundary, incoherent freshness metadata, future completed bars, forgeable license claims, symbol-only allowlists, and shallow evidence immutability before each boundary was corrected.
+- Green: 9 targeted market-data tests passed; the full suite passed 221/221 across 16 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; zero temporary Gustavo PostgreSQL processes remained.
+- Spec review: passed after corrections made freshness a frozen evaluated projection with exact millisecond boundaries and required completed bars to be temporally supported by their linked source observation in PostgreSQL.
+- Quality review: passed after corrections required a branded immutable provider-and-license authority, revalidated current license and redistribution rights at Challenge admission, bound Map-only allowlists to symbol and asset class, and deeply cloned/froze bounded JSON bar evidence.
+- Scope: canonical fixed-decimal US stock/ETF observations, canonical UTC timestamps, licensed raw-source provenance, delay/rights/session/freshness metadata, trusted current source authority, immutable completed bars versus provisional active bars, and no external provider calls, analysis, Challenge mutation, credentials, or execution.
