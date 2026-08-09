@@ -109,7 +109,7 @@
 ### T1 — Migrate the repository into the Gustavo application scaffold
 
 **Maps to:** R1, R11, R12, R80
-**Files touched:** `package.json` (new), `pnpm-lock.yaml` (new), `tsconfig.json` (new), `vitest.config.ts` (new), `next.config.ts` (new), `README.md` (replace), `AGENTS.md` (replace), `policy/editorial-policy.json` (new), `tests/repository/product-policy.test.ts` (new), repository directory rename after the green tree
+**Files touched:** `.gitignore` (modify), `package.json` (new), `pnpm-lock.yaml` (new), `tsconfig.json` (new), `vitest.config.ts` (new), `next.config.ts` (new), `next-env.d.ts` (generated), `app/layout.tsx` (new), `app/page.tsx` (new), `README.md` (replace), `AGENTS.md` (replace), `policy/editorial-policy.json` (new), `tests/repository/product-policy.test.ts` (new), repository directory rename after the green tree
 
 #### Red — failing test
 
@@ -150,7 +150,7 @@ Expected initial state: the test exits 1 because `policy/editorial-policy.json` 
 
 Command: `pnpm vitest run tests/repository/product-policy.test.ts && pnpm exec tsc --noEmit`
 
-Expected: 1 passing test, TypeScript exits 0, and the command exits 0.
+Expected: 2 passing tests, TypeScript exits 0, and the command exits 0.
 
 #### Reviewable as a unit?
 

@@ -1,28 +1,46 @@
-# Repository Guidelines
+# Gustavo Repository Instructions
 
-## Project Structure & Module Organization
+## Source of truth
 
-This is a documentation-first knowledge repository for a local paper-trade lab. Durable mechanism rules belong in `policy/lab-policy.json`; do not encode temporary prices or active theses there. Current account and risk-day facts live in `state/current-profile.json`, while replaceable scan observations live in `state/latest-market-context.json`. `docs/` explains the policy in human-readable form and records dated decisions. `schemas/` describes local API and passive-export payloads, and `templates/` provides append-only record formats.
+Gustavo is an invitation-only educational market-commentary application with canonical production origin [https://gustavo.lol](https://gustavo.lol), one Main Brain, one stable Node Brain per account, one continuous private chat per account, and one shared simulated Challenge Portfolio.
 
-The safety boundary in `README.md` outranks every other file. This repository must never become a broker adapter, signal copier, or execution path.
+Read the mission contracts before changing product behavior:
 
-## Validation Commands
+1. [`missions/public-market-commentary/01-story.md`](missions/public-market-commentary/01-story.md)
+2. [`missions/public-market-commentary/02-design.md`](missions/public-market-commentary/02-design.md)
+3. [`missions/public-market-commentary/03-plan.md`](missions/public-market-commentary/03-plan.md)
 
-Run the complete repository check with:
+The approved design is the behavioral source of truth. `policy/editorial-policy.json` is the machine-readable source for product identity and safety constants. Historical files under `docs/`, `policy/`, `schemas/`, `state/`, and `templates/` are preserved import evidence, not active application configuration.
+
+## Non-negotiable boundaries
+
+- Display the exact label `SIMULATION ONLY — NOT A REAL TRADE` wherever simulated Challenge actions or performance appear.
+- Never add real order routing, execution adapters, copy-trade exports, account credentials, or brokerage/prop-firm connectivity.
+- Use `paper long`, `paper short`, or `no simulated position`; do not present simulated actions as recommendations to buy or sell.
+- Treat Gustavo's Brain and memory terms as software roles and retrieval systems. Do not claim consciousness, sentience, hidden chain-of-thought access, or perfect recall.
+- Keep private Node Brain content scope-bound. Authorization must precede retrieval, ranking, graph expansion, cache access, and DTO projection.
+- Do not ship protected text, ciphertext, secrets, or browser-usable decryption material to an unauthorized client.
+- Label market observations with source time and freshness. Active unfinished bars are provisional.
+- Limit active market coverage to the `US_STOCK` and `US_ETF` classes configured in `policy/editorial-policy.json`.
+
+## Engineering conventions
+
+- Use Node.js 24 and the pnpm version declared in `package.json`.
+- Keep TypeScript strict. Avoid `any`; validate data at trust boundaries and use fixed decimal or integer-cent arithmetic for money.
+- Use the Next.js App Router and keep secrets, authorization, data access, model calls, and market-data adapters server-only.
+- PostgreSQL append-only events are authoritative. Queues, caches, summaries, embeddings, and projections must be disposable and rebuildable.
+- Persist source events before derived state. Make mutations and worker jobs idempotent and record causation, correlation, policy version, and provenance.
+- Write a failing test before production code. Implement the smallest behavior that satisfies the approved task, then run its exact verification command.
+- Preserve unrelated legacy knowledge until its planned provenance-preserving import and archival task.
+
+## Validation
+
+Install and run the baseline checks from the repository root:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1
+pnpm install --frozen-lockfile
+pnpm vitest run
+pnpm exec tsc --noEmit
 ```
 
-The script parses all JSON files, checks required documents, confirms that real-account connectivity is disabled, and rejects an export destination that points at the active `Trade\New` inbox. Also run `git diff --check` before committing documentation edits.
-
-## Documentation & Data Conventions
-
-Use ISO-8601 UTC timestamps for dated observations and epoch milliseconds only where the tracker API requires them. Write prices as JSON numbers, not formatted strings. Clearly label Coinbase as live public exchange data and Yahoo as potentially delayed public intraday data. Separate confirmed completed-candle evidence from unfinished-candle observations.
-
-Keep deterministic setup keys in the form `scan:<SYMBOL>:<completed-15m-time>:<long|short>:<slug>`. A materially new completed-candle thesis gets a new key; ordinary price updates do not.
-
-## Safety Rules for Changes
-
-Never add credentials, account identifiers, confirmation tokens, broker URLs, or code that invokes `trade.cmd`. Never write or move artifacts into `Trade\New`, `processing`, `placed`, or `failed`. Add a CFT contract mapping only with explicit platform evidence, recording it through `templates/symbol-verification.md`. Paper setups and orders must retain the exact warning: “PAPER LAB ONLY — do not copy this trade to CFT.”
-
+Run the narrower command specified by the active plan task during test-first implementation. Do not commit generated output, credentials, local databases, encrypted-key material, or dependency directories.

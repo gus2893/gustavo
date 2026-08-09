@@ -2,4 +2,14 @@
 Thumbs.db
 *.tmp
 *.log
-
+/node_modules/
+/.next/
+/coverage/
+*.tsbuildinfo
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!*.env.example
+!/infra/env.example

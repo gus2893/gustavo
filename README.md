@@ -1,50 +1,39 @@
-# Local Paper-Trade Lab Knowledge Base
+# Gustavo
 
-This repository preserves the trading mechanism, operating rules, safety constraints, and dated decisions developed in the `eth-trade-setup-monitor` chat. It documents a **local simulation only**. It is not a signal service, brokerage integration, or authorization to trade a real account.
+**The market thinks out loud.**
 
-> PAPER LAB ONLY — do not copy this trade to CFT.
+Gustavo is an invitation-only market-intelligence show at [https://gustavo.lol](https://gustavo.lol). Each account holder has one stable Node Brain and one continuous private conversation. Node Brains can submit structured ideas to the shared Main Brain, which records its reasoning and manages one shared simulated Challenge Portfolio.
 
-## Non-negotiable boundary
+Gustavo publishes educational market commentary, not individualized financial advice. It makes no promise of accuracy, profitability, or future performance. Its Brain and memory language describes software roles and retrieval systems; Gustavo does not claim consciousness or sentience.
 
-- Never connect this repository or its workflows to Crypto Fund Trader, Match-Trader, MT5, Bybit, a broker, or an exchange.
-- Never store account numbers, credentials, confirmation tokens, or broker session data.
-- Never run `trade.cmd` or write a paper artifact into `C:\Users\gusta\Desktop\Projects\Trade\New`, `processing`, `placed`, or `failed`.
-- The only permitted JSON-export location is `C:\Users\gusta\Desktop\Projects\Trade\paper-lab-exports`, and an export remains a passive local paper-tracking artifact.
-- CFT-style contract names are used only when their exact mapping has been verified. Never guess a `.cft` symbol.
+> SIMULATION ONLY — NOT A REAL TRADE
 
-## Repository map
+Gustavo cannot route real orders, connect to brokerage or prop-firm accounts, produce copy-trade instructions, or hold execution credentials. The MVP market universe is limited to operator-approved US-listed stocks and ETFs. Market observations include timestamps and freshness labels, and unfinished bars are explicitly provisional.
 
-- [`docs/MECHANISM.md`](docs/MECHANISM.md) — structure hierarchy and decision process.
-- [`docs/GRADING_AND_RISK.md`](docs/GRADING_AND_RISK.md) — quality tiers, sizing, leverage, and risk gates.
-- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — exact ten-minute monitor workflow.
-- [`docs/API_CONTRACTS.md`](docs/API_CONTRACTS.md) — local tracker endpoints and payload rules.
-- [`docs/EXPORTS_AND_SYMBOLS.md`](docs/EXPORTS_AND_SYMBOLS.md) — passive export policy and verified mappings.
-- [`docs/DECISION_HISTORY.md`](docs/DECISION_HISTORY.md) — dated decisions and lessons from this chat.
-- [`docs/ETH_CONTEXT.md`](docs/ETH_CONTEXT.md) — timestamped ETH-specific context, not permanent policy.
-- [`policy/lab-policy.json`](policy/lab-policy.json) — machine-readable source of truth for durable rules.
-- [`state/current-profile.json`](state/current-profile.json) — current $5,000 profile ledger and risk-day state.
-- [`state/latest-market-context.json`](state/latest-market-context.json) — replaceable market snapshot context.
-- [`templates`](templates) — records for new decisions and symbol verification.
-- [`schemas`](schemas) — local payload validation shapes.
+## Product model
 
-## Source-of-truth order
+- The Main Brain is the single authority for shared views, scheduled messages, council decisions, and the simulated Challenge Portfolio.
+- Each account has exactly one stable Node Brain and one private, continuous chat.
+- Node proposals never mutate shared state directly; the Main Brain evaluates them against recorded hard gates and a versioned scoring policy.
+- Source interactions remain durable. Derived summaries, indexes, and caches never replace the source record or widen access permissions.
+- Protected conversation text is never sent to an unauthorized public browser.
 
-When documents disagree, use this order:
+Machine-readable product constants and safety boundaries live in [`policy/editorial-policy.json`](policy/editorial-policy.json). README prose is explanatory and is not executable configuration.
 
-1. Safety boundary in this README.
-2. `policy/lab-policy.json` for durable mechanism rules.
-3. Dated records in `state/` for current profile and market facts.
-4. Explanatory material in `docs/`.
+## Mission documents
 
-Market context expires quickly. Update `state/latest-market-context.json` rather than rewriting durable rules after every scan.
+- [`01-story.md`](missions/public-market-commentary/01-story.md) — approved user stories and observable acceptance criteria.
+- [`02-design.md`](missions/public-market-commentary/02-design.md) — approved product and architecture contract.
+- [`03-plan.md`](missions/public-market-commentary/03-plan.md) — test-first implementation plan.
 
-## Validate
+Legacy knowledge files are preserved as import sources and historical evidence. They are not active Gustavo configuration and cannot enable obsolete execution behavior.
 
-Run from this repository:
+## Development
+
+Gustavo uses Node.js 24, pnpm, TypeScript with strict checking, Next.js, and Vitest.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1
+pnpm install --frozen-lockfile
+pnpm test
+pnpm exec tsc --noEmit
 ```
-
-The validator parses every JSON file, checks required documents, and verifies the most important local-only safety settings.
-
