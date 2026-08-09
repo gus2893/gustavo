@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 5 / 34
+- Tasks completed: 6 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -60,3 +60,13 @@
 - Spec review: passed with no Critical, Important, or optional findings.
 - Quality review: passed after one correction round that made conflicting idempotency reuse a stable non-leaking 409 while preserving exact replay and generic unexpected-failure 500s.
 - Scope: encrypted native turns linked to immutable events, atomic event/body/message/outbox commits, completion and abort metadata, account/conversation authorization, per-conversation idempotency, bounded UUIDv7 keyset pagination, HMAC-signed scope-bound cursors, private no-store GET/POST routes, origin protection, and rollback-safe acknowledgement.
+
+### T6 — Add an auditable provider-neutral model gateway
+
+- Status: completed
+- Commit: `T6: add the auditable model gateway` (resolve the single-task commit from Git history)
+- Red: the initial gateway test failed before model modules existed; focused adversarial regressions then exposed production-config, reservation-month, abort, cost-accounting, mutable-input, numeric-bound, provider-error, event-snapshot, iterator-cleanup, and concurrent-saturation gaps before each was corrected.
+- Green: 38 targeted gateway tests passed; the full suite passed 67/67 across 10 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; zero temporary Gustavo PostgreSQL processes remained.
+- Spec review: passed after correction rounds covering automatic production identity validation, exact reservation-month finalization, non-cooperative cancellation, provider-overrun evidence, and cleanup from every streaming lifecycle entry point.
+- Quality review: passed after adversarial correction rounds covering fail-closed budget accounting, immutable request/config/event/usage snapshots, provider error sanitization, pre-yield output limits, PostgreSQL numeric bounds, best-effort iterator cleanup, and sticky concurrent budget saturation.
+- Scope: provider-neutral streaming for Main/Node/Evaluator roles, validated production role identities, prompt/policy version metadata, correlation IDs, fully audited terminal states, concurrency-safe monthly role budgets, per-call ceilings, conservative reservations and actual-cost accounting, deterministic fake-provider tests, and no prompt/output/hidden-reasoning persistence or external model calls.
