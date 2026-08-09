@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 1 / 34
+- Tasks completed: 2 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -20,3 +20,13 @@
 - Spec review: passed after adding the canonical origin to `AGENTS.md` and aligning `@types/node` with Node 24.
 - Quality review: passed after adding the minimal App Router shell and proving the advertised Next.js commands build successfully.
 - Scope: application foundation, product identity, machine-readable editorial/safety policy, repository guidance, and no live feed or execution behavior.
+
+### T2 — Commit append-only events and outbox work atomically
+
+- Status: completed
+- Commit: `T2: add the encrypted event ledger` (resolve the single-task commit from Git history)
+- Red: the event-store integration test initially failed because its PostgreSQL helper and event-store module did not exist; focused regressions later failed before authoritative aggregate-key references, failure-safe lifecycle cleanup, and immutable key identity were implemented.
+- Green: the targeted event test passed 1/1; the full suite passed 5/5 across 3 files; strict TypeScript, the Next.js production build, frozen install, and `git diff --check` passed under Node 24.14.0 and pnpm 11.16.0; zero temporary Gustavo PostgreSQL processes remained.
+- Spec review: passed with no Critical, Important, or optional findings.
+- Quality review: passed after two correction rounds covering authoritative per-aggregate key rotation/erasure, bidirectional SQL aggregate invariants, and cleanup from the earliest temporary-directory allocation through partial PostgreSQL startup.
+- Scope: immutable event metadata, envelope-encrypted bodies, versioned environment-only root keys, canonical integrity hashes, UUIDv7 ordering, idempotent replay/conflict rejection, atomic transactional outbox, real isolated PostgreSQL integration tests, and no cloud service or credentials.

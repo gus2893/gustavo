@@ -161,7 +161,7 @@ Yes. It establishes only the runnable project and non-negotiable product boundar
 ### T2 — Commit append-only events and outbox work atomically
 
 **Maps to:** R15, R19, R24, R51, R53
-**Files touched:** `db/migrations/0001_events.sql` (new), `lib/server/crypto/envelope.ts` (new), `lib/server/events/types.ts` (new), `lib/server/events/store.ts` (new), `tests/events/event-store.test.ts` (new), `tests/helpers/postgres.ts` (new)
+**Files touched:** `db/migrations/0001_events.sql` (new), `lib/server/crypto/envelope.ts` (new), `lib/server/events/types.ts` (new), `lib/server/events/store.ts` (new), `tests/events/event-store.test.ts` (new), `tests/helpers/postgres.ts` (new), `tests/helpers/postgres-lifecycle.test.ts` (new), `package.json` (modify), `pnpm-lock.yaml` (modify), `missions/public-market-commentary/debug-t2-event-store-timeout.md` (new)
 
 #### Red — failing test
 
