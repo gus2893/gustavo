@@ -1115,7 +1115,7 @@ Yes. It adds the auditable rationale primitive separately from memory extraction
 ### T19 — Consolidate source events into typed memory projections
 
 **Maps to:** R16, R21, R22, R24, R70, R73
-**Files touched:** `db/migrations/0013_memory.sql` (new), `lib/server/memory/types.ts` (new), `lib/server/consolidation/consolidate.ts` (new), `worker/consolidation/process-event.ts` (new), `tests/memory/consolidation.test.ts` (new)
+**Files touched:** `db/migrations/0013_memory.sql` (new), `lib/server/memory/types.ts` (new), `lib/server/consolidation/consolidate.ts` (new), `lib/server/events/store.ts` (modify; authorized bounded batched-read primitive), `worker/consolidation/process-event.ts` (new), `tests/memory/consolidation.test.ts` (new), `tests/events/event-store.test.ts` (modify; authorized batched-read and ingestion regressions), `missions/public-market-commentary/debug-t19-test-fixture.md` (new; required MCAX debug record for unexpected fixture/runtime failures), `vitest.config.ts` (debug scope fix: serialize disposable PostgreSQL ownership on Windows only), `missions/public-market-commentary/debug-t19-full-suite-cleanup.md` (new; required MCAX debug record), `missions/public-market-commentary/03-plan.md` (modify; T19 scope ledger)
 
 #### Red — failing test
 
