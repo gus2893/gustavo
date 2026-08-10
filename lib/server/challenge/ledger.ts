@@ -412,7 +412,7 @@ export async function loadChallengeLedgerEvents(
             actor_id, idempotency_key, causation_id::text, correlation_id::text
        from challenge_ledger_events
       where stage_id=$1
-      order by sequence, id`,
+      order by challenge_ledger_events.sequence, challenge_ledger_events.id`,
     [stageId],
   );
   return Object.freeze(rows.map(storedEvent));
@@ -467,7 +467,7 @@ export async function replaceProjectionCheckpoint(
               actor_id, idempotency_key, causation_id::text, correlation_id::text
          from challenge_ledger_events
         where stage_id=$1 and sequence<=$2
-        order by sequence, id`,
+        order by challenge_ledger_events.sequence, challenge_ledger_events.id`,
       [input.stageId, input.highWaterSequence],
     );
     const events = rows.map(storedEvent);
