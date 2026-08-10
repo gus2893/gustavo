@@ -2,27 +2,34 @@
   "name": "gustavo",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.16.0",
+  "engines": {
+    "node": ">=24.7.0 <25",
+    "pnpm": ">=11.0.0 <12"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "invitation:issue": "tsx scripts/issue-invitation.ts",
     "start": "next start",
-    "lint": "next lint"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@types/node": "20.4.10",
-    "@types/react": "18.2.20",
-    "@types/react-dom": "18.2.7",
-    "autoprefixer": "10.4.14",
-    "eslint": "8.47.0",
-    "eslint-config-next": "13.4.13",
-    "next": "13.4.13",
-    "postcss": "8.4.27",
-    "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "tailwindcss": "3.3.3",
-    "typescript": "5.1.6"
+    "decimal.js": "10.6.0",
+    "next": "16.3.0",
+    "pg": "8.16.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
-    "eslint-config-prettier": "^9.0.0"
+    "@types/node": "24.13.3",
+    "@types/pg": "8.15.6",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "tsx": "4.20.6",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
   }
 }

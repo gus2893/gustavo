@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "scope": {
+    "name": "LOCAL PAPER-TRADE LAB",
+    "realAccountConnectivity": false,
+    "realOrderPlacement": false,
+    "credentialCollection": false,
+    "thirdPartyTradeCopying": false,
+    "requiredSetupWarning": "PAPER LAB ONLY — do not copy this trade to CFT."
+  },
+  "profile": {
+    "startEpochMs": 1786113002011,
+    "startIsoUtc": "2026-08-07T14:30:02.011Z",
+    "startingEquityUsd": 5000,
+    "targetEquityUsd": 5500,
+    "hardDailyLossUsd": 200,
+    "hardOverallFloorUsd": 4700,
+    "internalNoNewOrderFloorUsd": 4730,
+    "internalPortfolioRiskCeilingUsd": 150,
+    "riskDayStartUtc": "00:05:00",
+    "maxFullStoppedAttemptsPerRiskDay": 2
+  },
+  "service": {
+    "baseUrl": "http://127.0.0.1:4317",
+    "healthPath": "/api/health",
+    "recoveryCommand": "npm run ensure",
+    "recoveryWorkingDirectory": "C:\\Users\\gusta\\Desktop\\Projects\\live-level-tracker",
+    "maxRecoveryAttemptsPerRun": 1,
+    "forbiddenWhenHealthy": ["npm run dev", "vite", "tsx watch", "second tracker instance"]
+  },
+  "universe": {
+    "mappedMarketCount": 95,
+    "categories": ["crypto", "stock", "forex", "index", "commodity"],
+    "catalogClaim": "local public-provider mappings, not the exact complete CFT catalog",
+    "cryptoProviderLabel": "Coinbase live public exchange data",
+    "yahooProviderLabel": "Yahoo potentially delayed public intraday data",
+    "rejectProviderStates": ["stale", "disconnected"],
+    "requireHistoryReady": true
+  },
+  "timeframes": {
+    "bias": "4h",
+    "structure": "1h",
+    "trigger": "15m",
+    "unfinishedCandlesConfirmNothing": true,
+    "defaultPivotStrength": 5,
+    "minimumTouchGapBars1h": 6
+  },
+  "grades": {
+    "standard": {
+      "orderEligible": false,
+      "exportEligible": false,
+      "description": "Directional structure missing one or more action requirements"
+    },
+    "elite": {
+      "desiredRiskUsd": 75,
+      "minimumActualRiskUsd": 50,
+      "minimumBlendedRewardR": 2,
+      "requirements": [
+        "live fresh provider",
+        "session open",
+        "4H bias aligned",
+        "confirmed 1H zone",
+        "completed 15m breakout and retest or strong rejection",
+        "limit entry at retest rather than chase",
+        "stop beyond structural invalidation",
+        "at least 2R blended reward after likely costs"
+      ]
+    },
+    "greatElite": {
+      "desiredRiskUsd": 100,
+      "minimumActualRiskUsd": 75,
+      "minimumBlendedRewardR": 2.5,
+      "additionalRequirements": [
+        "at least two genuinely separated confirmed 1H touch episodes",
+        "completed trigger and completed retest or rejection",
+        "no nearby opposing confirmed zone blocks the path",
+        "not in the middle of a range",
+        "not a duplicate correlated thesis"
+      ]
+    }
+  },
+  "sizing": {
+    "riskPerUnitFormula": "abs(entry - stop)",
+    "leverageLimitedRiskFormula": "simulatedEquity * categoryLeverageCap * riskPerUnit / entry",
+    "actualRiskFormula": "min(desiredRisk, leverageLimitedRisk)",
+    "quantityFormula": "actualRiskUsd / riskPerUnit",
+    "estimatedLeverageFormula": "entry * quantity / simulatedEquity",
+    "categoryLeverageCaps": {
+      "crypto": 4,
+      "stock": 4,
+      "index": 16,
+      "etf": 16,
+      "forex": 24,
+      "commodity": 24
+    },
+    "minimumMarginHeadroomPct": 20,
+    "tightenStopToIncreaseSize": false
+  },
+  "portfolioRisk": {
+    "formula": "realized losses since 00:05 UTC + current open losses + remaining stop risk of pending and open trades",
+    "blockWhenProposedTotalExceedsUsd": 150,
+    "onePendingOrOpenPerSymbol": true,
+    "oneMatchingThesisPerCorrelationCluster": true,
+    "clusters": ["US equities and US indices", "crypto", "energy", "precious metals", "grains", "overlapping FX crosses"]
+  },
+  "watchlist": {
+    "displayOnly": true,
+    "syncPath": "/api/potential-setups/sync",
+    "syncExactlyOncePerRun": true,
+    "maximumSetups": 8,
+    "allowedStatuses": ["forming", "confirmed"],
+    "allowedQualities": ["standard", "elite", "great-elite"],
+    "expiryMinutes": 45,
+    "sourceKeyPattern": "scan:<SYMBOL>:<original completed-15m trigger candle time>:<long|short>:<slug>"
+  },
+  "paperOrders": {
+    "path": "/api/paper-trades",
+    "eligibleQualities": ["elite", "great-elite"],
+    "orderType": "limit",
+    "targetAllocationMustTotalPct": 100,
+    "deterministicSourceKeyRequired": true,
+    "duplicateSourceKeyAllowed": false
+  },
+  "exports": {
+    "passiveTestArtifactOnly": true,
+    "directory": "C:\\Users\\gusta\\Desktop\\Projects\\Trade\\paper-lab-exports",
+    "forbiddenDirectories": [
+      "C:\\Users\\gusta\\Desktop\\Projects\\Trade\\New",
+      "C:\\Users\\gusta\\Desktop\\Projects\\Trade\\processing",
+      "C:\\Users\\gusta\\Desktop\\Projects\\Trade\\placed",
+      "C:\\Users\\gusta\\Desktop\\Projects\\Trade\\failed"
+    ],
+    "eligibleQualities": ["elite", "great-elite"],
+    "firstTargetOnly": true,
+    "eliteMinimumSingleTargetR": 2,
+    "greatEliteMinimumSingleTargetR": 2.5,
+    "requireExactVerifiedCftSymbol": true,
+    "invokeTradeCmd": false,
+    "minimalFields": ["testOnly", "symbol", "tradeType", "price", "side", "stopLoss", "takeProfit", "amounts"]
+  },
+  "verifiedCftMappings": {
+    "USOIL": "USOUSD.cft",
+    "AVAX-USD": "AVAXUSDT.cft"
+  }
+}
+

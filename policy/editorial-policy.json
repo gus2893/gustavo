@@ -1,0 +1,10 @@
+{
+  "productName": "Gustavo",
+  "canonicalOrigin": "https://gustavo.lol",
+  "tagline": "The market thinks out loud.",
+  "contentClassification": "EDUCATIONAL_MARKET_COMMENTARY",
+  "simulationDisclaimer": "SIMULATION ONLY — NOT A REAL TRADE",
+  "realExecutionEnabled": false,
+  "claimsSentience": false,
+  "marketScope": ["US_STOCK", "US_ETF"]
+}

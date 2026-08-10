@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local Paper Trade Order Input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sourceKey", "symbol", "name", "direction", "entry", "stop", "takeProfits", "riskUsd", "reason"],
+  "properties": {
+    "sourceKey": { "type": "string", "minLength": 1 },
+    "symbol": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "pattern": "(ELITE|GREAT ELITE)" },
+    "direction": { "enum": ["long", "short"] },
+    "entry": { "type": "number", "exclusiveMinimum": 0 },
+    "stop": { "type": "number", "exclusiveMinimum": 0 },
+    "takeProfits": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["price", "allocationPct"],
+        "properties": {
+          "price": { "type": "number", "exclusiveMinimum": 0 },
+          "allocationPct": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 }
+        }
+      }
+    },
+    "riskUsd": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+    "reason": { "type": "string", "minLength": 1 }
+  }
+}
+

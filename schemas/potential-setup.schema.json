@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local Potential Setup Input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sourceKey", "symbol", "direction", "status", "observedPrice", "trigger", "reason", "expiresAt"],
+  "properties": {
+    "sourceKey": { "type": "string", "pattern": "^scan:[^:]+:[^:]+:(long|short):[^:]+$" },
+    "symbol": { "type": "string", "minLength": 1 },
+    "direction": { "enum": ["long", "short"] },
+    "status": { "enum": ["forming", "confirmed"] },
+    "quality": { "enum": ["standard", "elite", "great-elite"] },
+    "observedPrice": { "type": "number", "exclusiveMinimum": 0 },
+    "entryZone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lo", "hi"],
+      "properties": {
+        "lo": { "type": "number", "exclusiveMinimum": 0 },
+        "hi": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "entry": { "type": "number", "exclusiveMinimum": 0 },
+    "stop": { "type": "number", "exclusiveMinimum": 0 },
+    "takeProfits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["price"],
+        "properties": {
+          "price": { "type": "number", "exclusiveMinimum": 0 },
+          "allocationPct": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 }
+        }
+      }
+    },
+    "riskUsd": { "type": "number", "exclusiveMinimum": 0 },
+    "estimatedLeverage": { "type": "number", "exclusiveMinimum": 0 },
+    "trigger": { "type": "string", "minLength": 1 },
+    "reason": { "type": "string", "minLength": 1 },
+    "expiresAt": { "type": "integer", "exclusiveMinimum": 0 }
+  }
+}
+
