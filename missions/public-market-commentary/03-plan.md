@@ -1227,7 +1227,7 @@ Yes. It handles source ingestion without sharing imported content into Main memo
 ### T21 — Retrieve bounded authorized memory and store RecallTrace provenance
 
 **Maps to:** R16, R22, R23, R26, R45, R71, R72, R74, R75, R78
-**Files touched:** `db/migrations/0015_recall.sql` (new), `lib/server/recall/planner.ts` (new), `lib/server/recall/rank.ts` (new), `lib/server/recall/trace.ts` (new), `tests/recall/planner.test.ts` (new)
+**Files touched:** `db/migrations/0015_recall.sql` (new), `lib/server/recall/planner.ts` (new), `lib/server/recall/rank.ts` (new), `lib/server/recall/trace.ts` (new), `lib/server/events/store.ts` (modify; authorized Stage A key-read locking/batch-authorization expansion), `lib/server/memory/vector-index.ts` (new; authorized final-probe bounded keyed vector buckets), `worker/consolidation/process-event.ts` (modify; authorized T19 vector-bucket producer expansion), `tests/recall/planner.test.ts` (new), `tests/events/event-store.test.ts` (modify; authorized Stage A key-read concurrency regression), `tests/memory/consolidation.test.ts` (modify; authorized T19 bucket authority/erasure regressions), `missions/public-market-commentary/debug-t21-first-green.md` (new; authorized first-green and Stage A debugging artifact)
 
 #### Red — failing test
 

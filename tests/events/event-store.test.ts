@@ -357,6 +357,50 @@ describe("appendEvent", () => {
     )).rejects.toThrow("EVENT_BODY_BATCH_LIMIT");
   });
 
+  it("holds every authorized aggregate key against erasure until the batch-read transaction commits", async () => {
+    const db = await openTestDb();
+    const event = await appendEvent(db, {
+      aggregateId: "locked-read-aggregate",
+      accountId: "locked-read-account",
+      actor: { type: "USER", id: "locked-read-account" },
+      type: "message.completed",
+      visibility: "PRIVATE_ACCOUNT",
+      body: { text: "protected until commit" },
+      idempotencyKey: "locked-read:event",
+    });
+    const key = await db.one<{ data_key_id: string }>(
+      "select data_key_id from encrypted_event_bodies where event_id=$1", [event.id],
+    );
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let ready!: () => void;
+    const readReady = new Promise<void>((resolve) => { ready = resolve; });
+    const fillSpy = vi.spyOn(Buffer.prototype, "fill");
+    try {
+      const reader = db.transaction(async (transaction) => {
+        await expect(readEventBodies(transaction, [event.id], {
+          actor: { role: "ACCOUNT", accountId: "locked-read-account" },
+        })).resolves.toHaveLength(1);
+        ready();
+        await held;
+      });
+      await readReady;
+      let erased = false;
+      const erasure = db.query("delete from aggregate_data_keys where id=$1", [key.data_key_id])
+        .then(() => { erased = true; });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const erasureWaitedForCommit = !erased;
+      release();
+      await reader;
+      await erasure;
+      expect(erasureWaitedForCommit).toBe(true);
+      expect(fillSpy.mock.calls.some(([value]) => value === 0)).toBe(true);
+    } finally {
+      fillSpy.mockRestore();
+      release();
+    }
+  }, 15_000);
+
   it("overwrites caller-supplied ingestion sequences on direct inserts", async () => {
     const db = await openTestDb();
     const source = await appendEvent(db, {

@@ -65,6 +65,20 @@ interface EncryptedBodyRow extends Record<string, unknown> {
   body_auth_tag: Buffer;
 }
 
+interface MemorySourceRequirementRow extends Record<string, unknown> {
+  readonly body_event_id: string;
+  readonly source_event_id: string;
+  readonly search_key_id: string | null;
+}
+
+interface EventBodyKeyReferenceRow extends Record<string, unknown> {
+  readonly event_id: string;
+  readonly data_key_id: string | null;
+}
+
+const MAX_MEMORY_BODY_REQUIREMENTS = 100;
+const MAX_MEMORY_SOURCE_REQUIREMENTS = 50_000;
+
 const UUID_V7_RANDOM_MASK = (1n << 74n) - 1n;
 let lastUuidTimestamp = 0;
 let lastUuidRandom = 0n;
@@ -249,6 +263,7 @@ interface PreparedAppend {
   readonly input: AppendEventInput;
   readonly accountId: string | null;
   readonly requestHash: string;
+  readonly bodyDigest: string;
 }
 
 function prepareAppend(input: AppendEventInput): PreparedAppend {
@@ -256,11 +271,17 @@ function prepareAppend(input: AppendEventInput): PreparedAppend {
   requireNonEmpty(input.actor.id, "actor_id");
   requireNonEmpty(input.type, "type");
   requireNonEmpty(input.idempotencyKey, "idempotency_key");
+  const bodyDigest = canonicalContentDigest(input.body);
+  if (input.type === "memory.recall.traced"
+    && !input.idempotencyKey.endsWith(`:${bodyDigest}`)) {
+    throw new Error("RECALL_TRACE_BODY_BINDING_INVALID");
+  }
   const accountId = eventOwner(input);
   return Object.freeze({
     input,
     accountId,
     requestHash: canonicalContentDigest(requestDocument(input, accountId)),
+    bodyDigest,
   });
 }
 
@@ -350,7 +371,7 @@ export async function appendEvents(
         );
       }
 
-      const pendingRows = pending.map(({ input, accountId, requestHash }) => {
+      const pendingRows = pending.map(({ input, accountId, requestHash, bodyDigest }) => {
         const id = nextUuidV7();
         const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
         if (!Number.isFinite(occurredAt.getTime())) throw new Error("INVALID_EVENT_OCCURRED_AT");
@@ -367,7 +388,7 @@ export async function appendEvents(
           id, integrityHash, Buffer.from(canonicalJson(input.body), "utf8"),
           plaintextKeys.get(input.aggregateId)!,
         );
-        return { input, accountId, requestHash, eventWithoutHash, integrityHash, encrypted,
+        return { input, accountId, requestHash, bodyDigest, eventWithoutHash, integrityHash, encrypted,
           keyRow: keysByAggregate.get(input.aggregateId)! };
       });
       await transaction.query(
@@ -385,13 +406,27 @@ export async function appendEvents(
           row.input.idempotencyKey, row.requestHash, row.integrityHash,
         ]),
       );
-      await transaction.query(
-        `insert into encrypted_event_bodies
-           (event_id,aggregate_id,data_key_id,ciphertext,body_iv,body_auth_tag)
-         values ${batchValues(pendingRows.length, 6)}`,
-        pendingRows.flatMap((row) => [row.eventWithoutHash.id, row.input.aggregateId,
-          row.keyRow.id, row.encrypted.ciphertext, row.encrypted.iv, row.encrypted.authTag]),
-      );
+      const ordinaryBodyRows = pendingRows.filter(({ input }) => input.type !== "memory.recall.traced");
+      if (ordinaryBodyRows.length > 0) {
+        await transaction.query(
+          `insert into encrypted_event_bodies
+             (event_id,aggregate_id,data_key_id,ciphertext,body_iv,body_auth_tag)
+           values ${batchValues(ordinaryBodyRows.length, 6)}`,
+          ordinaryBodyRows.flatMap((row) => [row.eventWithoutHash.id, row.input.aggregateId,
+            row.keyRow.id, row.encrypted.ciphertext, row.encrypted.iv, row.encrypted.authTag]),
+        );
+      }
+      const recallBodyRows = pendingRows.filter(({ input }) => input.type === "memory.recall.traced");
+      if (recallBodyRows.length > 0) {
+        await transaction.query(
+          `insert into encrypted_event_bodies
+             (event_id,aggregate_id,data_key_id,ciphertext,body_iv,body_auth_tag,body_digest)
+           values ${batchValues(recallBodyRows.length, 7)}`,
+          recallBodyRows.flatMap((row) => [row.eventWithoutHash.id, row.input.aggregateId,
+            row.keyRow.id, row.encrypted.ciphertext, row.encrypted.iv, row.encrypted.authTag,
+            row.bodyDigest]),
+        );
+      }
       await transaction.query(
         `insert into transactional_outbox (id,event_id,topic,payload)
          values ${batchValues(pendingRows.length, 4)}`,
@@ -423,6 +458,109 @@ export async function readEventBody(
   return (await readEventBodies(database, [eventId], context))[0].body;
 }
 
+/**
+ * Holds every source body/key behind the supplied consolidation bodies through
+ * the caller's transaction. Callers must establish scope/proposal authority
+ * before invoking this primitive. Keys are locked before body rows to preserve
+ * aggregate-key deletion order; body rows use SHARE so direct key-nulling
+ * updates cannot pass between this revalidation and protected body hydration.
+ */
+export async function lockAvailableMemorySourceBodies(
+  database: EventDatabase,
+  consolidationBodyEventIds: readonly string[],
+  additionalEventIds: readonly string[] = [],
+): Promise<readonly string[]> {
+  if (!Array.isArray(consolidationBodyEventIds)
+      || consolidationBodyEventIds.length > MAX_MEMORY_BODY_REQUIREMENTS
+      || !Array.isArray(additionalEventIds)
+      || (consolidationBodyEventIds.length === 0 && additionalEventIds.length === 0)
+      || new Set([...consolidationBodyEventIds, ...additionalEventIds]).size > 100) {
+    throw new Error("MEMORY_SOURCE_BODY_BATCH_LIMIT");
+  }
+  const bodyEventIds = [...new Set(consolidationBodyEventIds)].sort();
+  const requirements = await database.query<MemorySourceRequirementRow>(
+    `/* recall-source-body-requirements */
+     select distinct memory.body_event_id::text,source.source_event_id::text,
+            memory.search_key_id::text
+     from memory_records memory
+     join memory_sources source on source.memory_id=memory.id
+     where memory.body_event_id=any($1::uuid[])
+     order by memory.body_event_id::text,source.source_event_id::text
+     limit ${MAX_MEMORY_SOURCE_REQUIREMENTS + 1}`,
+    [bodyEventIds],
+  );
+  if (requirements.length > MAX_MEMORY_SOURCE_REQUIREMENTS) {
+    throw new Error("MEMORY_SOURCE_BODY_REQUIREMENT_LIMIT");
+  }
+  const sourcesByBody = new Map<string, string[]>();
+  const searchKeysByBody = new Map<string, Set<string>>();
+  for (const { body_event_id, source_event_id, search_key_id } of requirements) {
+    const sources = sourcesByBody.get(body_event_id) ?? [];
+    sources.push(source_event_id);
+    sourcesByBody.set(body_event_id, sources);
+    if (search_key_id !== null) {
+      const searchKeys = searchKeysByBody.get(body_event_id) ?? new Set<string>();
+      searchKeys.add(search_key_id);
+      searchKeysByBody.set(body_event_id, searchKeys);
+    }
+  }
+  const sourceEventIds = [...new Set(requirements.map(({ source_event_id }) => source_event_id))]
+    .sort();
+  const allEventIds = [...new Set([...sourceEventIds, ...bodyEventIds, ...additionalEventIds])].sort();
+  const observedBodies = await database.query<EventBodyKeyReferenceRow>(
+    `/* recall-source-body-key-snapshot */
+     select event_id::text,data_key_id::text
+     from encrypted_event_bodies where event_id=any($1::uuid[])
+     order by event_id`,
+    [allEventIds],
+  );
+  const observedKeyByEvent = new Map(observedBodies.map((row) => [row.event_id, row.data_key_id]));
+  const observedKeyIds = [...new Set([
+    ...observedBodies.map(({ data_key_id }) => data_key_id)
+      .filter((id): id is string => id !== null),
+    ...requirements.map(({ search_key_id }) => search_key_id)
+      .filter((id): id is string => id !== null),
+  ])].sort();
+  const lockedKeys = observedKeyIds.length === 0 ? [] : await database.query<{ id: string }>(
+    `/* recall-source-key-lock */
+     select id::text from aggregate_data_keys where id=any($1::uuid[])
+     order by id for key share`,
+    [observedKeyIds],
+  );
+  const lockedKeyIds = new Set(lockedKeys.map(({ id }) => id));
+  const lockedBodies = await database.query<EventBodyKeyReferenceRow>(
+    `/* recall-source-body-lock */
+     select event_id::text,data_key_id::text
+     from encrypted_event_bodies where event_id=any($1::uuid[])
+     order by event_id for share`,
+    [allEventIds],
+  );
+  const lockedKeyByEvent = new Map(lockedBodies.map((row) => [row.event_id, row.data_key_id]));
+  const everyAdditionalBodyAvailable = additionalEventIds.every((eventId) => {
+    const observedKeyId = observedKeyByEvent.get(eventId);
+    return observedKeyId !== undefined && observedKeyId !== null
+      && lockedKeyIds.has(observedKeyId)
+      && lockedKeyByEvent.get(eventId) === observedKeyId;
+  });
+  if (!everyAdditionalBodyAvailable) throw new Error("EVENT_KEY_UNAVAILABLE");
+  return Object.freeze(bodyEventIds.filter((bodyEventId) => {
+    const sources = sourcesByBody.get(bodyEventId);
+    const observedBodyKeyId = observedKeyByEvent.get(bodyEventId);
+    const bodyAvailable = observedBodyKeyId !== undefined && observedBodyKeyId !== null
+      && lockedKeyIds.has(observedBodyKeyId)
+      && lockedKeyByEvent.get(bodyEventId) === observedBodyKeyId;
+    const searchKeysAvailable = [...(searchKeysByBody.get(bodyEventId) ?? [])]
+      .every((keyId) => lockedKeyIds.has(keyId));
+    return bodyAvailable && searchKeysAvailable
+      && sources !== undefined && sources.length > 0 && sources.every((sourceEventId) => {
+      const observedKeyId = observedKeyByEvent.get(sourceEventId);
+      return observedKeyId !== undefined && observedKeyId !== null
+        && lockedKeyIds.has(observedKeyId)
+        && lockedKeyByEvent.get(sourceEventId) === observedKeyId;
+      });
+  }));
+}
+
 function immutableJson(value: JsonValue): JsonValue {
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
@@ -450,26 +588,24 @@ export async function readEventBodies(
   // Authorize the complete metadata set before reading any ciphertext or wrapped key.
   for (const id of uniqueIds) authorizeRead(events.get(id)!, context);
 
+  const aggregateIds = [...new Set([...events.values()].map(({ aggregateId }) => aggregateId))];
+  // Event metadata already proves the owning aggregates, so lock their keys in a
+  // stable order before the only query that is permitted to fetch ciphertext.
+  const keyRows = await database.query<AggregateKeyRow>(
+    `select id,aggregate_id,root_key_version,wrapped_key,wrap_iv,wrap_auth_tag
+     from aggregate_data_keys where aggregate_id=any($1::text[])
+     order by id for key share`,
+    [aggregateIds],
+  );
+  const keysByAggregate = new Map(keyRows.map((row) => [row.aggregate_id, row]));
+  if (keysByAggregate.size !== aggregateIds.length) throw new Error("EVENT_KEY_UNAVAILABLE");
   const protectedRows = await database.query<EncryptedBodyRow & { event_id: string }>(
     `select event_id::text,aggregate_id,data_key_id,ciphertext,body_iv,body_auth_tag
-     from encrypted_event_bodies where event_id=any($1::uuid[])`,
-    [uniqueIds],
+     from encrypted_event_bodies where event_id=any($1::uuid[])`, [uniqueIds],
   );
   const protectedByEvent = new Map(protectedRows.map((row) => [row.event_id, row]));
   if (protectedByEvent.size !== uniqueIds.length) throw new Error("EVENT_BODY_NOT_FOUND");
-  const keyIds = new Set<string>();
-  for (const id of uniqueIds) {
-    const keyId = protectedByEvent.get(id)!.data_key_id;
-    if (!keyId) throw new Error("EVENT_KEY_UNAVAILABLE");
-    keyIds.add(keyId);
-  }
-  const keyRows = await database.query<AggregateKeyRow>(
-    `select id,aggregate_id,root_key_version,wrapped_key,wrap_iv,wrap_auth_tag
-     from aggregate_data_keys where id=any($1::uuid[])`,
-    [[...keyIds]],
-  );
   const keysById = new Map(keyRows.map((row) => [row.id, row]));
-  if (keysById.size !== keyIds.size) throw new Error("EVENT_KEY_UNAVAILABLE");
   const unwrapped = new Map<string, Buffer>();
   const bodies = new Map<string, JsonValue>();
   try {
@@ -481,8 +617,10 @@ export async function readEventBodies(
     for (const id of uniqueIds) {
       const event = events.get(id)!;
       const protectedRow = protectedByEvent.get(id)!;
-      const keyRow = keysById.get(protectedRow.data_key_id!)!;
-      if (keyRow.aggregate_id !== protectedRow.aggregate_id
+      const keyRow = protectedRow.data_key_id
+        ? keysById.get(protectedRow.data_key_id) : undefined;
+      if (!keyRow || keyRow !== keysByAggregate.get(event.aggregateId)
+          || keyRow.aggregate_id !== protectedRow.aggregate_id
           || keyRow.aggregate_id !== event.aggregateId) {
         throw new Error("EVENT_KEY_UNAVAILABLE");
       }

@@ -8,7 +8,12 @@ import {
   captureMemoryInput,
   consolidateEvents,
 } from "../../lib/server/consolidation/consolidate";
-import { appendEvent, readEventBodies, readEventBody } from "../../lib/server/events/store";
+import {
+  appendEvent,
+  lockAvailableMemorySourceBodies,
+  readEventBodies,
+  readEventBody,
+} from "../../lib/server/events/store";
 import { canonicalContentDigest, canonicalJson } from "../../lib/server/events/integrity";
 import type { EventVisibility, JsonValue } from "../../lib/server/events/types";
 import type {
@@ -21,6 +26,7 @@ import type {
   ProcessMemoryEventContext,
   ProcessMemoryEventInput,
 } from "../../lib/server/memory/types";
+import { memoryVectorBucketDigests } from "../../lib/server/memory/vector-index";
 
 interface SourceEventRow extends Record<string, unknown> {
   id: string;
@@ -267,6 +273,288 @@ function deriveIndexHmacKey(dataKey: Buffer): Buffer {
   return createHmac("sha256", dataKey).update("gustavo:memory-search-key:v1").digest();
 }
 
+export interface MemoryVectorBackfillDomain {
+  readonly scope: MemoryScope;
+  readonly accountId: string | null;
+  readonly nodeBrainId: string | null;
+  readonly conversationId: string | null;
+}
+
+interface MemoryVectorBackfillRow extends Record<string, unknown> {
+  readonly id: string;
+  readonly body_event_id: string;
+  readonly body_key_id: string;
+  readonly scope: MemoryScope;
+  readonly account_id: string | null;
+  readonly node_brain_id: string | null;
+  readonly conversation_id: string | null;
+  readonly search_key_id: string | null;
+  readonly embedding_version: string;
+  readonly embedding_digest: string;
+  readonly embedding_dimension: number;
+  readonly search_embedding: number[] | null;
+}
+
+interface MemoryVectorBackfillCheckpointRow extends Record<string, unknown> {
+  readonly id: string;
+  readonly scope: MemoryScope;
+  readonly account_id: string | null;
+  readonly node_brain_id: string | null;
+  readonly conversation_id: string | null;
+  readonly last_memory_id: string | null;
+}
+
+const MEMORY_VECTOR_BACKFILL_LIMIT = 100;
+
+export async function backfillHistoricalMemoryVectorBuckets(
+  context: ProcessMemoryEventContext,
+  domains: readonly MemoryVectorBackfillDomain[],
+  embeddingVersion: string,
+): Promise<number> {
+  if (!context || typeof context !== "object" || !memoryWorkerContexts.has(context)) {
+    throw new Error("MEMORY_WORKER_CONTEXT_INVALID");
+  }
+  required(embeddingVersion, "MEMORY_EMBEDDING_VERSION_REQUIRED", 200);
+  if (!Array.isArray(domains) || domains.length === 0 || domains.length > 6) return 0;
+  const acquired = await context.db.one<{ acquired: boolean }>(
+    "select pg_try_advisory_xact_lock(hashtextextended('memory-vector-backfill:v1',0)) acquired",
+  );
+  if (!acquired.acquired) return 0;
+  const domainJson = domains.map((domain) => ({
+    scope: domain.scope,
+    accountId: domain.accountId,
+    nodeBrainId: domain.nodeBrainId,
+    conversationId: domain.conversationId,
+  }));
+  await context.db.query(
+    `/* memory-vector-backfill-checkpoints */
+     insert into memory_vector_backfill_checkpoints (
+       scope,account_id,node_brain_id,conversation_id,embedding_version
+     )
+     select domain.value->>'scope',(domain.value->>'accountId')::uuid,
+            (domain.value->>'nodeBrainId')::uuid,(domain.value->>'conversationId')::uuid,$2
+     from jsonb_array_elements($1::jsonb) domain(value)
+     on conflict (scope,account_id,node_brain_id,conversation_id,embedding_version)
+       do nothing`,
+    [JSON.stringify(domainJson), embeddingVersion],
+  );
+  await context.db.query(
+    `/* memory-vector-backfill-complete-empty */
+     update memory_vector_backfill_checkpoints checkpoint
+        set completed=true,updated_at=clock_timestamp()
+     from jsonb_array_elements($1::jsonb) domain(value)
+     where not checkpoint.completed and checkpoint.embedding_version=$2
+       and checkpoint.scope=domain.value->>'scope'
+       and checkpoint.account_id is not distinct from (domain.value->>'accountId')::uuid
+       and checkpoint.node_brain_id is not distinct from (domain.value->>'nodeBrainId')::uuid
+       and checkpoint.conversation_id is not distinct from (domain.value->>'conversationId')::uuid
+       and not exists (
+         select 1 from memory_records memory
+         where memory.has_embedding and memory.embedding_version=checkpoint.embedding_version
+           and memory.scope=checkpoint.scope
+           and memory.account_id is not distinct from checkpoint.account_id
+           and memory.node_brain_id is not distinct from checkpoint.node_brain_id
+           and memory.conversation_id is not distinct from checkpoint.conversation_id
+           and memory.id>coalesce(checkpoint.last_memory_id,
+             '00000000-0000-0000-0000-000000000000'::uuid)
+       )`,
+    [JSON.stringify(domainJson), embeddingVersion],
+  );
+  const checkpoints = await context.db.query<MemoryVectorBackfillCheckpointRow>(
+    `/* memory-vector-backfill-checkpoint */
+     select checkpoint.id::text,checkpoint.scope,checkpoint.account_id::text,
+            checkpoint.node_brain_id::text,checkpoint.conversation_id::text,
+            checkpoint.last_memory_id::text
+     from jsonb_array_elements($1::jsonb) with ordinality domain(value,ordinal)
+     join memory_vector_backfill_checkpoints checkpoint
+       on checkpoint.scope=domain.value->>'scope'
+      and checkpoint.account_id is not distinct from (domain.value->>'accountId')::uuid
+      and checkpoint.node_brain_id is not distinct from (domain.value->>'nodeBrainId')::uuid
+      and checkpoint.conversation_id is not distinct from (domain.value->>'conversationId')::uuid
+      and checkpoint.embedding_version=$2
+     where not checkpoint.completed
+     order by domain.ordinal
+     limit 1 for update of checkpoint`,
+    [JSON.stringify(domainJson), embeddingVersion],
+  );
+  const checkpoint = checkpoints[0];
+  if (!checkpoint) return 0;
+  const privateDomain = checkpoint.scope === "PRIVATE_ACCOUNT" || checkpoint.scope === "NODE_BRANCH";
+  const scanIdentity = privateDomain
+    ? `memory.account_id=$2::uuid and memory.node_brain_id=$3::uuid
+       and memory.conversation_id=$4::uuid`
+    : `memory.account_id is null and $2::uuid is null
+       and memory.node_brain_id is null and $3::uuid is null
+       and memory.conversation_id is null and $4::uuid is null`;
+  const scanned = await context.db.query<{ id: string } & Record<string, unknown>>(
+    `/* memory-vector-backfill-scan */
+     select memory.id::text
+     from memory_records memory
+     where memory.scope=$1
+       and ${scanIdentity}
+       and memory.embedding_version=$5 and memory.has_embedding
+       and memory.id>coalesce($6::uuid,'00000000-0000-0000-0000-000000000000'::uuid)
+     order by memory.id
+     limit 100`,
+    [checkpoint.scope, checkpoint.account_id, checkpoint.node_brain_id,
+      checkpoint.conversation_id, embeddingVersion, checkpoint.last_memory_id],
+  );
+  if (scanned.length === 0) {
+    await context.db.query(
+      `/* memory-vector-backfill-checkpoint-finished */
+       update memory_vector_backfill_checkpoints
+       set completed=true,updated_at=clock_timestamp() where id=$1::bigint`,
+      [checkpoint.id],
+    );
+    return 0;
+  }
+  await context.db.query(
+    `/* memory-vector-backfill-checkpoint-advance */
+     update memory_vector_backfill_checkpoints
+     set last_memory_id=$2,scanned_count=scanned_count+$3,
+         completed=$4,updated_at=clock_timestamp()
+     where id=$1::bigint`,
+    [checkpoint.id, scanned[scanned.length - 1]!.id, scanned.length,
+      scanned.length < MEMORY_VECTOR_BACKFILL_LIMIT],
+  );
+  const rows = await context.db.query<MemoryVectorBackfillRow>(
+    `/* memory-vector-backfill-eligible */
+     select memory.id::text,memory.body_event_id::text,body.data_key_id::text body_key_id,
+            memory.scope,memory.account_id::text,memory.node_brain_id::text,
+            memory.conversation_id::text,memory.search_key_id::text,memory.embedding_version,
+            memory.embedding_digest,memory.embedding_dimension,
+            embedding.search_embedding
+     from memory_records memory
+     join encrypted_event_bodies body on body.event_id=memory.body_event_id
+       and body.data_key_id is not null
+     join aggregate_data_keys body_key on body_key.id=body.data_key_id
+     left join memory_embeddings embedding on embedding.memory_id=memory.id
+       and embedding.active and embedding.embedding_version=memory.embedding_version
+     where memory.id=any($1::uuid[]) and memory.has_embedding and memory.embedding_version=$3
+       and (memory.scope='PUBLIC' and embedding.memory_id is not null
+         or memory.scope<>'PUBLIC' and exists (
+           select 1 from aggregate_data_keys search_key where search_key.id=memory.search_key_id
+         ))
+       and (select count(*) from memory_vector_buckets bucket
+            where bucket.memory_id=memory.id)<6
+       and exists (
+         select 1 from jsonb_array_elements($2::jsonb) domain
+         where domain->>'scope'=memory.scope
+           and (memory.scope not in ('PRIVATE_ACCOUNT','NODE_BRANCH') or (
+             memory.account_id::text=domain->>'accountId'
+             and memory.node_brain_id::text=domain->>'nodeBrainId'
+             and memory.conversation_id::text=domain->>'conversationId'
+           ))
+       )
+       and not exists (
+         select 1 from memory_records sibling
+         where sibling.body_event_id=memory.body_event_id and not exists (
+           select 1 from jsonb_array_elements($2::jsonb) domain
+           where domain->>'scope'=sibling.scope
+             and (sibling.scope not in ('PRIVATE_ACCOUNT','NODE_BRANCH') or (
+               sibling.account_id::text=domain->>'accountId'
+               and sibling.node_brain_id::text=domain->>'nodeBrainId'
+               and sibling.conversation_id::text=domain->>'conversationId'
+             ))
+         )
+       )
+     order by memory.id
+     limit ${MEMORY_VECTOR_BACKFILL_LIMIT}`,
+    [scanned.map(({ id }) => id), JSON.stringify(domainJson), embeddingVersion],
+  );
+  if (rows.length === 0) return 0;
+  const lockedBodyEventIds = new Set(await lockAvailableMemorySourceBodies(
+    context.db, [...new Set(rows.map(({ body_event_id }) => body_event_id))],
+  ));
+  const availableRows = rows.filter(({ body_event_id }) => lockedBodyEventIds.has(body_event_id));
+  if (availableRows.length === 0) return 0;
+  const protectedRows = availableRows.filter(({ scope }) => scope !== "PUBLIC");
+  const bodyEventIds = [...new Set(protectedRows.map(({ body_event_id }) => body_event_id))];
+  const bodies = bodyEventIds.length === 0 ? [] : await readEventBodies(
+    context.db, bodyEventIds, { actor: { role: "SYSTEM" } },
+  );
+  const memoriesByBody = new Map(bodies.map(({ eventId, body }) => {
+    const header = protectedBodyHeader(body);
+    if (!header.memories) throw new Error("INVALID_MEMORY_CONSOLIDATION_BODY");
+    return [eventId, captureMemoryInput(header.memories)] as const;
+  }));
+  const searchKeyIds = [...new Set(protectedRows.map(({ search_key_id }) => search_key_id)
+    .filter((id): id is string => id !== null))];
+  const keyRows = searchKeyIds.length === 0 ? [] : await context.db.query<
+    AggregateKeyRow & { readonly aggregate_id: string }
+  >(
+    `select id::text,aggregate_id,root_key_version,wrapped_key,wrap_iv,wrap_auth_tag
+     from aggregate_data_keys where id=any($1::uuid[]) order by id for key share`,
+    [searchKeyIds],
+  );
+  if (keyRows.length !== searchKeyIds.length) throw new Error("EVENT_KEY_UNAVAILABLE");
+  const indexKeys = new Map<string, Buffer>();
+  const dataKeys: Buffer[] = [];
+  try {
+    for (const keyRow of keyRows) {
+      const dataKey = unwrapDataKey(keyRow.aggregate_id, {
+        rootKeyVersion: keyRow.root_key_version, wrappedKey: keyRow.wrapped_key,
+        iv: keyRow.wrap_iv, authTag: keyRow.wrap_auth_tag,
+      });
+      dataKeys.push(dataKey);
+      indexKeys.set(keyRow.id, deriveIndexHmacKey(dataKey));
+    }
+    const bucketRows = availableRows.map((row) => {
+      let vector: readonly number[];
+      if (row.scope === "PUBLIC") {
+        if (!row.search_embedding) throw new Error("INVALID_MEMORY_SEARCH_EMBEDDING");
+        vector = row.search_embedding;
+      } else {
+        const memoryValue = memoriesByBody.get(row.body_event_id)?.find((item) => (
+          item !== null && typeof item === "object" && !Array.isArray(item)
+          && "id" in item && item.id === row.id
+        ));
+        if (!memoryValue || typeof memoryValue !== "object" || Array.isArray(memoryValue)) {
+          throw new Error("MEMORY_REPLAY_BODY_MISMATCH");
+        }
+        const memory = memoryValue as unknown as Record<string, unknown>;
+        if (memory.scope !== row.scope || memory.accountId !== row.account_id
+            || memory.nodeBrainId !== row.node_brain_id
+            || memory.conversationId !== row.conversation_id
+            || memory.embeddingVersion !== row.embedding_version
+            || memory.embeddingDigest !== row.embedding_digest
+            || !Array.isArray(memory.embedding)
+            || memory.embedding.length !== row.embedding_dimension) {
+          throw new Error("MEMORY_REPLAY_BODY_MISMATCH");
+        }
+        vector = memory.embedding.map((component) => {
+          if (typeof component !== "number") throw new Error("INVALID_MEMORY_SEARCH_EMBEDDING");
+          return component;
+        });
+      }
+      const indexKey = row.search_key_id === null ? null : indexKeys.get(row.search_key_id);
+      if (row.scope !== "PUBLIC" && !indexKey) throw new Error("EVENT_KEY_UNAVAILABLE");
+      return Object.freeze({ ...row, digests: memoryVectorBucketDigests({
+        vector, scope: row.scope, embeddingVersion: row.embedding_version,
+        indexKey: indexKey ?? null,
+      }) });
+    });
+    await context.db.query(
+      `insert into memory_vector_buckets (
+         memory_id,ordinal,scope,account_id,node_brain_id,conversation_id,search_key_id,
+         body_key_id,embedding_version,bucket_digest
+       ) select (item->>'id')::uuid,(bucket.ordinal-1)::integer,item->>'scope',
+                (item->>'account_id')::uuid,(item->>'node_brain_id')::uuid,
+                (item->>'conversation_id')::uuid,(item->>'search_key_id')::uuid,
+                (item->>'body_key_id')::uuid,item->>'embedding_version',bucket.digest
+         from jsonb_array_elements($1::jsonb) item
+         cross join lateral jsonb_array_elements_text(item->'digests')
+           with ordinality bucket(digest,ordinal)
+       on conflict do nothing`,
+      [JSON.stringify(bucketRows)],
+    );
+  } finally {
+    for (const key of indexKeys.values()) key.fill(0);
+    for (const key of dataKeys) key.fill(0);
+  }
+  return availableRows.length;
+}
+
 function validatedSearchVector(value: readonly number[]): readonly number[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > 8_192
       || value.some((component) => typeof component !== "number" || !Number.isFinite(component)
@@ -421,15 +709,37 @@ async function persistableForScope(
   input: ProcessMemoryEventInput,
   memories: readonly ConsolidatedMemory[],
   salt: Buffer,
-): Promise<{ readonly memories: readonly ConsolidatedMemory[]; readonly searchKeyId: string | null }> {
+): Promise<{
+  readonly memories: readonly ConsolidatedMemory[];
+  readonly searchKeyId: string | null;
+  readonly vectorBucketDigests: ReadonlyMap<string, readonly string[]>;
+}> {
   if (!protectedScope(input.scope)) {
-    return { memories: persistableMemories(memories, salt, null), searchKeyId: null };
+    const persisted = persistableMemories(memories, salt, null);
+    return {
+      memories: persisted,
+      searchKeyId: null,
+      vectorBucketDigests: new Map(persisted.map((memory) => [memory.id,
+        memory.embedding === null ? Object.freeze([]) : memoryVectorBucketDigests({
+          vector: memory.embedding, scope: memory.scope,
+          embeddingVersion: memory.embeddingVersion, indexKey: null,
+        })])),
+    };
   }
   const retrieval = await loadRetrievalKey(db, input, true);
   if (!retrieval) throw new Error("MEMORY_RETRIEVAL_KEY_REQUIRED");
   const indexKey = deriveIndexHmacKey(retrieval.dataKey);
   try {
-    return { memories: persistableMemories(memories, salt, indexKey), searchKeyId: retrieval.id };
+    const persisted = persistableMemories(memories, salt, indexKey);
+    return {
+      memories: persisted,
+      searchKeyId: retrieval.id,
+      vectorBucketDigests: new Map(persisted.map((memory) => [memory.id,
+        memory.embedding === null ? Object.freeze([]) : memoryVectorBucketDigests({
+          vector: memory.embedding, scope: memory.scope,
+          embeddingVersion: memory.embeddingVersion, indexKey,
+        })])),
+    };
   } finally {
     indexKey.fill(0);
     retrieval.dataKey.fill(0);
@@ -575,6 +885,7 @@ async function insertMemory(
   sourceSequences: ReadonlyMap<string, string>,
   sourceById: ReadonlyMap<string, SourceEventRow>,
   searchKeyId: string | null,
+  vectorBucketDigests: readonly string[],
 ): Promise<void> {
   const authority = supersessionAuthority(memory, sourceById);
   await db.query(
@@ -665,6 +976,19 @@ async function insertMemory(
       [memory.id, memory.accountId, memory.nodeBrainId, memory.conversationId, memory.scope,
         memory.embeddingVersion, memory.embeddingDigest, memory.embeddingDimension,
         memory.embedding],
+    );
+  }
+  if (memory.embedding !== null) {
+    await db.query(
+      `insert into memory_vector_buckets (
+         memory_id,ordinal,scope,account_id,node_brain_id,conversation_id,search_key_id,
+         body_key_id,embedding_version,bucket_digest
+       ) select $1,(bucket.ordinal-1)::int,$2,$3,$4,$5,$6,body.data_key_id,$7,bucket.digest
+           from encrypted_event_bodies body
+           cross join unnest($8::text[]) with ordinality bucket(digest,ordinal)
+           where body.event_id=$9 and body.data_key_id is not null`,
+      [memory.id, memory.scope, memory.accountId, memory.nodeBrainId, memory.conversationId,
+        searchKeyId, memory.embeddingVersion, vectorBucketDigests, bodyEventId],
     );
   }
   if (authority) {
@@ -936,7 +1260,8 @@ export async function processMemoryEvent(
     );
     for (const memory of memories) {
       await insertMemory(transaction, runId, derived.id, completedAt, memory, sourceTimes,
-        sourceSequences, sourceById, persistedMemory.searchKeyId);
+        sourceSequences, sourceById, persistedMemory.searchKeyId,
+        persistedMemory.vectorBucketDigests.get(memory.id) ?? Object.freeze([]));
     }
     await transaction.query(
       `insert into memory_dossier_refreshes (
