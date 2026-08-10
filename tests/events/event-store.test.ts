@@ -1,15 +1,88 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { EventDatabase, JsonValue } from "../../lib/server/events/types";
 import { openTestDb } from "../helpers/postgres";
 import {
   appendEvent,
+  appendEvents,
   readEventBodies,
   readEventBody,
   rewrapAggregateDataKey,
 } from "../../lib/server/events/store";
 
 describe("appendEvent", () => {
+  it("batch-appends ordered idempotent events atomically with bounded aggregate-key work", async () => {
+    const db = await openTestDb();
+    let queryCount = 0;
+    const counted = (database: EventDatabase): EventDatabase => ({
+      query: async (sql, parameters) => {
+        queryCount += 1;
+        return database.query(sql, parameters);
+      },
+      one: async (sql, parameters) => {
+        queryCount += 1;
+        return database.one(sql, parameters);
+      },
+      transaction: (work) => database.transaction((transaction) => work(counted(transaction))),
+    });
+    const inputs = Array.from({ length: 100 }, (_, index) => ({
+      aggregateId: `batch-aggregate-${index % 3}`,
+      accountId: "batch-owner",
+      actor: { type: "SYSTEM" as const, id: "batch-writer" },
+      type: "batch.item.committed",
+      visibility: "PRIVATE_ACCOUNT" as const,
+      body: { index, secret: `private-${index}` },
+      idempotencyKey: `batch-write:${index}`,
+    }));
+    const written = await appendEvents(counted(db), inputs);
+    expect(written).toHaveLength(100);
+    expect(new Set(written.map(({ id }) => id)).size).toBe(100);
+    expect(written.map(({ aggregateId }) => aggregateId)).toEqual(
+      inputs.map(({ aggregateId }) => aggregateId),
+    );
+    expect(queryCount).toBeLessThanOrEqual(9);
+    expect(await db.one<{ events: number; bodies: number; jobs: number }>(
+      `select (select count(*)::int from events where type='batch.item.committed') as events,
+              (select count(*)::int from encrypted_event_bodies b join events e on e.id=b.event_id
+                where e.type='batch.item.committed') as bodies,
+              (select count(*)::int from transactional_outbox o join events e on e.id=o.event_id
+                where e.type='batch.item.committed') as jobs`,
+    )).toEqual({ events: 100, bodies: 100, jobs: 100 });
+
+    queryCount = 0;
+    const replayed = await appendEvents(counted(db), [inputs[2], inputs[0], inputs[2]]);
+    expect(replayed.map(({ id }) => id)).toEqual([written[2].id, written[0].id, written[2].id]);
+    expect(queryCount).toBeLessThanOrEqual(3);
+    await expect(appendEvents(db, [{ ...inputs[0], body: { index: -1 } }]))
+      .rejects.toThrow("IDEMPOTENCY_KEY_REUSED");
+    await expect(appendEvents(db, Array.from({ length: 101 }, (_, index) => ({
+      ...inputs[0], idempotencyKey: `batch-over-limit:${index}`,
+    })))).rejects.toThrow("EVENT_APPEND_BATCH_LIMIT");
+
+    await db.query(`
+      create function reject_batch_test_outbox() returns trigger language plpgsql as $$
+      begin
+        if new.topic = 'batch.force.rollback' then raise exception 'TEST_BATCH_OUTBOX_FAILURE'; end if;
+        return new;
+      end; $$;
+      create trigger reject_batch_test_outbox before insert on transactional_outbox
+      for each row execute function reject_batch_test_outbox();
+    `);
+    const fillSpy = vi.spyOn(Buffer.prototype, "fill");
+    try {
+      await expect(appendEvents(db, [
+        { ...inputs[0], type: "batch.before.rollback", idempotencyKey: "batch-atomic:first" },
+        { ...inputs[1], type: "batch.force.rollback", idempotencyKey: "batch-atomic:second" },
+      ])).rejects.toThrow("TEST_BATCH_OUTBOX_FAILURE");
+      expect(fillSpy.mock.calls.filter(([value]) => value === 0).length).toBeGreaterThanOrEqual(2);
+    } finally {
+      fillSpy.mockRestore();
+    }
+    expect(await db.one(
+      "select count(*)::int count from events where idempotency_key like 'batch-atomic:%'",
+    )).toEqual({ count: 0 });
+  }, 30_000);
+
   it("writes the event and its outbox job in one transaction", async () => {
     const db = await openTestDb();
     const event = await appendEvent(db, {

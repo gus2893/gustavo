@@ -44,6 +44,10 @@ interface EventRow extends Record<string, unknown> {
   integrity_hash: string;
 }
 
+interface IdempotentEventRow extends EventRow {
+  idempotency_key: string;
+}
+
 interface AggregateKeyRow extends Record<string, unknown> {
   id: string;
   aggregate_id: string;
@@ -231,152 +235,184 @@ const EVENT_COLUMNS = `
   policy_version, request_hash, integrity_hash
 `;
 
-export async function appendEvent(
-  database: EventDatabase,
-  input: AppendEventInput,
-): Promise<StoredEvent> {
+const EVENT_APPEND_BATCH_LIMIT = 100;
+
+function batchValues(rowCount: number, columnCount: number): string {
+  return Array.from({ length: rowCount }, (_, row) => (
+    `(${Array.from({ length: columnCount }, (__, column) => (
+      `$${row * columnCount + column + 1}`
+    )).join(",")})`
+  )).join(",");
+}
+
+interface PreparedAppend {
+  readonly input: AppendEventInput;
+  readonly accountId: string | null;
+  readonly requestHash: string;
+}
+
+function prepareAppend(input: AppendEventInput): PreparedAppend {
   requireNonEmpty(input.aggregateId, "aggregate_id");
   requireNonEmpty(input.actor.id, "actor_id");
   requireNonEmpty(input.type, "type");
   requireNonEmpty(input.idempotencyKey, "idempotency_key");
   const accountId = eventOwner(input);
-  const requestHash = canonicalContentDigest(requestDocument(input, accountId));
+  return Object.freeze({
+    input,
+    accountId,
+    requestHash: canonicalContentDigest(requestDocument(input, accountId)),
+  });
+}
+
+export async function appendEvents(
+  database: EventDatabase,
+  inputs: readonly AppendEventInput[],
+): Promise<readonly StoredEvent[]> {
+  if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > EVENT_APPEND_BATCH_LIMIT) {
+    throw new Error("EVENT_APPEND_BATCH_LIMIT");
+  }
+  const prepared = inputs.map(prepareAppend);
+  const uniqueByIdempotency = new Map<string, PreparedAppend>();
+  for (const item of prepared) {
+    const prior = uniqueByIdempotency.get(item.input.idempotencyKey);
+    if (prior && prior.requestHash !== item.requestHash) throw new Error("IDEMPOTENCY_KEY_REUSED");
+    uniqueByIdempotency.set(item.input.idempotencyKey, prior ?? item);
+  }
+  const unique = [...uniqueByIdempotency.values()];
 
   return database.transaction(async (transaction) => {
-    await transaction.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
-      `event-idempotency:${input.idempotencyKey}`,
-    ]);
-    const duplicateRows = await transaction.query<EventRow>(
-      `select ${EVENT_COLUMNS} from events where idempotency_key=$1`,
-      [input.idempotencyKey],
+    const idempotencyKeys = [...uniqueByIdempotency.keys()].sort();
+    await transaction.query(
+      `select pg_advisory_xact_lock(hashtextextended(item,0))
+         from unnest($1::text[]) item order by item`,
+      [idempotencyKeys.map((key) => `event-idempotency:${key}`)],
     );
-    const duplicate = duplicateRows[0];
-    if (duplicate) {
-      if (duplicate.request_hash !== requestHash) {
+    const duplicates = await transaction.query<IdempotentEventRow>(
+      `select ${EVENT_COLUMNS},idempotency_key from events
+        where idempotency_key=any($1::text[])`,
+      [idempotencyKeys],
+    );
+    const eventsByKey = new Map<string, StoredEvent>();
+    const requestByKey = new Map(unique.map((item) => [item.input.idempotencyKey, item]));
+    for (const duplicate of duplicates) {
+      const requested = requestByKey.get(duplicate.idempotency_key);
+      if (!requested || duplicate.request_hash !== requested.requestHash) {
         throw new Error("IDEMPOTENCY_KEY_REUSED");
       }
-      return mapEvent(duplicate);
+      eventsByKey.set(duplicate.idempotency_key, mapEvent(duplicate));
+    }
+    const pending = unique.filter(({ input }) => !eventsByKey.has(input.idempotencyKey));
+    if (pending.length === 0) {
+      return Object.freeze(prepared.map(({ input }) => eventsByKey.get(input.idempotencyKey)!));
     }
 
-    await transaction.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
-      `aggregate-key:${input.aggregateId}`,
-    ]);
-    let keyRows = await transaction.query<AggregateKeyRow>(
-      `select id, aggregate_id, root_key_version, wrapped_key, wrap_iv, wrap_auth_tag
-       from aggregate_data_keys where aggregate_id=$1`,
-      [input.aggregateId],
+    const aggregateIds = [...new Set(pending.map(({ input }) => input.aggregateId))].sort();
+    await transaction.query(
+      `select pg_advisory_xact_lock(hashtextextended(item,0))
+         from unnest($1::text[]) item order by item`,
+      [aggregateIds.map((aggregateId) => `aggregate-key:${aggregateId}`)],
     );
-    let dataKey: Buffer;
-    if (keyRows.length === 0) {
-      const created = createAndWrapDataKey(input.aggregateId);
-      dataKey = created.dataKey;
-      const dataKeyId = nextUuidV7();
-      await transaction.query(
-        `insert into aggregate_data_keys
-          (id, aggregate_id, root_key_version, wrapped_key, wrap_iv, wrap_auth_tag)
-         values ($1, $2, $3, $4, $5, $6)`,
-        [
-          dataKeyId,
-          input.aggregateId,
-          created.wrapped.rootKeyVersion,
-          created.wrapped.wrappedKey,
-          created.wrapped.iv,
-          created.wrapped.authTag,
-        ],
-      );
-      keyRows = [
-        {
-          id: dataKeyId,
-          aggregate_id: input.aggregateId,
+    const keyRows = await transaction.query<AggregateKeyRow>(
+      `select id,aggregate_id,root_key_version,wrapped_key,wrap_iv,wrap_auth_tag
+         from aggregate_data_keys where aggregate_id=any($1::text[])`,
+      [aggregateIds],
+    );
+    const keysByAggregate = new Map(keyRows.map((row) => [row.aggregate_id, row]));
+    const plaintextKeys = new Map<string, Buffer>();
+    try {
+      const newKeyRows: AggregateKeyRow[] = [];
+      for (const aggregateId of aggregateIds) {
+        const existing = keysByAggregate.get(aggregateId);
+        if (existing) {
+          plaintextKeys.set(aggregateId, unwrapDataKey(
+            aggregateId, wrappedFromAggregateRow(existing),
+          ));
+          continue;
+        }
+        const created = createAndWrapDataKey(aggregateId);
+        const row: AggregateKeyRow = {
+          id: nextUuidV7(), aggregate_id: aggregateId,
           root_key_version: created.wrapped.rootKeyVersion,
-          wrapped_key: created.wrapped.wrappedKey,
-          wrap_iv: created.wrapped.iv,
+          wrapped_key: created.wrapped.wrappedKey, wrap_iv: created.wrapped.iv,
           wrap_auth_tag: created.wrapped.authTag,
-        },
-      ];
-    } else {
-      dataKey = unwrapDataKey(input.aggregateId, wrappedFromAggregateRow(keyRows[0]));
-    }
-    const keyRow = keyRows[0];
+        };
+        keysByAggregate.set(aggregateId, row);
+        plaintextKeys.set(aggregateId, created.dataKey);
+        newKeyRows.push(row);
+      }
+      if (newKeyRows.length > 0) {
+        await transaction.query(
+          `insert into aggregate_data_keys
+             (id,aggregate_id,root_key_version,wrapped_key,wrap_iv,wrap_auth_tag)
+           values ${batchValues(newKeyRows.length, 6)}`,
+          newKeyRows.flatMap((row) => [row.id, row.aggregate_id, row.root_key_version,
+            row.wrapped_key, row.wrap_iv, row.wrap_auth_tag]),
+        );
+      }
 
-    const id = nextUuidV7();
-    const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
-    if (!Number.isFinite(occurredAt.getTime())) {
-      throw new Error("INVALID_EVENT_OCCURRED_AT");
+      const pendingRows = pending.map(({ input, accountId, requestHash }) => {
+        const id = nextUuidV7();
+        const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
+        if (!Number.isFinite(occurredAt.getTime())) throw new Error("INVALID_EVENT_OCCURRED_AT");
+        const correlationId = input.correlationId ?? id;
+        const eventWithoutHash: Omit<StoredEvent, "integrityHash"> = {
+          id, aggregateId: input.aggregateId, accountId, actor: input.actor,
+          type: input.type, visibility: input.visibility, occurredAt,
+          causationId: input.causationId ?? null, correlationId,
+          promptVersion: input.promptVersion ?? null, modelVersion: input.modelVersion ?? null,
+          policyVersion: input.policyVersion ?? null,
+        };
+        const integrityHash = canonicalContentDigest(integrityDocument(eventWithoutHash, input.body));
+        const encrypted = encryptEventBody(
+          id, integrityHash, Buffer.from(canonicalJson(input.body), "utf8"),
+          plaintextKeys.get(input.aggregateId)!,
+        );
+        return { input, accountId, requestHash, eventWithoutHash, integrityHash, encrypted,
+          keyRow: keysByAggregate.get(input.aggregateId)! };
+      });
+      await transaction.query(
+        `insert into events (
+           id,aggregate_id,account_id,actor_type,actor_id,type,visibility,occurred_at,
+           causation_id,correlation_id,prompt_version,model_version,policy_version,
+           idempotency_key,request_hash,integrity_hash
+         ) values ${batchValues(pendingRows.length, 16)}`,
+        pendingRows.flatMap((row) => [
+          row.eventWithoutHash.id, row.input.aggregateId, row.accountId,
+          row.input.actor.type, row.input.actor.id, row.input.type, row.input.visibility,
+          row.eventWithoutHash.occurredAt, row.input.causationId ?? null,
+          row.eventWithoutHash.correlationId, row.input.promptVersion ?? null,
+          row.input.modelVersion ?? null, row.input.policyVersion ?? null,
+          row.input.idempotencyKey, row.requestHash, row.integrityHash,
+        ]),
+      );
+      await transaction.query(
+        `insert into encrypted_event_bodies
+           (event_id,aggregate_id,data_key_id,ciphertext,body_iv,body_auth_tag)
+         values ${batchValues(pendingRows.length, 6)}`,
+        pendingRows.flatMap((row) => [row.eventWithoutHash.id, row.input.aggregateId,
+          row.keyRow.id, row.encrypted.ciphertext, row.encrypted.iv, row.encrypted.authTag]),
+      );
+      await transaction.query(
+        `insert into transactional_outbox (id,event_id,topic,payload)
+         values ${batchValues(pendingRows.length, 4)}`,
+        pendingRows.flatMap((row) => [nextUuidV7(), row.eventWithoutHash.id,
+          row.input.type, JSON.stringify({ eventId: row.eventWithoutHash.id })]),
+      );
+      for (const row of pendingRows) eventsByKey.set(row.input.idempotencyKey, {
+        ...row.eventWithoutHash, integrityHash: row.integrityHash,
+      });
+      return Object.freeze(prepared.map(({ input }) => eventsByKey.get(input.idempotencyKey)!));
+    } finally {
+      for (const key of plaintextKeys.values()) key.fill(0);
     }
-    const correlationId = input.correlationId ?? id;
-    const eventWithoutHash: Omit<StoredEvent, "integrityHash"> = {
-      id,
-      aggregateId: input.aggregateId,
-      accountId,
-      actor: input.actor,
-      type: input.type,
-      visibility: input.visibility,
-      occurredAt,
-      causationId: input.causationId ?? null,
-      correlationId,
-      promptVersion: input.promptVersion ?? null,
-      modelVersion: input.modelVersion ?? null,
-      policyVersion: input.policyVersion ?? null,
-    };
-    const canonicalBody = canonicalJson(input.body);
-    const integrityHash = canonicalContentDigest(
-      integrityDocument(eventWithoutHash, input.body),
-    );
-    const encrypted = encryptEventBody(
-      id,
-      integrityHash,
-      Buffer.from(canonicalBody, "utf8"),
-      dataKey,
-    );
-
-    await transaction.query(
-      `insert into events (
-        id, aggregate_id, account_id, actor_type, actor_id, type, visibility,
-        occurred_at, causation_id, correlation_id, prompt_version, model_version,
-        policy_version, idempotency_key, request_hash, integrity_hash
-      ) values (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
-      )`,
-      [
-        id,
-        input.aggregateId,
-        accountId,
-        input.actor.type,
-        input.actor.id,
-        input.type,
-        input.visibility,
-        occurredAt,
-        input.causationId ?? null,
-        correlationId,
-        input.promptVersion ?? null,
-        input.modelVersion ?? null,
-        input.policyVersion ?? null,
-        input.idempotencyKey,
-        requestHash,
-        integrityHash,
-      ],
-    );
-    await transaction.query(
-      `insert into encrypted_event_bodies (
-        event_id, aggregate_id, data_key_id, ciphertext, body_iv, body_auth_tag
-      ) values ($1, $2, $3, $4, $5, $6)`,
-      [
-        id,
-        input.aggregateId,
-        keyRow.id,
-        encrypted.ciphertext,
-        encrypted.iv,
-        encrypted.authTag,
-      ],
-    );
-    await transaction.query(
-      `insert into transactional_outbox (id, event_id, topic, payload)
-       values ($1, $2, $3, $4::jsonb)`,
-      [nextUuidV7(), id, input.type, JSON.stringify({ eventId: id })],
-    );
-    return { ...eventWithoutHash, integrityHash };
   });
+}
+
+export async function appendEvent(
+  database: EventDatabase,
+  input: AppendEventInput,
+): Promise<StoredEvent> {
+  return (await appendEvents(database, [input]))[0];
 }
 
 export async function readEventBody(
