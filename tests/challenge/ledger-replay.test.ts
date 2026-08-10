@@ -14,7 +14,7 @@ import {
   type ChallengeLedgerEvent,
 } from "../../lib/server/challenge/projection";
 import { INITIAL_PROFILE } from "../../lib/server/challenge/profile";
-import { testContext } from "../helpers/postgres";
+import { createChallengeDecisionFixture, testContext } from "../helpers/postgres";
 
 const stageStarted = {
   id: "1",
@@ -26,6 +26,7 @@ const stageStarted = {
 async function dependencyStage() {
   const { db } = await testContext();
   const stageId = randomUUID();
+  const stageStartedEventId = randomUUID();
   await db.query(
     `insert into challenge_stages (
        id, challenge_portfolio_id, profile_version_id, stage_profile_id,
@@ -39,7 +40,7 @@ async function dependencyStage() {
        id, challenge_portfolio_id, stage_id, profile_version_id, sequence,
        type, payload, occurred_at, actor_type, actor_id, idempotency_key
      ) values ($1,$2,$3,$4,1,'stage.started',$5,$6,'SYSTEM','dependency-test',$7)`,
-    [randomUUID(), INITIAL_PROFILE.challengePortfolioId, stageId,
+    [stageStartedEventId, INITIAL_PROFILE.challengePortfolioId, stageId,
       INITIAL_PROFILE.profileVersionId, { amount: "2500.00" },
       "2026-08-09T00:00:01.000Z", `dependency-stage-${stageId}`],
   );
@@ -50,21 +51,99 @@ async function dependencyStage() {
     type: string,
     payload: object,
     key: string,
+    causationId: string | null = null,
   ) => transaction.query(
     `insert into challenge_ledger_events (
        id, challenge_portfolio_id, stage_id, profile_version_id, sequence,
-       type, payload, occurred_at, actor_type, actor_id, idempotency_key
-     ) values ($1,$2,$3,$4,$5,$6,$7,$8,'SYSTEM','dependency-test',$9)`,
+       type, payload, occurred_at, actor_type, actor_id, idempotency_key,
+       causation_id
+     ) values ($1,$2,$3,$4,$5,$6,$7,$8,'SYSTEM','dependency-test',$9,$10)`,
     [id, INITIAL_PROFILE.challengePortfolioId, stageId,
       INITIAL_PROFILE.profileVersionId, sequence, type, payload,
-      `2026-08-09T00:00:${String(sequence).padStart(2, "0")}.000Z`, key],
+      `2026-08-09T00:00:${String(sequence).padStart(2, "0")}.000Z`, key, causationId],
   );
-  return { db, stageId, insertEvent };
+  return { db, stageId, stageStartedEventId, insertEvent };
+}
+
+async function insertAcceptedRiskEvaluation(
+  transaction: Awaited<ReturnType<typeof testContext>>["db"],
+  stageId: string,
+  intentId: string,
+  intentEventId: string,
+  sequence: number,
+  occurredAt: string,
+  key: string,
+  decision: Awaited<ReturnType<typeof createChallengeDecisionFixture>>,
+  highWaterEventId: string,
+): Promise<Readonly<{ evaluationId: string; evaluationEventId: string }>> {
+  const evaluationId = randomUUID();
+  const evaluationEventId = randomUUID();
+  const quantity = decision.geometry.desiredRisk === "12.38000001" ? "2" : "1";
+  const proposedStopRisk = quantity === "2" ? "12.38" : "7.19";
+  const proposedNotional = quantity === "2" ? "200.2" : "100.1";
+  await transaction.query(
+    `insert into challenge_ledger_events (
+       id, challenge_portfolio_id, stage_id, profile_version_id, sequence,
+       type, payload, occurred_at, actor_type, actor_id, idempotency_key,
+       causation_id, correlation_id
+     ) values ($1,$2,$3,$4,$5,'rule.evaluated',$6,$7,'SYSTEM','challenge-risk-v1',$8,$9,$9)`,
+    [evaluationEventId, INITIAL_PROFILE.challengePortfolioId, stageId,
+      INITIAL_PROFILE.profileVersionId, sequence, {
+        evaluationId,
+        intentId,
+        evaluatedLedgerHighWaterId: highWaterEventId,
+        accepted: true,
+        reasons: [],
+        evaluatedAt: occurredAt,
+        riskPolicyVersion: "challenge-risk-v1",
+        riskSnapshot: {
+          actorType: "MAIN_BRAIN",
+          startingBalance: "2500.00",
+          currentEquity: "2500.00",
+          dayStartEquity: "2500.00",
+          realizedDayLoss: "0",
+          openLoss: "0",
+          existingStopRisk: "0",
+          proposedStopRisk,
+          existingGrossNotional: "0",
+          proposedNotional,
+          entryCommission: "1",
+          postEntryEquity: "2499",
+          pendingOpenCount: 0,
+          symbolAlreadyActive: false,
+          profileVersionId: INITIAL_PROFILE.profileVersionId,
+          ledgerHighWaterId: highWaterEventId,
+        },
+        decisionProvenance: {
+          decisionWindowId: decision.decisionWindowId,
+          selectionEventId: decision.selectionEventId,
+          selectedCandidateId: decision.selectedCandidateId,
+          selectedCandidateEventId: decision.selectedCandidateEventId,
+          selectedCandidateCommitmentDigest: decision.selectedCandidateCommitmentDigest,
+          evaluatorRunId: decision.evaluatorRunId,
+          marketObservationId: decision.marketObservationId,
+          marketObservationIds: [decision.marketObservationId],
+          selectedGeometry: decision.geometry,
+        },
+      }, occurredAt, key, intentEventId],
+  );
+  await transaction.query(
+    `insert into challenge_rule_evaluations (
+       id,stage_id,profile_version_id,ledger_event_id,intent_id,
+       evaluated_ledger_high_water_id,accepted,reasons,evaluated_at
+     ) values ($1,$2,$3,$4,$5,$6,true,'[]'::jsonb,$7)`,
+    [evaluationId, stageId, INITIAL_PROFILE.profileVersionId,
+      evaluationEventId, intentId, highWaterEventId, occurredAt],
+  );
+  return Object.freeze({ evaluationId, evaluationEventId });
 }
 
 async function activePositionStage() {
   const context = await dependencyStage();
-  const { db, stageId, insertEvent } = context;
+  const { db, stageId, stageStartedEventId, insertEvent } = context;
+  const decision = await createChallengeDecisionFixture(
+    db, stageId, stageStartedEventId, `active-${stageId}`, "12.38000001",
+  );
   const intentId = randomUUID();
   const orderId = randomUUID();
   const positionId = randomUUID();
@@ -75,42 +154,58 @@ async function activePositionStage() {
   await db.transaction(async (transaction) => {
     await insertEvent(transaction as typeof db, 2, intentEventId, "paper.intent.proposed", {
       intentId, direction: "PAPER_LONG", symbol: "AAPL", entryPrice: "100.00",
-      stopPrice: "95.00", targetPrice: "110.00", desiredRisk: "25.00",
+      stopPrice: "95.00", targetPrice: "110.00", desiredRisk: decision.geometry.desiredRisk,
       expiresAt: "2026-08-09T01:00:00.000Z", initialStatus: "PROPOSED",
       createdAt: "2026-08-09T00:00:02.000Z",
+      sourceDecisionId: decision.decisionWindowId,
+      selectionEventId: decision.selectionEventId,
+      marketObservationId: decision.marketObservationId,
     }, `active-intent-${stageId}`);
-    await insertEvent(transaction as typeof db, 3, orderEventId, "paper.order.created", {
-      orderId, intentId, symbol: "AAPL", side: "BUY", quantity: "2",
-      initialStatus: "PENDING", createdAt: "2026-08-09T00:00:03.000Z",
-    }, `active-order-${stageId}`);
-    await insertEvent(transaction as typeof db, 4, openingEventId, "paper.fill.created", {
-      fillId: openingFillId, orderId, positionId, symbol: "AAPL", side: "BUY",
-      quantity: "1", price: "100.00", commission: "0.00",
-      openedAt: "2026-08-09T00:00:04.000Z", filledAt: "2026-08-09T00:00:04.000Z",
-    }, `active-opening-fill-${stageId}`);
     await transaction.query(
       `insert into challenge_intents (
          id,stage_id,profile_version_id,ledger_event_id,symbol,direction,
          entry_price,stop_price,target_price,desired_risk,expires_at,initial_status,created_at
-       ) values ($1,$2,$3,$4,'AAPL','PAPER_LONG','100.00','95.00','110.00','25.00',
-                 $5,'PROPOSED',$6)`,
+       ) values ($1,$2,$3,$4,'AAPL','PAPER_LONG','100.00','95.00','110.00',$5,
+                 $6,'PROPOSED',$7)`,
       [intentId, stageId, INITIAL_PROFILE.profileVersionId, intentEventId,
-        "2026-08-09T01:00:00.000Z", "2026-08-09T00:00:02.000Z"],
+        decision.geometry.desiredRisk, "2026-08-09T01:00:00.000Z",
+        "2026-08-09T00:00:02.000Z"],
     );
+    const acceptedRisk = await insertAcceptedRiskEvaluation(
+      transaction as typeof db,
+      stageId,
+      intentId,
+      intentEventId,
+      3,
+      "2026-08-09T00:00:03.000Z",
+      `active-risk-${stageId}`,
+      decision,
+      stageStartedEventId,
+    );
+    await insertEvent(transaction as typeof db, 4, orderEventId, "paper.order.created", {
+      orderId, intentId, symbol: "AAPL", side: "BUY", quantity: "2",
+      initialStatus: "PENDING", createdAt: "2026-08-09T00:00:04.000Z",
+      acceptedRiskEvaluationId: acceptedRisk.evaluationId,
+    }, `active-order-${stageId}`, acceptedRisk.evaluationEventId);
+    await insertEvent(transaction as typeof db, 5, openingEventId, "paper.fill.created", {
+      fillId: openingFillId, orderId, positionId, symbol: "AAPL", side: "BUY",
+      quantity: "1", price: "100.00", commission: "0.00",
+      openedAt: "2026-08-09T00:00:05.000Z", filledAt: "2026-08-09T00:00:05.000Z",
+    }, `active-opening-fill-${stageId}`);
     await transaction.query(
       `insert into challenge_orders (
          id,intent_id,stage_id,profile_version_id,ledger_event_id,
          symbol,side,quantity,initial_status,created_at
-       ) values ($1,$2,$3,$4,$5,'AAPL','BUY','2','PENDING',$6)`,
+      ) values ($1,$2,$3,$4,$5,'AAPL','BUY','2','PENDING',$6)`,
       [orderId, intentId, stageId, INITIAL_PROFILE.profileVersionId,
-        orderEventId, "2026-08-09T00:00:03.000Z"],
+        orderEventId, "2026-08-09T00:00:04.000Z"],
     );
     await transaction.query(
       `insert into challenge_positions (
          id,stage_id,profile_version_id,opening_ledger_event_id,symbol,side,opened_at
        ) values ($1,$2,$3,$4,'AAPL','BUY',$5)`,
       [positionId, stageId, INITIAL_PROFILE.profileVersionId,
-        openingEventId, "2026-08-09T00:00:04.000Z"],
+        openingEventId, "2026-08-09T00:00:05.000Z"],
     );
     await transaction.query(
       `insert into challenge_fills (
@@ -118,7 +213,7 @@ async function activePositionStage() {
          side,quantity,price,commission,filled_at
        ) values ($1,$2,$3,$4,$5,$6,'BUY','1','100.00','0.00',$7)`,
       [openingFillId, orderId, positionId, stageId, INITIAL_PROFILE.profileVersionId,
-        openingEventId, "2026-08-09T00:00:04.000Z"],
+        openingEventId, "2026-08-09T00:00:05.000Z"],
     );
   });
   return { ...context, intentId, orderId, positionId };
@@ -1111,6 +1206,7 @@ describe("Challenge ledger persistence", () => {
   it("serializes fill and close quantities so every committed stream replays", async () => {
     const { db } = await testContext();
     const stageId = randomUUID();
+    const stageStartedEventId = randomUUID();
     await db.query(
       `insert into challenge_stages (
          id, challenge_portfolio_id, profile_version_id, stage_profile_id,
@@ -1124,7 +1220,7 @@ describe("Challenge ledger persistence", () => {
          id, challenge_portfolio_id, stage_id, profile_version_id, sequence,
          type, payload, occurred_at, actor_type, actor_id, idempotency_key
        ) values ($1,$2,$3,$4,1,'stage.started',$5,$6,'SYSTEM','stream-test',$7)`,
-      [randomUUID(), INITIAL_PROFILE.challengePortfolioId, stageId,
+      [stageStartedEventId, INITIAL_PROFILE.challengePortfolioId, stageId,
         INITIAL_PROFILE.profileVersionId, { amount: "2500.00" },
         "2026-08-09T00:00:00.000Z", "stream-stage-start"],
     );
@@ -1132,6 +1228,9 @@ describe("Challenge ledger persistence", () => {
     const orderId = randomUUID();
     const positionId = randomUUID();
     const initialFillId = randomUUID();
+    const decision = await createChallengeDecisionFixture(
+      db, stageId, stageStartedEventId, "stream", "12.38000001",
+    );
     await db.transaction(async (transaction) => {
       const intentEventId = randomUUID();
       await transaction.query(
@@ -1143,8 +1242,12 @@ describe("Challenge ledger persistence", () => {
           INITIAL_PROFILE.profileVersionId, {
             intentId, direction: "PAPER_LONG", symbol: "AAPL",
             entryPrice: "100.00", stopPrice: "95.00", targetPrice: "110.00",
-            desiredRisk: "25.00", expiresAt: "2026-08-09T01:00:00.000Z",
+            desiredRisk: decision.geometry.desiredRisk,
+            expiresAt: "2026-08-09T01:00:00.000Z",
             initialStatus: "PROPOSED", createdAt: "2026-08-09T00:00:01.000Z",
+            sourceDecisionId: decision.decisionWindowId,
+            selectionEventId: decision.selectionEventId,
+            marketObservationId: decision.marketObservationId,
           }, "2026-08-09T00:00:01.000Z", "stream-intent"],
       );
       await transaction.query(
@@ -1153,21 +1256,36 @@ describe("Challenge ledger persistence", () => {
            entry_price, stop_price, target_price, desired_risk, expires_at,
            initial_status, created_at
          ) values ($1,$2,$3,$4,'AAPL','PAPER_LONG','100.00','95.00','110.00',
-                   '25.00',$5,'PROPOSED',$6)`,
+                   $5,$6,'PROPOSED',$7)`,
         [intentId, stageId, INITIAL_PROFILE.profileVersionId, intentEventId,
-          "2026-08-09T01:00:00.000Z", "2026-08-09T00:00:01.000Z"],
+          decision.geometry.desiredRisk, "2026-08-09T01:00:00.000Z",
+          "2026-08-09T00:00:01.000Z"],
+      );
+      const acceptedRisk = await insertAcceptedRiskEvaluation(
+        transaction as typeof db,
+        stageId,
+        intentId,
+        intentEventId,
+        3,
+        "2026-08-09T00:00:02.000Z",
+        "stream-risk",
+        decision,
+        stageStartedEventId,
       );
       const orderEventId = randomUUID();
       await transaction.query(
         `insert into challenge_ledger_events (
            id, challenge_portfolio_id, stage_id, profile_version_id, sequence,
-           type, payload, occurred_at, actor_type, actor_id, idempotency_key
-         ) values ($1,$2,$3,$4,3,'paper.order.created',$5,$6,'SYSTEM','stream-test',$7)`,
+           type, payload, occurred_at, actor_type, actor_id, idempotency_key,
+           causation_id
+         ) values ($1,$2,$3,$4,4,'paper.order.created',$5,$6,'SYSTEM','stream-test',$7,$8)`,
         [orderEventId, INITIAL_PROFILE.challengePortfolioId, stageId,
           INITIAL_PROFILE.profileVersionId, {
             orderId, intentId, symbol: "AAPL", side: "BUY", quantity: "2",
-            initialStatus: "PENDING", createdAt: "2026-08-09T00:00:02.000Z",
-          }, "2026-08-09T00:00:02.000Z", "stream-order"],
+            initialStatus: "PENDING", createdAt: "2026-08-09T00:00:03.000Z",
+            acceptedRiskEvaluationId: acceptedRisk.evaluationId,
+          }, "2026-08-09T00:00:03.000Z", "stream-order",
+          acceptedRisk.evaluationEventId],
       );
       await transaction.query(
         `insert into challenge_orders (
@@ -1175,21 +1293,21 @@ describe("Challenge ledger persistence", () => {
            symbol, side, quantity, initial_status, created_at
          ) values ($1,$2,$3,$4,$5,'AAPL','BUY','2','PENDING',$6)`,
         [orderId, intentId, stageId, INITIAL_PROFILE.profileVersionId,
-          orderEventId, "2026-08-09T00:00:02.000Z"],
+          orderEventId, "2026-08-09T00:00:03.000Z"],
       );
       const fillEventId = randomUUID();
       await transaction.query(
         `insert into challenge_ledger_events (
            id, challenge_portfolio_id, stage_id, profile_version_id, sequence,
            type, payload, occurred_at, actor_type, actor_id, idempotency_key
-         ) values ($1,$2,$3,$4,4,'paper.fill.created',$5,$6,'SYSTEM','stream-test',$7)`,
+         ) values ($1,$2,$3,$4,5,'paper.fill.created',$5,$6,'SYSTEM','stream-test',$7)`,
         [fillEventId, INITIAL_PROFILE.challengePortfolioId, stageId,
           INITIAL_PROFILE.profileVersionId, {
              fillId: initialFillId, orderId, positionId, symbol: "AAPL", side: "BUY",
              quantity: "1", price: "100.00", commission: "0.00",
-             openedAt: "2026-08-09T00:00:03.000Z",
-             filledAt: "2026-08-09T00:00:03.000Z",
-          }, "2026-08-09T00:00:03.000Z", "stream-opening-fill"],
+             openedAt: "2026-08-09T00:00:04.000Z",
+             filledAt: "2026-08-09T00:00:04.000Z",
+          }, "2026-08-09T00:00:04.000Z", "stream-opening-fill"],
       );
       await transaction.query(
         `insert into challenge_positions (
@@ -1197,7 +1315,7 @@ describe("Challenge ledger persistence", () => {
            symbol, side, opened_at
          ) values ($1,$2,$3,$4,'AAPL','BUY',$5)`,
         [positionId, stageId, INITIAL_PROFILE.profileVersionId, fillEventId,
-          "2026-08-09T00:00:03.000Z"],
+          "2026-08-09T00:00:04.000Z"],
       );
       await transaction.query(
         `insert into challenge_fills (
@@ -1205,7 +1323,7 @@ describe("Challenge ledger persistence", () => {
            ledger_event_id, side, quantity, price, commission, filled_at
          ) values ($1,$2,$3,$4,$5,$6,'BUY','1','100.00','0.00',$7)`,
         [initialFillId, orderId, positionId, stageId,
-          INITIAL_PROFILE.profileVersionId, fillEventId, "2026-08-09T00:00:03.000Z"],
+          INITIAL_PROFILE.profileVersionId, fillEventId, "2026-08-09T00:00:04.000Z"],
       );
     });
 
@@ -1486,7 +1604,7 @@ describe("Challenge ledger persistence", () => {
       let observationId: string | undefined;
       if (dependency === "mark") {
         await db.query(
-          "insert into market_instrument_allowlist(symbol,asset_class,enabled) values ('AAPL','US_STOCK',true)",
+          "insert into market_instrument_allowlist(symbol,asset_class,enabled) values ('AAPL','US_STOCK',true) on conflict(symbol) do nothing",
         );
         await db.query(
           `insert into market_data_sources(provider,license_id,licensed,redistribution)
@@ -1668,7 +1786,7 @@ describe("Challenge ledger persistence", () => {
   it("allows a mark after a partial close and rejects one after explicit flattening", async () => {
     const { db, stageId, positionId, insertEvent } = await activePositionStage();
     await db.query(
-      "insert into market_instrument_allowlist(symbol,asset_class,enabled) values ('AAPL','US_STOCK',true)",
+      "insert into market_instrument_allowlist(symbol,asset_class,enabled) values ('AAPL','US_STOCK',true) on conflict(symbol) do nothing",
     );
     await db.query(
       `insert into market_data_sources(provider,license_id,licensed,redistribution)
@@ -1686,7 +1804,7 @@ describe("Challenge ledger persistence", () => {
     const partialClosureId = randomUUID();
     const partialEventId = randomUUID();
     await db.transaction(async (transaction) => {
-      await insertEvent(transaction as typeof db, 5, partialEventId, "paper.position.closed", {
+      await insertEvent(transaction as typeof db, 6, partialEventId, "paper.position.closed", {
         closureId: partialClosureId, positionId, quantity: "0.5", price: "105.00",
         commission: "0.00", closedAt: "2026-08-09T00:00:05.000Z",
       }, "active-partial-close");
@@ -1702,7 +1820,7 @@ describe("Challenge ledger persistence", () => {
     const validMarkId = randomUUID();
     const validMarkEventId = randomUUID();
     await db.transaction(async (transaction) => {
-      await insertEvent(transaction as typeof db, 6, validMarkEventId, "price.mark.recorded", {
+      await insertEvent(transaction as typeof db, 7, validMarkEventId, "price.mark.recorded", {
         markId: validMarkId, positionId, marketObservationId: observationId,
         price: "105.00", observedAt: "2026-08-09T00:00:06.000Z",
         recordedAt: "2026-08-09T00:00:06.000Z",
@@ -1719,7 +1837,7 @@ describe("Challenge ledger persistence", () => {
     const flattenClosureId = randomUUID();
     const flattenEventId = randomUUID();
     await db.transaction(async (transaction) => {
-      await insertEvent(transaction as typeof db, 7, flattenEventId, "paper.position.closed", {
+      await insertEvent(transaction as typeof db, 8, flattenEventId, "paper.position.closed", {
         closureId: flattenClosureId, positionId, quantity: "0.5", price: "105.00",
         commission: "0.00", closedAt: "2026-08-09T00:00:07.000Z",
       }, "active-explicit-flatten");
@@ -1735,7 +1853,7 @@ describe("Challenge ledger persistence", () => {
     await expect(db.transaction(async (transaction) => {
       const markId = randomUUID();
       const eventId = randomUUID();
-      await insertEvent(transaction as typeof db, 8, eventId, "price.mark.recorded", {
+      await insertEvent(transaction as typeof db, 9, eventId, "price.mark.recorded", {
         markId, positionId, marketObservationId: observationId, price: "105.00",
         observedAt: "2026-08-09T00:00:06.000Z", recordedAt: "2026-08-09T00:00:08.000Z",
       }, "active-mark-after-flat");
@@ -1753,11 +1871,11 @@ describe("Challenge ledger persistence", () => {
   }, 30_000);
 
   it("rejects an additive fill after an explicit full close of the immutable position", async () => {
-    const { db, stageId, intentId, positionId, insertEvent } = await activePositionStage();
+    const { db, stageId, orderId, positionId, insertEvent } = await activePositionStage();
     const closureId = randomUUID();
     const closeEventId = randomUUID();
     await db.transaction(async (transaction) => {
-      await insertEvent(transaction as typeof db, 5, closeEventId, "paper.position.closed", {
+      await insertEvent(transaction as typeof db, 6, closeEventId, "paper.position.closed", {
         closureId, positionId, quantity: "1", price: "100.00", commission: "0.00",
         closedAt: "2026-08-09T00:00:05.000Z",
       }, "active-full-explicit-close");
@@ -1771,20 +1889,6 @@ describe("Challenge ledger persistence", () => {
       );
     });
     await expect(db.transaction(async (transaction) => {
-      const orderId = randomUUID();
-      const orderEventId = randomUUID();
-      await insertEvent(transaction as typeof db, 6, orderEventId, "paper.order.created", {
-        orderId, intentId, symbol: "AAPL", side: "BUY", quantity: "1",
-        initialStatus: "PENDING", createdAt: "2026-08-09T00:00:06.000Z",
-      }, "active-order-after-flat");
-      await transaction.query(
-        `insert into challenge_orders (
-           id,intent_id,stage_id,profile_version_id,ledger_event_id,
-           symbol,side,quantity,initial_status,created_at
-         ) values ($1,$2,$3,$4,$5,'AAPL','BUY','1','PENDING',$6)`,
-        [orderId, intentId, stageId, INITIAL_PROFILE.profileVersionId,
-          orderEventId, "2026-08-09T00:00:06.000Z"],
-      );
       const fillId = randomUUID();
       const fillEventId = randomUUID();
       await insertEvent(transaction as typeof db, 7, fillEventId, "paper.fill.created", {
@@ -1809,7 +1913,7 @@ describe("Challenge ledger persistence", () => {
       let observationId: string | undefined;
       if (scenario === "mark-after-explicit-flat") {
         await db.query(
-          "insert into market_instrument_allowlist(symbol,asset_class,enabled) values ('AAPL','US_STOCK',true)",
+          "insert into market_instrument_allowlist(symbol,asset_class,enabled) values ('AAPL','US_STOCK',true) on conflict(symbol) do nothing",
         );
         await db.query(
           `insert into market_data_sources(provider,license_id,licensed,redistribution)
@@ -1829,7 +1933,7 @@ describe("Challenge ledger persistence", () => {
       await expect(db.transaction(async (transaction) => {
         const closureId = randomUUID();
         const closeEventId = randomUUID();
-        await insertEvent(transaction as typeof db, 5, closeEventId, "paper.position.closed", {
+        await insertEvent(transaction as typeof db, 6, closeEventId, "paper.position.closed", {
           closureId, positionId,
           quantity: scenario === "mark-after-explicit-flat" ? "1" : null,
           price: "100.00", commission: "0.00", closedAt: "2026-08-09T00:00:05.000Z",
@@ -1837,7 +1941,7 @@ describe("Challenge ledger persistence", () => {
         const dependentSourceId = randomUUID();
         const dependentEventId = randomUUID();
         if (scenario === "mark-after-explicit-flat") {
-          await insertEvent(transaction as typeof db, 6, dependentEventId, "price.mark.recorded", {
+          await insertEvent(transaction as typeof db, 7, dependentEventId, "price.mark.recorded", {
             markId: dependentSourceId, positionId, marketObservationId: observationId,
             price: "100.00", observedAt: "2026-08-09T00:00:06.000Z",
             recordedAt: "2026-08-09T00:00:06.000Z",
@@ -1851,7 +1955,7 @@ describe("Challenge ledger persistence", () => {
               dependentEventId, observationId, "2026-08-09T00:00:06.000Z"],
           );
         } else {
-          await insertEvent(transaction as typeof db, 6, dependentEventId, "paper.fill.created", {
+          await insertEvent(transaction as typeof db, 7, dependentEventId, "paper.fill.created", {
             fillId: dependentSourceId, orderId, positionId, symbol: "AAPL", side: "BUY",
             quantity: "0.25", price: "100.00", commission: "0.00",
             filledAt: "2026-08-09T00:00:06.000Z",
@@ -1881,9 +1985,12 @@ describe("Challenge ledger persistence", () => {
   );
 
   it("commits a valid mark when its earlier opening-fill source row is inserted later", async () => {
-    const { db, stageId, insertEvent } = await dependencyStage();
+    const { db, stageId, stageStartedEventId, insertEvent } = await dependencyStage();
+    const decision = await createChallengeDecisionFixture(
+      db, stageId, stageStartedEventId, "ordered-active", "7.19000001",
+    );
     await db.query(
-      "insert into market_instrument_allowlist(symbol,asset_class,enabled) values ('AAPL','US_STOCK',true)",
+      "insert into market_instrument_allowlist(symbol,asset_class,enabled) values ('AAPL','US_STOCK',true) on conflict(symbol) do nothing",
     );
     await db.query(
       `insert into market_data_sources(provider,license_id,licensed,redistribution)
@@ -1911,46 +2018,62 @@ describe("Challenge ledger persistence", () => {
     await db.transaction(async (transaction) => {
       await insertEvent(transaction as typeof db, 2, intentEventId, "paper.intent.proposed", {
         intentId, direction: "PAPER_LONG", symbol: "AAPL", entryPrice: "100.00",
-        stopPrice: "95.00", targetPrice: "110.00", desiredRisk: "25.00",
+        stopPrice: "95.00", targetPrice: "110.00", desiredRisk: decision.geometry.desiredRisk,
         expiresAt: "2026-08-09T01:00:00.000Z", initialStatus: "PROPOSED",
         createdAt: "2026-08-09T00:00:02.000Z",
+        sourceDecisionId: decision.decisionWindowId,
+        selectionEventId: decision.selectionEventId,
+        marketObservationId: decision.marketObservationId,
       }, "ordered-active-intent");
-      await insertEvent(transaction as typeof db, 3, orderEventId, "paper.order.created", {
-        orderId, intentId, symbol: "AAPL", side: "BUY", quantity: "1",
-        initialStatus: "PENDING", createdAt: "2026-08-09T00:00:03.000Z",
-      }, "ordered-active-order");
-      await insertEvent(transaction as typeof db, 4, fillEventId, "paper.fill.created", {
-        fillId, orderId, positionId, symbol: "AAPL", side: "BUY", quantity: "1",
-        price: "100.00", commission: "0.00", openedAt: "2026-08-09T00:00:04.000Z",
-        filledAt: "2026-08-09T00:00:04.000Z",
-      }, "ordered-active-fill");
-      await insertEvent(transaction as typeof db, 5, markEventId, "price.mark.recorded", {
-        markId, positionId, marketObservationId: observationId, price: "101.00",
-        observedAt: "2026-08-09T00:00:05.000Z", recordedAt: "2026-08-09T00:00:05.000Z",
-      }, "ordered-active-mark");
       await transaction.query(
         `insert into challenge_intents (
            id,stage_id,profile_version_id,ledger_event_id,symbol,direction,
            entry_price,stop_price,target_price,desired_risk,expires_at,initial_status,created_at
-         ) values ($1,$2,$3,$4,'AAPL','PAPER_LONG','100.00','95.00','110.00','25.00',
-                   $5,'PROPOSED',$6)`,
+         ) values ($1,$2,$3,$4,'AAPL','PAPER_LONG','100.00','95.00','110.00',$5,
+                   $6,'PROPOSED',$7)`,
         [intentId, stageId, INITIAL_PROFILE.profileVersionId, intentEventId,
-          "2026-08-09T01:00:00.000Z", "2026-08-09T00:00:02.000Z"],
+          decision.geometry.desiredRisk, "2026-08-09T01:00:00.000Z",
+          "2026-08-09T00:00:02.000Z"],
       );
+      const acceptedRisk = await insertAcceptedRiskEvaluation(
+        transaction as typeof db,
+        stageId,
+        intentId,
+        intentEventId,
+        3,
+        "2026-08-09T00:00:03.000Z",
+        "ordered-active-risk",
+        decision,
+        stageStartedEventId,
+      );
+      await insertEvent(transaction as typeof db, 4, orderEventId, "paper.order.created", {
+        orderId, intentId, symbol: "AAPL", side: "BUY", quantity: "1",
+        initialStatus: "PENDING", createdAt: "2026-08-09T00:00:04.000Z",
+        acceptedRiskEvaluationId: acceptedRisk.evaluationId,
+      }, "ordered-active-order", acceptedRisk.evaluationEventId);
+      await insertEvent(transaction as typeof db, 5, fillEventId, "paper.fill.created", {
+        fillId, orderId, positionId, symbol: "AAPL", side: "BUY", quantity: "1",
+        price: "100.00", commission: "0.00", openedAt: "2026-08-09T00:00:05.000Z",
+        filledAt: "2026-08-09T00:00:05.000Z",
+      }, "ordered-active-fill");
+      await insertEvent(transaction as typeof db, 6, markEventId, "price.mark.recorded", {
+        markId, positionId, marketObservationId: observationId, price: "101.00",
+        observedAt: "2026-08-09T00:00:05.000Z", recordedAt: "2026-08-09T00:00:05.000Z",
+      }, "ordered-active-mark");
       await transaction.query(
         `insert into challenge_orders (
            id,intent_id,stage_id,profile_version_id,ledger_event_id,
            symbol,side,quantity,initial_status,created_at
          ) values ($1,$2,$3,$4,$5,'AAPL','BUY','1','PENDING',$6)`,
         [orderId, intentId, stageId, INITIAL_PROFILE.profileVersionId,
-          orderEventId, "2026-08-09T00:00:03.000Z"],
+          orderEventId, "2026-08-09T00:00:04.000Z"],
       );
       await transaction.query(
         `insert into challenge_positions (
            id,stage_id,profile_version_id,opening_ledger_event_id,symbol,side,opened_at
          ) values ($1,$2,$3,$4,'AAPL','BUY',$5)`,
         [positionId, stageId, INITIAL_PROFILE.profileVersionId,
-          fillEventId, "2026-08-09T00:00:04.000Z"],
+          fillEventId, "2026-08-09T00:00:05.000Z"],
       );
       await transaction.query(
         `insert into challenge_price_marks (
@@ -1966,7 +2089,7 @@ describe("Challenge ledger persistence", () => {
            side,quantity,price,commission,filled_at
          ) values ($1,$2,$3,$4,$5,$6,'BUY','1','100.00','0.00',$7)`,
         [fillId, orderId, positionId, stageId, INITIAL_PROFILE.profileVersionId,
-          fillEventId, "2026-08-09T00:00:04.000Z"],
+          fillEventId, "2026-08-09T00:00:05.000Z"],
       );
     });
     expect(replayStoredLedgerEvents(await loadChallengeLedgerEvents({ db }, stageId)))
@@ -2070,16 +2193,22 @@ describe("Challenge ledger persistence", () => {
       type: string,
       payload: object,
       key: string,
+      causationId: string | null = null,
     ) => transaction.query(
       `insert into challenge_ledger_events (
          id, challenge_portfolio_id, stage_id, profile_version_id, sequence,
-         type, payload, occurred_at, actor_type, actor_id, idempotency_key
-       ) values ($1,$2,$3,$4,$5,$6,$7,$8,'SYSTEM','challenge-engine',$9)`,
+         type, payload, occurred_at, actor_type, actor_id, idempotency_key,
+         causation_id
+       ) values ($1,$2,$3,$4,$5,$6,$7,$8,'SYSTEM','challenge-engine',$9,$10)`,
       [id, INITIAL_PROFILE.challengePortfolioId, stageId,
         INITIAL_PROFILE.profileVersionId, sequence, type, payload,
-        `2026-08-09T00:00:0${sequence}.000Z`, key],
+        `2026-08-09T00:00:0${sequence}.000Z`, key, causationId],
     );
-    await append(db, 1, randomUUID(), "stage.started", { amount: "2500.00" }, "close-stage");
+    const stageStartedEventId = randomUUID();
+    await append(db, 1, stageStartedEventId, "stage.started", { amount: "2500.00" }, "close-stage");
+    const decision = await createChallengeDecisionFixture(
+      db, stageId, stageStartedEventId, "close", "7.19000001",
+    );
     const intentId = randomUUID();
     const orderId = randomUUID();
     const positionId = randomUUID();
@@ -2091,8 +2220,12 @@ describe("Challenge ledger persistence", () => {
       await append(transaction as typeof db, 2, intentEventId, "paper.intent.proposed", {
         intentId, direction: "PAPER_LONG", symbol: "AAPL", initialStatus: "PROPOSED",
         entryPrice: "100.00", stopPrice: "95.00", targetPrice: "110.00",
-        desiredRisk: "25.00", expiresAt: "2026-08-09T01:00:00.000Z",
+        desiredRisk: decision.geometry.desiredRisk,
+        expiresAt: "2026-08-09T01:00:00.000Z",
         createdAt: "2026-08-09T00:00:02.000Z",
+        sourceDecisionId: decision.decisionWindowId,
+        selectionEventId: decision.selectionEventId,
+        marketObservationId: decision.marketObservationId,
       }, "close-intent");
       await transaction.query(
         `insert into challenge_intents (
@@ -2100,27 +2233,40 @@ describe("Challenge ledger persistence", () => {
            entry_price, stop_price, target_price, desired_risk, expires_at,
            initial_status, created_at
          ) values ($1,$2,$3,$4,'AAPL','PAPER_LONG','100.00','95.00','110.00',
-                   '25.00',$5,'PROPOSED',$6)`,
+                   $5,$6,'PROPOSED',$7)`,
         [intentId, stageId, INITIAL_PROFILE.profileVersionId, intentEventId,
-          "2026-08-09T01:00:00.000Z", "2026-08-09T00:00:02.000Z"],
+          decision.geometry.desiredRisk, "2026-08-09T01:00:00.000Z",
+          "2026-08-09T00:00:02.000Z"],
       );
-      await append(transaction as typeof db, 3, orderEventId, "paper.order.created", {
+      const acceptedRisk = await insertAcceptedRiskEvaluation(
+        transaction as typeof db,
+        stageId,
+        intentId,
+        intentEventId,
+        3,
+        "2026-08-09T00:00:03.000Z",
+        "close-risk",
+        decision,
+        stageStartedEventId,
+      );
+      await append(transaction as typeof db, 4, orderEventId, "paper.order.created", {
         orderId, intentId, symbol: "AAPL", side: "BUY", quantity: "1",
-        initialStatus: "PENDING", createdAt: "2026-08-09T00:00:03.000Z",
-      }, "close-order");
+        initialStatus: "PENDING", createdAt: "2026-08-09T00:00:04.000Z",
+        acceptedRiskEvaluationId: acceptedRisk.evaluationId,
+      }, "close-order", acceptedRisk.evaluationEventId);
       await transaction.query(
         `insert into challenge_orders (
            id, intent_id, stage_id, profile_version_id, ledger_event_id,
            symbol, side, quantity, initial_status, created_at
          ) values ($1,$2,$3,$4,$5,'AAPL','BUY','1','PENDING',$6)`,
         [orderId, intentId, stageId, INITIAL_PROFILE.profileVersionId,
-          orderEventId, "2026-08-09T00:00:03.000Z"],
+          orderEventId, "2026-08-09T00:00:04.000Z"],
       );
-      await append(transaction as typeof db, 4, fillEventId, "paper.fill.created", {
+      await append(transaction as typeof db, 5, fillEventId, "paper.fill.created", {
         fillId, orderId, positionId, symbol: "AAPL", side: "BUY",
         quantity: "1", price: "100.00", commission: "1.00",
-        openedAt: "2026-08-09T00:00:04.000Z",
-        filledAt: "2026-08-09T00:00:04.000Z",
+        openedAt: "2026-08-09T00:00:05.000Z",
+        filledAt: "2026-08-09T00:00:05.000Z",
       }, "close-fill");
       await transaction.query(
         `insert into challenge_positions (
@@ -2128,7 +2274,7 @@ describe("Challenge ledger persistence", () => {
            symbol, side, opened_at
          ) values ($1,$2,$3,$4,'AAPL','BUY',$5)`,
         [positionId, stageId, INITIAL_PROFILE.profileVersionId,
-          fillEventId, "2026-08-09T00:00:04.000Z"],
+          fillEventId, "2026-08-09T00:00:05.000Z"],
       );
       await transaction.query(
         `insert into challenge_fills (
@@ -2136,13 +2282,14 @@ describe("Challenge ledger persistence", () => {
            ledger_event_id, side, quantity, price, commission, filled_at
          ) values ($1,$2,$3,$4,$5,$6,'BUY','1','100.00','1.00',$7)`,
         [fillId, orderId, positionId, stageId, INITIAL_PROFILE.profileVersionId,
-          fillEventId, "2026-08-09T00:00:04.000Z"],
+          fillEventId, "2026-08-09T00:00:05.000Z"],
       );
     });
 
     await db.query(
       `insert into market_instrument_allowlist(symbol, asset_class, enabled)
-       values ('AAPL','US_STOCK',true),('SPY','US_ETF',true)`,
+       values ('AAPL','US_STOCK',true),('SPY','US_ETF',true)
+       on conflict(symbol) do nothing`,
     );
     await db.query(
       `insert into market_data_sources(provider, license_id, licensed, redistribution)
@@ -2166,7 +2313,7 @@ describe("Challenge ledger persistence", () => {
     const wrongMarkId = randomUUID();
     const wrongMarkEventId = randomUUID();
     await expect(db.transaction(async (transaction) => {
-      await append(transaction as typeof db, 5, wrongMarkEventId, "price.mark.recorded", {
+      await append(transaction as typeof db, 6, wrongMarkEventId, "price.mark.recorded", {
         markId: wrongMarkId, positionId, marketObservationId: spyObservationId,
         price: "100.00", observedAt: "2026-08-09T00:00:05.000Z",
         recordedAt: "2026-08-09T00:00:05.000Z",
@@ -2184,7 +2331,7 @@ describe("Challenge ledger persistence", () => {
     const markId = randomUUID();
     const markEventId = randomUUID();
     await db.transaction(async (transaction) => {
-      await append(transaction as typeof db, 5, markEventId, "price.mark.recorded", {
+      await append(transaction as typeof db, 6, markEventId, "price.mark.recorded", {
         markId, positionId, marketObservationId: aaplObservationId,
         price: "100.00", observedAt: "2026-08-09T00:00:05.000Z",
         recordedAt: "2026-08-09T00:00:05.000Z",
@@ -2210,7 +2357,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "paper.intent.proposed", {
+          await append(transaction as typeof db, 7, eventId, "paper.intent.proposed", {
             intentId: sourceId, direction: "PAPER_LONG", symbol: "AAPL",
             entryPrice: "100.00", stopPrice: "95.00", targetPrice: "110.00",
             desiredRisk: "25.00", expiresAt: "2026-08-09T01:00:00.000Z",
@@ -2233,7 +2380,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "paper.order.created", {
+          await append(transaction as typeof db, 7, eventId, "paper.order.created", {
             orderId: sourceId, intentId, symbol: "AAPL", side: "BUY", quantity: "1",
             initialStatus: "PENDING", createdAt: mismatchTime,
           }, "fidelity-order-time");
@@ -2251,7 +2398,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "paper.fill.created", {
+          await append(transaction as typeof db, 7, eventId, "paper.fill.created", {
             positionId: sourceId, symbol: "AAPL", side: "BUY", openedAt: mismatchTime,
           }, "fidelity-position-time");
           await transaction.query(
@@ -2268,7 +2415,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "paper.fill.created", {
+          await append(transaction as typeof db, 7, eventId, "paper.fill.created", {
             fillId: sourceId, orderId, positionId, symbol: "AAPL", side: "BUY",
             quantity: "0.01", price: "100.00", commission: "0.00", filledAt: mismatchTime,
           }, "fidelity-fill-time");
@@ -2287,7 +2434,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "paper.position.closed", {
+          await append(transaction as typeof db, 7, eventId, "paper.position.closed", {
             closureId: sourceId, positionId, quantity: "0.01", price: "100.00",
             commission: "0.00", closedAt: mismatchTime,
           }, "fidelity-close-time");
@@ -2306,7 +2453,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "price.mark.recorded", {
+          await append(transaction as typeof db, 7, eventId, "price.mark.recorded", {
             markId: sourceId, positionId, marketObservationId: aaplObservationId,
             price: "100.00", observedAt: "2026-08-09T00:00:05.000Z",
             recordedAt: mismatchTime,
@@ -2326,7 +2473,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "fee.recorded", {
+          await append(transaction as typeof db, 7, eventId, "fee.recorded", {
             feeId: sourceId, positionId, orderId: null, amount: "1.00",
             category: "COMMISSION", recordedAt: mismatchTime,
           }, "fidelity-fee-time");
@@ -2345,7 +2492,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "financing.recorded", {
+          await append(transaction as typeof db, 7, eventId, "financing.recorded", {
             financingId: sourceId, positionId, amount: "1.00", utcDays: 1,
             policyVersion: "stock-etf-cost-v1", recordedAt: mismatchTime,
           }, "fidelity-financing-time");
@@ -2364,7 +2511,7 @@ describe("Challenge ledger persistence", () => {
         run: () => db.transaction(async (transaction) => {
           const sourceId = randomUUID();
           const eventId = randomUUID();
-          await append(transaction as typeof db, 6, eventId, "rule.evaluated", {
+          await append(transaction as typeof db, 7, eventId, "rule.evaluated", {
             evaluationId: sourceId, intentId, evaluatedLedgerHighWaterId: markEventId,
             accepted: true, reasons: [], evaluatedAt: mismatchTime,
           }, "fidelity-rule-time");
@@ -2391,7 +2538,7 @@ describe("Challenge ledger persistence", () => {
       await expect(db.transaction(async (transaction) => {
         const sourceId = randomUUID();
         const eventId = randomUUID();
-        await append(transaction as typeof db, 6, eventId, "fee.recorded", {
+        await append(transaction as typeof db, 7, eventId, "fee.recorded", {
           feeId: sourceId, positionId: null, orderId: null, amount: "1.00",
           category: "COMMISSION", recordedAt: payloadTime,
         }, `fidelity-fee-${name}-timestamp`);
@@ -2508,7 +2655,7 @@ describe("Challenge ledger persistence", () => {
       await expect(db.transaction(async (transaction) => {
         await append(
           transaction as typeof db,
-          6,
+          7,
           eventId,
           numericCase.type,
           numericCase.payload(sourceId, eventId),
@@ -2519,20 +2666,20 @@ describe("Challenge ledger persistence", () => {
     }
 
     await expect(db.transaction(async (transaction) => {
-      await append(transaction as typeof db, 6, randomUUID(), "paper.position.closed", {
+      await append(transaction as typeof db, 7, randomUUID(), "paper.position.closed", {
         positionId, price: "105.00", commission: "1.00",
         closedAt: "2026-08-09T00:00:05.000Z",
       }, "close-orphan");
     })).rejects.toThrow("CHALLENGE_LEDGER_TYPED_SOURCE_MISSING");
     await expect(db.transaction(async (transaction) => {
-      await append(transaction as typeof db, 6, randomUUID(), "paper.position.closed", {}, "close-empty");
+      await append(transaction as typeof db, 7, randomUUID(), "paper.position.closed", {}, "close-empty");
     })).rejects.toThrow("CHALLENGE_LEDGER_TYPED_SOURCE_MISSING");
 
     const missingPositionId = randomUUID();
     const missingClosureId = randomUUID();
     const missingEventId = randomUUID();
     await expect(db.transaction(async (transaction) => {
-      await append(transaction as typeof db, 6, missingEventId, "paper.position.closed", {
+      await append(transaction as typeof db, 7, missingEventId, "paper.position.closed", {
         closureId: missingClosureId, positionId: missingPositionId,
         price: "105.00", commission: "1.00", closedAt: "2026-08-09T00:00:05.000Z",
       }, "close-missing-position");
@@ -2549,7 +2696,7 @@ describe("Challenge ledger persistence", () => {
     const closureId = randomUUID();
     const closeEventId = randomUUID();
     await db.transaction(async (transaction) => {
-      await append(transaction as typeof db, 6, closeEventId, "paper.position.closed", {
+      await append(transaction as typeof db, 7, closeEventId, "paper.position.closed", {
         closureId, positionId, quantity: null, price: "105.00", commission: "1.00",
         closedAt: "2026-08-09T00:00:05.000Z",
       }, "close-valid");

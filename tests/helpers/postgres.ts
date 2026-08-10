@@ -18,6 +18,19 @@ import {
   hashOpaqueToken,
 } from "../../lib/server/auth/sessions";
 import type { EventDatabase } from "../../lib/server/events/types";
+import { appendChallengeLedgerEvent } from "../../lib/server/challenge/ledger";
+import { INITIAL_PROFILE } from "../../lib/server/challenge/profile";
+import {
+  createMainPaperOrderContext,
+  createPaperWorkerContext,
+  type MainPaperOrderContext,
+  type PaperWorkerContext,
+} from "../../lib/server/challenge/orders";
+import {
+  commitMainBaseline,
+  openDecisionWindow,
+  recordEvaluation,
+} from "../../lib/server/orchestration/decision-window";
 
 const execFileAsync = promisify(execFile);
 const TEST_CLUSTER_PREFIX = "gustavo-postgres-";
@@ -35,6 +48,26 @@ export interface ConversationFixture {
   readonly nodeBrainId: string;
   readonly conversationId: string;
   readonly sessionToken: string;
+}
+
+export interface ChallengeFixture {
+  readonly db: TestDatabase;
+  readonly challengePortfolioId: string;
+  readonly profileVersionId: string;
+  readonly stageId: string;
+  readonly stageStartedEventId: string;
+  readonly observationId: string;
+  readonly decisionWindowId: string;
+  readonly selectionEventId: string;
+  readonly mainOrderContext: MainPaperOrderContext;
+  readonly paperWorkerContext: PaperWorkerContext;
+}
+
+export interface ChallengeFixtureOptions {
+  readonly sessionState?: "OPEN" | "CLOSED" | "PRE_MARKET" | "AFTER_HOURS" | "HALTED";
+  readonly evidenceFresh?: boolean;
+  readonly completedEvidence?: boolean;
+  readonly selectedThesis?: string;
 }
 
 interface PartialTestPostgresServer {
@@ -436,6 +469,206 @@ export async function openTestDb(): Promise<TestDatabase> {
 
 export async function testContext(): Promise<{ readonly db: TestDatabase }> {
   return { db: await openTestDb() };
+}
+
+export async function createChallengeDecisionFixture(
+  db: TestDatabase,
+  stageId: string,
+  highWaterEventId: string,
+  label: string,
+  desiredRisk: string,
+) {
+  const marketObservationId = randomUUID();
+  const geometry = Object.freeze({
+    symbol: "AAPL" as const, direction: "LONG" as const, entry: "100.00" as const,
+    stop: "95.00" as const, target: "110.00" as const, desiredRisk,
+    expiresAt: "2026-08-09T01:00:00.000Z" as const,
+  });
+  await db.query(`insert into market_instrument_allowlist(symbol,asset_class,enabled)
+    values ('AAPL','US_STOCK',true) on conflict (symbol) do nothing`);
+  await db.query(`insert into market_data_sources(provider,license_id,licensed,redistribution)
+    values ('ledger-fixture','ledger-v1',true,'INTERNAL_ONLY')
+    on conflict (provider,license_id) do nothing`);
+  await db.query(
+    `insert into market_observations (
+       id,symbol,asset_class,price,observed_at,received_at,provider,license_id,
+       raw_source_ref,feed_status,delay_seconds,redistribution,session_state
+     ) values ($1,'AAPL','US_STOCK','100.00',$2,$2,'ledger-fixture','ledger-v1',
+               $3,'REALTIME',0,'INTERNAL_ONLY','OPEN')`,
+    [marketObservationId, "2026-08-09T00:00:00.000Z", `ledger:${label}:${marketObservationId}`],
+  );
+  const evidence = [{ kind: "MARKET_EVENT" as const, referenceId: marketObservationId }];
+  const window = await openDecisionWindow({ db }, {
+    marketObservationIds: [marketObservationId], evidence,
+    portfolioSnapshot: { equity: "2500.00", highWaterId: highWaterEventId },
+    costModelSnapshot: { policyVersion: INITIAL_PROFILE.costPolicyVersion },
+    stageProfileVersion: INITIAL_PROFILE.profileVersionId, eligibleInstruments: ["AAPL"],
+    idempotencyKey: `ledger-window:${label}:${stageId}`,
+  });
+  const main = await commitMainBaseline({ db }, {
+    windowId: window.id, disposition: "THESIS", thesis: JSON.stringify(geometry), evidence,
+    counterevidence: [], uncertainty: "Fixture thesis can invalidate at its stop.",
+    idempotencyKey: `ledger-main:${label}:${stageId}`,
+  });
+  const evaluatorRunId = randomUUID();
+  await db.query(`insert into model_runs (
+      id,role,provider,model,prompt_version,policy_version,correlation_id,causation_id,
+      input_tokens,output_tokens,max_input_tokens,max_output_tokens,completion_status,completed_at
+    ) values ($1,'EVALUATOR','fake','ledger-fixture','fixture-prompt','fixture-policy',
+      $2,$3,1,1,128,128,'COMPLETED',clock_timestamp())`,
+  [evaluatorRunId, randomUUID(), main.eventId]);
+  const selection = await recordEvaluation({ db }, {
+    windowId: window.id, evaluatorRunId,
+    scores: [{ candidateId: "main", components: {
+      evidenceFreshness: 25, structuralClarity: 20, costAdjustedGeometry: 20,
+      falsifiability: 15, uncertainty: 10, independence: 10,
+    }, hardGates: { evidenceFresh: true, sessionValid: true, geometryComplete: true,
+      nonDuplicate: true, authorized: true } }],
+    idempotencyKey: `ledger-evaluation:${label}:${stageId}`,
+  });
+  return Object.freeze({
+    decisionWindowId: window.id, selectionEventId: selection.selectionEventId,
+    selectedCandidateId: "main", selectedCandidateEventId: main.eventId,
+    selectedCandidateCommitmentDigest: main.commitmentDigest, evaluatorRunId,
+    marketObservationId, geometry,
+  });
+}
+
+export async function testChallengeContext(
+  options: ChallengeFixtureOptions = {},
+): Promise<ChallengeFixture> {
+  const db = await openTestDb();
+  const stageId = randomUUID();
+  const stageStartedEventId = randomUUID();
+  const observationId = randomUUID();
+  const stageStartedAt = "2026-08-09T14:00:00.000Z";
+  const observedAt = "2026-08-09T15:00:00.000Z";
+
+  await db.query(
+    `insert into challenge_stages (
+       id, challenge_portfolio_id, profile_version_id, stage_profile_id,
+       ordinal, created_at
+     ) values ($1,$2,$3,'00000000-0000-4000-8000-000000001211',1,$4)`,
+    [stageId, INITIAL_PROFILE.challengePortfolioId, INITIAL_PROFILE.profileVersionId,
+      stageStartedAt],
+  );
+  await appendChallengeLedgerEvent({ db }, {
+    id: stageStartedEventId,
+    challengePortfolioId: INITIAL_PROFILE.challengePortfolioId,
+    stageId,
+    profileVersionId: INITIAL_PROFILE.profileVersionId,
+    type: "stage.started",
+    payload: { amount: "2500.00" },
+    occurredAt: stageStartedAt,
+    actorType: "SYSTEM",
+    actorId: "challenge-test-fixture",
+    idempotencyKey: `challenge-test-stage:${stageId}`,
+  });
+  await db.query(
+    `insert into market_instrument_allowlist (symbol, asset_class, enabled, updated_at)
+     values ('AAPL','US_STOCK',true,$1)`,
+    [stageStartedAt],
+  );
+  await db.query(
+    `insert into market_data_sources (
+       provider, license_id, licensed, redistribution, created_at
+     ) values ('licensed-feed','license-v1',true,'INTERNAL_ONLY',$1)`,
+    [stageStartedAt],
+  );
+  await db.query(
+    `insert into market_observations (
+       id, symbol, asset_class, price, observed_at, received_at,
+       provider, license_id, raw_source_ref, feed_status, delay_seconds,
+       redistribution, session_state, created_at
+     ) values ($1,'AAPL','US_STOCK','100.00',$2,$2,'licensed-feed','license-v1',
+               $3,'REALTIME',0,'INTERNAL_ONLY',$4,$2)`,
+    [observationId, observedAt, `fixture:${observationId}`, options.sessionState ?? "OPEN"],
+  );
+  if (options.completedEvidence ?? true) {
+    await db.query(
+      `insert into market_bars (
+         id, source_observation_id, symbol, asset_class, provider, timeframe,
+         started_at, ended_at, open_price, high_price, low_price, close_price,
+         completed, created_at
+       ) values ($1,$2,'AAPL','US_STOCK','licensed-feed','15m',$3,$4,
+                 '99.00','101.00','98.00','100.00',true,$4)`,
+      [randomUUID(), observationId, "2026-08-09T14:45:00.000Z", observedAt],
+    );
+  }
+
+  const evidence = [{ kind: "MARKET_EVENT" as const, referenceId: observationId }];
+  const window = await openDecisionWindow({ db }, {
+    marketObservationIds: [observationId],
+    evidence,
+    portfolioSnapshot: { equity: "2500.00", highWaterId: stageStartedEventId },
+    costModelSnapshot: { policyVersion: INITIAL_PROFILE.costPolicyVersion },
+    stageProfileVersion: INITIAL_PROFILE.profileVersionId,
+    eligibleInstruments: ["AAPL"],
+    idempotencyKey: `challenge-test-window:${stageId}`,
+  });
+  const main = await commitMainBaseline({ db }, {
+    windowId: window.id,
+    disposition: "THESIS",
+    thesis: options.selectedThesis ?? JSON.stringify({
+      direction: "LONG",
+      entry: "100.00",
+      expiresAt: "2026-08-09T20:00:00.000Z",
+      desiredRisk: "25.00",
+      stop: "97.50",
+      symbol: "AAPL",
+      target: "105.00",
+    }),
+    evidence,
+    counterevidence: [],
+    uncertainty: "The simulated entry can expire or invalidate at its structural stop.",
+    idempotencyKey: `challenge-test-main:${stageId}`,
+  });
+  const evaluatorRunId = randomUUID();
+  await db.query(
+    `insert into model_runs (
+       id, role, provider, model, prompt_version, policy_version,
+       correlation_id, causation_id, input_tokens, output_tokens,
+       max_input_tokens, max_output_tokens, completion_status, completed_at
+     ) values ($1,'EVALUATOR','fake','fixture-evaluator','fixture-prompt','fixture-policy',
+               $2,$3,1,1,128,128,'COMPLETED',clock_timestamp())`,
+    [evaluatorRunId, randomUUID(), main.eventId],
+  );
+  const selection = await recordEvaluation({ db }, {
+    windowId: window.id,
+    evaluatorRunId,
+    scores: [{
+      candidateId: "main",
+      components: {
+        evidenceFreshness: 25,
+        structuralClarity: 20,
+        costAdjustedGeometry: 20,
+        falsifiability: 15,
+        uncertainty: 10,
+        independence: 10,
+      },
+      hardGates: {
+        evidenceFresh: options.evidenceFresh ?? true,
+        sessionValid: true,
+        geometryComplete: true,
+        nonDuplicate: true,
+        authorized: true,
+      },
+    }],
+    idempotencyKey: `challenge-test-evaluation:${stageId}`,
+  });
+
+  return Object.freeze({
+    db,
+    challengePortfolioId: INITIAL_PROFILE.challengePortfolioId,
+    profileVersionId: INITIAL_PROFILE.profileVersionId,
+    stageId,
+    stageStartedEventId,
+    observationId,
+    decisionWindowId: window.id,
+    selectionEventId: selection.selectionEventId,
+    mainOrderContext: createMainPaperOrderContext(db),
+    paperWorkerContext: createPaperWorkerContext(db),
+  });
 }
 
 export async function createConversationFixture(

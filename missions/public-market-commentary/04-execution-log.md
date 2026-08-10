@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 15 / 34
+- Tasks completed: 16 / 34
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -160,3 +160,13 @@
 - Spec review: passed after real append/load/replay, stage/profile balance binding, exact Main authority, deferred typed-source completeness, full payload/source parity, immutable position closures, and canonical fixed-decimal JSON made every accepted source history replayable.
 - Quality review: passed after sequence-aware fill/closure/mark capacity and liveness, valid lifecycle preludes, strict round-trip timestamps, bounded canonical JSON snapshots, successor-stage causation, full licensed mark provenance, and recomputed monotonic checkpoints closed all adversarial and concurrent integrity gaps.
 - Scope: append-only shared Challenge stages/events/intents/orders/fills/positions/closures/marks/fees/financing/rule evaluations; exact fixed-decimal replay of balance, equity, realized/unrealized P&L, peak, exposure, drawdown, positions, and high-water state; disposable event-bound checkpoints; stage-locked sequence/idempotency; bounded provenance-preserving payloads; and no broker, exchange, external execution, model, credential, or network behavior. The accepted-risk-evaluation-to-order gate remains explicitly assigned to T16.
+
+### T16 — Simulate idempotent orders, fills, marks, and exits
+
+- Status: completed
+- Commit: `T16: add authoritative paper order lifecycle` (resolve the single-task commit from Git history)
+- Red: the lifecycle suite first failed before the order modules existed; later focused and direct-SQL regressions exposed cost-blind sizing, stale risk snapshots, caller-asserted authority, incomplete evidence, missing durable leases, retry ordering, semantic rejection, gap-through-stop handling, fabricated risk provenance, hostile nested inputs, malformed durable results, forged numeric risk and quantity, initially completed jobs without results, and JSON scalar-type coercion before each boundary was corrected.
+- Green: 21 targeted lifecycle tests and 78 combined ledger/lifecycle tests passed; the root-owned full suite passed 371/371 across 22 files; strict TypeScript, the Next.js production build, frozen install, `git diff --check`, and zero-owned-process checks passed under Node 24.14.0 and pnpm 11.16.0. Two prior root full-suite attempts also passed all assertions but exited on transient Windows removal locks for already-stopped disposable PostgreSQL directories; the unchanged third run exited cleanly.
+- Spec review: passed after cost-adjusted risk/notional, UTC-day and remaining-stop snapshots, opaque Main/worker capabilities, current licensed/session/fresh/completed evidence, durable reclaimable jobs, retry-first completed results, persisted semantic rejections, deterministic gap closure, real selected-thesis binding, and database-enforced earlier accepted-risk causation were implemented.
+- Quality review: passed after descriptor-only hostile-input capture, SQL-authoritative decision/evaluator/evidence/profile/high-water provenance, deterministic SQL ledger replay and cost/risk/quantity recomputation, strict lifecycle-bound durable result validation, deferred completed-job completeness, completed-result retry behavior across later policy revocation, and explicit JSON string typing for decimal result fields closed all direct-SQL and hydration gaps.
+- Scope: one Main-authorized simulated intent path and one separately authorized worker path; immutable intent/risk/order/rejection causation; costed pending fills, marks, target/stop/expiry exits, fees, short financing, checkpoints, and replay; exact idempotent concurrency and reclaimable leases; current licensed market evidence for new work; immutable stored results for exact retries; authoritative database recomputation from selected geometry and ledger high-water; and no broker, exchange, external execution, model, credential, export, or network behavior.
