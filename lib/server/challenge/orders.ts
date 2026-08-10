@@ -10,6 +10,10 @@ import { calculateCommission, calculatePriceFill } from "./costs";
 import { INITIAL_PROFILE } from "./profile";
 import { replayStoredLedgerEvents, type StoredReplayLedgerEvent } from "./projection";
 import { evaluateRisk } from "./risk";
+import {
+  createStageLifecycleContext,
+  evaluateStoredStage,
+} from "./stages";
 
 const OrderDecimal = Decimal.clone({
   precision: 80,
@@ -777,10 +781,18 @@ export async function submitPaperIntent(
       "select pg_advisory_xact_lock(hashtextextended('gustavo:shared-challenge:paper-intent',0))",
     );
     const stage = await currentStage(transaction);
+    await transaction.query(
+      "select pg_advisory_xact_lock(hashtextextended($1,0))",
+      [`challenge-stage:${stage.stage_id}`],
+    );
     await transaction.one(
       "select id from challenge_stages where id=$1 for update",
       [stage.stage_id],
     );
+    const lockedStage = await currentStage(transaction);
+    if (lockedStage.stage_id !== stage.stage_id) {
+      throw new Error("PAPER_INTENT_CURRENT_STAGE_INVALID");
+    }
     const duplicate = await existingIntent(
       transaction,
       stage.challenge_portfolio_id,
@@ -1046,7 +1058,7 @@ export async function submitPaperIntent(
       );
     }
     await checkpoint(transaction, stage);
-    return Object.freeze({
+    const result = Object.freeze({
       status: accepted ? "ORDER_CREATED" : "REJECTED",
       accepted,
       intentId,
@@ -1055,6 +1067,11 @@ export async function submitPaperIntent(
       reasons,
       quantity: accepted ? captured.quantity! : null,
     });
+    await evaluateStoredStage(createStageLifecycleContext(transaction), {
+      stageId: stage.stage_id,
+      evaluatedAt: occurredAt,
+    });
+    return result;
   });
 }
 

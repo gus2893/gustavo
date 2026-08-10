@@ -11,6 +11,10 @@ import {
 } from "../../lib/server/challenge/costs";
 import { appendChallengeLedgerEvent } from "../../lib/server/challenge/ledger";
 import {
+  createStageLifecycleContext,
+  evaluateStoredStage,
+} from "../../lib/server/challenge/stages";
+import {
   replayStoredLedgerEvents,
   type StoredReplayLedgerEvent,
 } from "../../lib/server/challenge/projection";
@@ -293,6 +297,20 @@ async function orderRow(database: EventDatabase, orderId: string): Promise<Order
   return rows[0];
 }
 
+async function assertStageNonterminal(
+  database: EventDatabase,
+  stageId: string,
+): Promise<void> {
+  const row = await database.one<{ terminal: boolean }>(
+    `select exists (
+       select 1 from challenge_ledger_events
+        where stage_id=$1 and type in ('stage.passed','stage.failed')
+     ) as terminal`,
+    [stageId],
+  );
+  if (row.terminal) throw new Error("PAPER_ORDER_STAGE_TERMINAL");
+}
+
 async function observationRow(
   database: EventDatabase,
   order: OrderRow,
@@ -398,6 +416,10 @@ async function claimJob(
 }>> {
   return context.db.transaction(async (transaction) => {
     const order = await orderRow(transaction, orderId);
+    await transaction.query(
+      "select pg_advisory_xact_lock(hashtextextended($1,0))",
+      [`challenge-stage:${order.stage_id}`],
+    );
     const observationId = await observationIdentity(
       transaction,
       order,
@@ -435,6 +457,7 @@ async function claimJob(
       }
     }
 
+    await assertStageNonterminal(transaction, order.stage_id);
     await observationRow(transaction, order, reference, observedAt, evaluatedAt);
     if (!job) {
     const jobId = randomUUID();
@@ -487,7 +510,10 @@ async function claimJob(
         [job.job_id, context.workerId],
       );
     }
-    return Object.freeze({ jobId: job.job_id, observationId });
+    return Object.freeze({
+      jobId: job.job_id,
+      observationId,
+    });
   });
 }
 
@@ -938,7 +964,13 @@ export async function processPaperOrder(
     );
     if (storedResult) return storedResult;
     const order = await orderRow(transaction, orderId);
+    await transaction.query(
+      "select pg_advisory_xact_lock(hashtextextended($1,0))",
+      [`challenge-stage:${order.stage_id}`],
+    );
     await transaction.one("select id from challenge_stages where id=$1 for update", [order.stage_id]);
+    await assertStageNonterminal(transaction, order.stage_id);
+    const result = await (async (): Promise<Readonly<PaperLifecycleResult>> => {
     const observation = await observationRow(
       transaction,
       order,
@@ -1084,6 +1116,12 @@ export async function processPaperOrder(
     await completeJob(
       transaction, claimed.jobId, order, claimed.observationId, result, evaluatedAt,
     );
+    return result;
+    })();
+    await evaluateStoredStage(createStageLifecycleContext(transaction), {
+      stageId: order.stage_id,
+      evaluatedAt,
+    });
     return result;
   });
 }

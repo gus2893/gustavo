@@ -1004,7 +1004,7 @@ Yes. It wires previously tested risk, costs, and ledger primitives into one life
 ### T17 — Enforce qualifying days, permanent failure, and stage advancement
 
 **Maps to:** R29, R34, R83, R85
-**Files touched:** `lib/server/challenge/stages.ts` (new), `tests/challenge/trading-days.test.ts` (new)
+**Files touched:** `lib/server/challenge/stages.ts` (new), `worker/challenge/process-stage.ts` (new), `worker/challenge/process-order.ts`, `lib/server/challenge/orders.ts`, `tests/challenge/trading-days.test.ts` (new), `missions/public-market-commentary/debug-t17-sequence-prefix.md` (authorized debug artifact), `missions/public-market-commentary/debug-t17-mark-transaction.md` (authorized debug artifact), `missions/public-market-commentary/debug-t17-lifecycle-wiring.md` (authorized debug artifact), `missions/public-market-commentary/debug-t17-profile-threshold-binding.md` (authorized debug artifact), `missions/public-market-commentary/debug-t17-opening-fill-binding.md` (authorized debug artifact), `missions/public-market-commentary/debug-t17-full-suite-cleanup.md` (authorized debug artifact), `missions/public-market-commentary/debug-t17-terminal-order-block.md` (authorized debug artifact), `missions/public-market-commentary/debug-t17-intent-stage-race.md` (authorized debug artifact), `missions/public-market-commentary/debug-t17-boundary-catchup.md` (authorized debug artifact)
 
 #### Red — failing test
 
