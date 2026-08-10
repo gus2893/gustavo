@@ -1631,6 +1631,65 @@ describe("memory consolidation", () => {
     )).toEqual({ retained: 2 });
   }, 20_000);
 
+  it("persists only keyed bounded vector buckets and erases them with either protected key", async () => {
+    const { db } = await testContext();
+    const source = await appendEvent(db, {
+      aggregateId: "shared-vector-bucket-source",
+      actor: { type: "MAIN_BRAIN", id: "gustavo-main" },
+      type: "main.broadcast.committed", visibility: "SHARED",
+      body: { text: "AAPL vector bucket authority." },
+      occurredAt: new Date("2026-08-09T14:19:00.000Z"),
+      idempotencyKey: "memory-source:shared-vector-bucket",
+    });
+    const result = await processMemoryEvent(createMemoryWorkerContext(db), {
+      scope: "MAIN_SHARED", sourceEventId: source.id,
+      events: [{ id: source.id, at: source.occurredAt.toISOString(),
+        text: "AAPL vector bucket authority." }],
+      extracted: { facts: [{
+        text: "AAPL vector bucket authority", sourceIds: [source.id],
+        keywords: ["AAPL"], embedding: [1, 0],
+      }] }, versions: VERSIONS, observedAt: "2026-08-09T14:19:30.000Z",
+      idempotencyKey: "memory-consolidation:shared-vector-bucket",
+    });
+    const buckets = await db.query<{
+      bucket_digest: string; search_key_id: string; body_key_id: string;
+    }>(
+      `select bucket.bucket_digest,bucket.search_key_id::text,bucket.body_key_id::text
+       from memory_vector_buckets bucket where bucket.memory_id=$1 order by bucket.ordinal`,
+      [result.memories[0].id],
+    );
+    expect(buckets.length).toBeGreaterThanOrEqual(3);
+    expect(buckets.length).toBeLessThanOrEqual(8);
+    expect(buckets.every(({ bucket_digest }) => /^[a-f0-9]{64}$/u.test(bucket_digest))).toBe(true);
+    expect(await db.query<{ column_name: string }>(
+      `select column_name from information_schema.columns
+       where table_schema=current_schema() and table_name='memory_vector_buckets'
+         and column_name in ('embedding','search_embedding','vector')`,
+    )).toHaveLength(0);
+    await expect(db.query(
+      `insert into memory_vector_buckets (
+         memory_id,ordinal,scope,account_id,node_brain_id,conversation_id,search_key_id,
+         body_key_id,embedding_version,bucket_digest
+       ) select memory_id,7,scope,account_id,node_brain_id,conversation_id,$2,
+                body_key_id,embedding_version,bucket_digest
+           from memory_vector_buckets where memory_id=$1 order by ordinal limit 1`,
+      [result.memories[0].id, randomUUID()],
+    )).rejects.toThrow("MEMORY_VECTOR_BUCKET_AUTHORITY_MISMATCH");
+    await expect(db.transaction(async (transaction) => {
+      await transaction.query("delete from aggregate_data_keys where id=$1", [buckets[0].body_key_id]);
+      expect(await transaction.one<{ count: number }>(
+        "select count(*)::int count from memory_vector_buckets where memory_id=$1",
+        [result.memories[0].id],
+      )).toEqual({ count: 0 });
+      throw new Error("ROLLBACK_VECTOR_BODY_KEY_ERASURE");
+    })).rejects.toThrow("ROLLBACK_VECTOR_BODY_KEY_ERASURE");
+    await db.query("delete from aggregate_data_keys where id=$1", [buckets[0].search_key_id]);
+    expect(await db.one<{ count: number }>(
+      "select count(*)::int count from memory_vector_buckets where memory_id=$1",
+      [result.memories[0].id],
+    )).toEqual({ count: 0 });
+  }, 20_000);
+
   it("holds the retrieval key against concurrent deletion through memory-record commit", async () => {
     const { db } = await testContext();
     const initialSource = await appendEvent(db, {
