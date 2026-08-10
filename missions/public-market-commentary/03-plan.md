@@ -1173,7 +1173,7 @@ Yes. It introduces derived memory generation but not retrieval ranking.
 ### T20 — Import authorized external chats incrementally and idempotently
 
 **Maps to:** R69, R77
-**Files touched:** `db/migrations/0014_chat_sources.sql` (new), `lib/server/chat-sources/contracts.ts` (new), `lib/server/chat-sources/import.ts` (new), `app/api/memory/sources/import/route.ts` (new), `tests/chats/incremental.test.ts` (new)
+**Files touched:** `db/migrations/0014_chat_sources.sql` (new), `lib/server/chat-sources/contracts.ts` (new), `lib/server/chat-sources/import.ts` (new), `app/api/memory/sources/import/route.ts` (new), `lib/server/events/store.ts` (authorized Stage B batch append expansion), `tests/events/event-store.test.ts` (authorized Stage B batch append expansion), `tests/chats/incremental.test.ts` (new), `missions/public-market-commentary/debug-t20-cursor-upsert.md` (new; authorized debug artifact), `missions/public-market-commentary/debug-t20-concurrency-timeout.md` (new; authorized debug artifact), `missions/public-market-commentary/debug-t20-json-capture-type.md` (new; authorized debug artifact), `missions/public-market-commentary/debug-t20-deferred-trigger-record-shape.md` (new; authorized Stage A debug artifact), `missions/public-market-commentary/debug-t20-replay-uuid-high-water.md` (new; authorized Stage A debug artifact)
 
 #### Red — failing test
 
