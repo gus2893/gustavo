@@ -21,6 +21,11 @@ import {
   digestsEqual,
 } from "./integrity";
 
+export interface EventBodyResult {
+  readonly eventId: string;
+  readonly body: JsonValue;
+}
+
 interface EventRow extends Record<string, unknown> {
   id: string;
   aggregate_id: string;
@@ -379,67 +384,97 @@ export async function readEventBody(
   eventId: string,
   context: EventReadContext,
 ): Promise<JsonValue> {
-  const eventRow = await database.one<EventRow>(
-    `select ${EVENT_COLUMNS} from events where id=$1`,
-    [eventId],
-  );
-  const event = mapEvent(eventRow);
+  return (await readEventBodies(database, [eventId], context))[0].body;
+}
 
-  // Authorization intentionally precedes every query for ciphertext or wrapped keys.
-  authorizeRead(event, context);
+function immutableJson(value: JsonValue): JsonValue {
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((item) => immutableJson(item))) as JsonValue;
+  }
+  const result = Object.create(null) as Record<string, JsonValue>;
+  for (const [key, item] of Object.entries(value)) result[key] = immutableJson(item);
+  return Object.freeze(result);
+}
 
-  const protectedRow = await database.one<EncryptedBodyRow>(
-    `select aggregate_id, data_key_id, ciphertext, body_iv, body_auth_tag
-     from encrypted_event_bodies where event_id=$1`,
-    [eventId],
+export async function readEventBodies(
+  database: EventDatabase,
+  eventIds: readonly string[],
+  context: EventReadContext,
+): Promise<readonly EventBodyResult[]> {
+  if (!Array.isArray(eventIds) || eventIds.length === 0 || eventIds.length > 100) {
+    throw new Error("EVENT_BODY_BATCH_LIMIT");
+  }
+  const uniqueIds = [...new Set(eventIds)];
+  const eventRows = await database.query<EventRow>(
+    `select ${EVENT_COLUMNS} from events where id=any($1::uuid[])`, [uniqueIds],
   );
-  if (!protectedRow.data_key_id) {
-    throw new Error("EVENT_KEY_UNAVAILABLE");
+  const events = new Map(eventRows.map((row) => [row.id, mapEvent(row)]));
+  if (events.size !== uniqueIds.length) throw new Error("EVENT_NOT_FOUND");
+  // Authorize the complete metadata set before reading any ciphertext or wrapped key.
+  for (const id of uniqueIds) authorizeRead(events.get(id)!, context);
+
+  const protectedRows = await database.query<EncryptedBodyRow & { event_id: string }>(
+    `select event_id::text,aggregate_id,data_key_id,ciphertext,body_iv,body_auth_tag
+     from encrypted_event_bodies where event_id=any($1::uuid[])`,
+    [uniqueIds],
+  );
+  const protectedByEvent = new Map(protectedRows.map((row) => [row.event_id, row]));
+  if (protectedByEvent.size !== uniqueIds.length) throw new Error("EVENT_BODY_NOT_FOUND");
+  const keyIds = new Set<string>();
+  for (const id of uniqueIds) {
+    const keyId = protectedByEvent.get(id)!.data_key_id;
+    if (!keyId) throw new Error("EVENT_KEY_UNAVAILABLE");
+    keyIds.add(keyId);
   }
   const keyRows = await database.query<AggregateKeyRow>(
-    `select id, aggregate_id, root_key_version, wrapped_key, wrap_iv, wrap_auth_tag
-     from aggregate_data_keys where id=$1 and aggregate_id=$2`,
-    [protectedRow.data_key_id, protectedRow.aggregate_id],
+    `select id,aggregate_id,root_key_version,wrapped_key,wrap_iv,wrap_auth_tag
+     from aggregate_data_keys where id=any($1::uuid[])`,
+    [[...keyIds]],
   );
-  const keyRow = keyRows[0];
-  if (!keyRow) {
-    throw new Error("EVENT_KEY_UNAVAILABLE");
+  const keysById = new Map(keyRows.map((row) => [row.id, row]));
+  if (keysById.size !== keyIds.size) throw new Error("EVENT_KEY_UNAVAILABLE");
+  const unwrapped = new Map<string, Buffer>();
+  const bodies = new Map<string, JsonValue>();
+  try {
+    for (const keyRow of keyRows) {
+      unwrapped.set(keyRow.id, unwrapDataKey(
+        keyRow.aggregate_id, wrappedFromAggregateRow(keyRow),
+      ));
+    }
+    for (const id of uniqueIds) {
+      const event = events.get(id)!;
+      const protectedRow = protectedByEvent.get(id)!;
+      const keyRow = keysById.get(protectedRow.data_key_id!)!;
+      if (keyRow.aggregate_id !== protectedRow.aggregate_id
+          || keyRow.aggregate_id !== event.aggregateId) {
+        throw new Error("EVENT_KEY_UNAVAILABLE");
+      }
+      const plaintext = decryptEventBody(
+        event.id, event.integrityHash,
+        { ciphertext: protectedRow.ciphertext, iv: protectedRow.body_iv,
+          authTag: protectedRow.body_auth_tag },
+        unwrapped.get(keyRow.id)!,
+      );
+      const body = immutableJson(JSON.parse(plaintext.toString("utf8")) as JsonValue);
+      const calculatedHash = canonicalContentDigest(integrityDocument({
+        id: event.id, aggregateId: event.aggregateId, accountId: event.accountId,
+        actor: event.actor, type: event.type, visibility: event.visibility,
+        occurredAt: event.occurredAt, causationId: event.causationId,
+        correlationId: event.correlationId, promptVersion: event.promptVersion,
+        modelVersion: event.modelVersion, policyVersion: event.policyVersion,
+      }, body));
+      if (!digestsEqual(event.integrityHash, calculatedHash)) {
+        throw new Error("EVENT_INTEGRITY_FAILURE");
+      }
+      bodies.set(id, body);
+    }
+    return Object.freeze(eventIds.map((eventId) => Object.freeze({
+      eventId, body: bodies.get(eventId)!,
+    })));
+  } finally {
+    for (const key of unwrapped.values()) key.fill(0);
   }
-  const dataKey = unwrapDataKey(protectedRow.aggregate_id, wrappedFromAggregateRow(keyRow));
-  const plaintext = decryptEventBody(
-    event.id,
-    event.integrityHash,
-    {
-      ciphertext: protectedRow.ciphertext,
-      iv: protectedRow.body_iv,
-      authTag: protectedRow.body_auth_tag,
-    },
-    dataKey,
-  );
-  const body = JSON.parse(plaintext.toString("utf8")) as JsonValue;
-  const calculatedHash = canonicalContentDigest(
-    integrityDocument(
-      {
-        id: event.id,
-        aggregateId: event.aggregateId,
-        accountId: event.accountId,
-        actor: event.actor,
-        type: event.type,
-        visibility: event.visibility,
-        occurredAt: event.occurredAt,
-        causationId: event.causationId,
-        correlationId: event.correlationId,
-        promptVersion: event.promptVersion,
-        modelVersion: event.modelVersion,
-        policyVersion: event.policyVersion,
-      },
-      body,
-    ),
-  );
-  if (!digestsEqual(event.integrityHash, calculatedHash)) {
-    throw new Error("EVENT_INTEGRITY_FAILURE");
-  }
-  return body;
 }
 
 export async function rewrapAggregateDataKey(

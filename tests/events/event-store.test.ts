@@ -1,8 +1,10 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import type { EventDatabase, JsonValue } from "../../lib/server/events/types";
 import { openTestDb } from "../helpers/postgres";
 import {
   appendEvent,
+  readEventBodies,
   readEventBody,
   rewrapAggregateDataKey,
 } from "../../lib/server/events/store";
@@ -224,4 +226,116 @@ describe("appendEvent", () => {
       }),
     ).rejects.toThrow("EVENT_KEY_UNAVAILABLE");
   }, 30_000);
+
+  it("batch-authorizes before ciphertext and decrypts ordered unique bodies in bounded queries", async () => {
+    const db = await openTestDb();
+    const first = await appendEvent(db, {
+      aggregateId: "batch-conversation", accountId: "batch-account",
+      actor: { type: "USER", id: "batch-account" }, type: "message.completed",
+      visibility: "PRIVATE_ACCOUNT", body: { text: "first", nested: { value: 1 } },
+      idempotencyKey: "batch-read:first",
+    });
+    const second = await appendEvent(db, {
+      aggregateId: "batch-conversation", accountId: "batch-account",
+      actor: { type: "NODE_BRAIN", id: "batch-node" }, type: "node.response.completed",
+      visibility: "PRIVATE_ACCOUNT", body: { text: "second" },
+      idempotencyKey: "batch-read:second",
+    });
+    const foreign = await appendEvent(db, {
+      aggregateId: "batch-foreign", accountId: "foreign-account",
+      actor: { type: "USER", id: "foreign-account" }, type: "message.completed",
+      visibility: "PRIVATE_ACCOUNT", body: { text: "foreign" },
+      idempotencyKey: "batch-read:foreign",
+    });
+    const queries: string[] = [];
+    const counted: EventDatabase = {
+      query: async (sql, parameters) => {
+        queries.push(sql);
+        return db.query(sql, parameters);
+      },
+      one: (sql, parameters) => db.one(sql, parameters),
+      transaction: (work) => db.transaction(work),
+    };
+    const bodies = await readEventBodies(
+      counted, [second.id, first.id, first.id],
+      { actor: { role: "ACCOUNT", accountId: "batch-account" } },
+    );
+    expect(bodies.map(({ eventId, body }) => ({ eventId, body }))).toEqual([
+      { eventId: second.id, body: { text: "second" } },
+      { eventId: first.id, body: { text: "first", nested: { value: 1 } } },
+      { eventId: first.id, body: { text: "first", nested: { value: 1 } } },
+    ]);
+    expect(bodies[1].body).toBe(bodies[2].body);
+    expect(Object.isFrozen(bodies)).toBe(true);
+    expect(Object.isFrozen(bodies[1].body)).toBe(true);
+    expect(queries).toHaveLength(3);
+
+    queries.length = 0;
+    await expect(readEventBodies(
+      counted, [first.id, foreign.id],
+      { actor: { role: "ACCOUNT", accountId: "batch-account" } },
+    )).rejects.toThrow("FORBIDDEN");
+    expect(queries).toHaveLength(1);
+    expect(queries.some((sql) => sql.includes("encrypted_event_bodies")
+      || sql.includes("aggregate_data_keys"))).toBe(false);
+    await expect(readEventBodies(
+      counted, Array.from({ length: 101 }, () => first.id),
+      { actor: { role: "ACCOUNT", accountId: "batch-account" } },
+    )).rejects.toThrow("EVENT_BODY_BATCH_LIMIT");
+  });
+
+  it("overwrites caller-supplied ingestion sequences on direct inserts", async () => {
+    const db = await openTestDb();
+    const source = await appendEvent(db, {
+      aggregateId: "ingestion-trigger", actor: { type: "SYSTEM", id: "test" },
+      type: "ingestion.source", visibility: "OPERATOR", body: { test: true },
+      idempotencyKey: "ingestion-trigger:source",
+    });
+    let storedSequence: string | undefined;
+    await expect(db.transaction(async (transaction) => {
+      const forgedId = randomUUID();
+      await transaction.query(
+        `insert into events (
+           ingested_sequence,id,aggregate_id,account_id,actor_type,actor_id,type,visibility,
+           occurred_at,causation_id,correlation_id,prompt_version,model_version,policy_version,
+           idempotency_key,request_hash,integrity_hash
+         ) select 9223372036854770000,$1,aggregate_id,account_id,actor_type,actor_id,type,
+                  visibility,occurred_at,causation_id,correlation_id,prompt_version,model_version,
+                  policy_version,$2,request_hash,integrity_hash from events where id=$3`,
+        [forgedId, `ingestion-trigger:forged:${forgedId}`, source.id],
+      );
+      storedSequence = (await transaction.one<{ sequence: string }>(
+        "select ingested_sequence::text sequence from events where id=$1", [forgedId],
+      )).sequence;
+      throw new Error("ROLLBACK_INGESTION_TRIGGER_FIXTURE");
+    })).rejects.toThrow("ROLLBACK_INGESTION_TRIGGER_FIXTURE");
+    expect(storedSequence).toBeDefined();
+    expect(storedSequence).not.toBe("9223372036854770000");
+  });
+
+  it("round-trips an own __proto__ JSON key without prototype mutation", async () => {
+    const db = await openTestDb();
+    const body = Object.create(null) as Record<string, JsonValue>;
+    Object.defineProperty(body, "__proto__", {
+      value: { attackerInherited: true }, enumerable: true, configurable: true, writable: true,
+    });
+    body.safe = { nested: "value" };
+    const event = await appendEvent(db, {
+      aggregateId: "prototype-safe-body", actor: { type: "SYSTEM", id: "prototype-test" },
+      type: "prototype.body.committed", visibility: "OPERATOR", body,
+      idempotencyKey: "prototype-safe-body:event",
+    });
+    const [result] = await readEventBodies(
+      db, [event.id], { actor: { role: "SYSTEM" } },
+    );
+    const read = result.body as Record<string, JsonValue>;
+    expect(Object.hasOwn(read, "__proto__")).toBe(true);
+    expect(read.__proto__).toEqual({ attackerInherited: true });
+    expect(Object.getPrototypeOf(read) === null || Object.getPrototypeOf(read) === Object.prototype)
+      .toBe(true);
+    expect((read as Record<string, unknown>).attackerInherited).toBeUndefined();
+    expect(read.safe).toEqual({ nested: "value" });
+    expect(Object.isFrozen(read)).toBe(true);
+    expect(Object.isFrozen(read.__proto__)).toBe(true);
+  });
 });
