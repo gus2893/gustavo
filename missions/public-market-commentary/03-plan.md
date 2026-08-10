@@ -1060,7 +1060,7 @@ Yes. It completes stage progression without changing order accounting.
 ### T18 — Store observable ThoughtRecords in the source transaction
 
 **Maps to:** R35, R51, R52, R53
-**Files touched:** `db/migrations/0011_thoughts.sql` (new), `lib/server/thoughts/types.ts` (new), `lib/server/thoughts/store.ts` (new), `tests/thoughts/atomic-thought.test.ts` (new)
+**Files touched:** `db/migrations/0012_thoughts.sql` (new), `lib/server/thoughts/types.ts` (new), `lib/server/thoughts/store.ts` (new), `tests/thoughts/atomic-thought.test.ts` (new), `missions/public-market-commentary/debug-t18-first-green.md` (new), `missions/public-market-commentary/debug-t18-full-suite-load.md` (new), `missions/public-market-commentary/debug-t18-system-actor-trigger-order.md` (new)
 
 #### Red — failing test
 
@@ -1115,7 +1115,7 @@ Yes. It adds the auditable rationale primitive separately from memory extraction
 ### T19 — Consolidate source events into typed memory projections
 
 **Maps to:** R16, R21, R22, R24, R70, R73
-**Files touched:** `db/migrations/0012_memory.sql` (new), `lib/server/memory/types.ts` (new), `lib/server/consolidation/consolidate.ts` (new), `worker/consolidation/process-event.ts` (new), `tests/memory/consolidation.test.ts` (new)
+**Files touched:** `db/migrations/0013_memory.sql` (new), `lib/server/memory/types.ts` (new), `lib/server/consolidation/consolidate.ts` (new), `worker/consolidation/process-event.ts` (new), `tests/memory/consolidation.test.ts` (new)
 
 #### Red — failing test
 
@@ -1173,7 +1173,7 @@ Yes. It introduces derived memory generation but not retrieval ranking.
 ### T20 — Import authorized external chats incrementally and idempotently
 
 **Maps to:** R69, R77
-**Files touched:** `db/migrations/0013_chat_sources.sql` (new), `lib/server/chat-sources/contracts.ts` (new), `lib/server/chat-sources/import.ts` (new), `app/api/memory/sources/import/route.ts` (new), `tests/chats/incremental.test.ts` (new)
+**Files touched:** `db/migrations/0014_chat_sources.sql` (new), `lib/server/chat-sources/contracts.ts` (new), `lib/server/chat-sources/import.ts` (new), `app/api/memory/sources/import/route.ts` (new), `tests/chats/incremental.test.ts` (new)
 
 #### Red — failing test
 
@@ -1227,7 +1227,7 @@ Yes. It handles source ingestion without sharing imported content into Main memo
 ### T21 — Retrieve bounded authorized memory and store RecallTrace provenance
 
 **Maps to:** R16, R22, R23, R26, R45, R71, R72, R74, R75, R78
-**Files touched:** `db/migrations/0014_recall.sql` (new), `lib/server/recall/planner.ts` (new), `lib/server/recall/rank.ts` (new), `lib/server/recall/trace.ts` (new), `tests/recall/planner.test.ts` (new)
+**Files touched:** `db/migrations/0015_recall.sql` (new), `lib/server/recall/planner.ts` (new), `lib/server/recall/rank.ts` (new), `lib/server/recall/trace.ts` (new), `tests/recall/planner.test.ts` (new)
 
 #### Red — failing test
 
@@ -1294,7 +1294,7 @@ Yes. It is the complete interactive recall boundary over already-built memory pr
 ### T22 — Version temporal memory graph edges and explicit conflicts
 
 **Maps to:** R70, R73, R74, R79
-**Files touched:** `db/migrations/0015_memory_graph.sql` (new), `lib/server/consolidation/graph.ts` (new), `lib/server/consolidation/conflicts.ts` (new), `tests/memory/conflicts.test.ts` (new)
+**Files touched:** `db/migrations/0016_memory_graph.sql` (new), `lib/server/consolidation/graph.ts` (new), `lib/server/consolidation/conflicts.ts` (new), `tests/memory/conflicts.test.ts` (new)
 
 #### Red — failing test
 
@@ -1344,7 +1344,7 @@ Yes. It adds associative structure without changing recall authorization.
 ### T23 — Build privacy-filtered Node-to-Main handoff packets
 
 **Maps to:** R23, R45, R58, R72
-**Files touched:** `db/migrations/0016_handoffs.sql` (new), `lib/server/handoffs/build.ts` (new), `worker/handoffs/refresh.ts` (new), `tests/handoffs/privacy.test.ts` (new)
+**Files touched:** `db/migrations/0017_handoffs.sql` (new), `lib/server/handoffs/build.ts` (new), `worker/handoffs/refresh.ts` (new), `tests/handoffs/privacy.test.ts` (new)
 
 #### Red — failing test
 
@@ -1453,7 +1453,7 @@ Yes. It accelerates existing projections without changing their authority.
 ### T25 — Bootstrap classified trading knowledge with provenance and rollback
 
 **Maps to:** R13, R60, R61, R62, R63, R64, R65, R66, R67, R68
-**Files touched:** `db/migrations/0017_imports.sql` (new), `lib/server/import/classify.ts` (new), `lib/server/import/run.ts` (new), `lib/server/import/verify.ts` (new), `scripts/import-bootstrap.ts` (new), `scripts/archive-legacy-knowledge.ts` (new), `.gitignore` (modify), `tests/import/bootstrap.test.ts` (new)
+**Files touched:** `db/migrations/0018_imports.sql` (new), `lib/server/import/classify.ts` (new), `lib/server/import/run.ts` (new), `lib/server/import/verify.ts` (new), `scripts/import-bootstrap.ts` (new), `scripts/archive-legacy-knowledge.ts` (new), `.gitignore` (modify), `tests/import/bootstrap.test.ts` (new)
 
 #### Red — failing test
 
@@ -1519,7 +1519,7 @@ Yes. It imports explicit local knowledge without altering current market state o
 ### T26 — Support memory inspection, correction, export, and cryptographic forgetting
 
 **Maps to:** R20, R27, R76
-**Files touched:** `db/migrations/0018_privacy_controls.sql` (new), `lib/server/memory/controls.ts` (new), `lib/server/memory/forget.ts` (new), `app/api/memory/route.ts` (new), `app/api/account/export/route.ts` (new), `tests/helpers/postgres.ts` (modify), `tests/privacy/forget-propagation.test.ts` (new)
+**Files touched:** `db/migrations/0019_privacy_controls.sql` (new), `lib/server/memory/controls.ts` (new), `lib/server/memory/forget.ts` (new), `app/api/memory/route.ts` (new), `app/api/account/export/route.ts` (new), `tests/helpers/postgres.ts` (modify), `tests/privacy/forget-propagation.test.ts` (new)
 
 #### Red — failing test
 
@@ -1911,7 +1911,7 @@ Yes. It is an independent safety gate over the completed tree.
 ### T33 — Open scheduled Main broadcast cycles idempotently
 
 **Maps to:** R15, R44
-**Files touched:** `db/migrations/0019_broadcast_schedules.sql` (new), `lib/server/main-brain/schedules.ts` (new), `worker/broadcasts/scheduler.ts` (new), `tests/broadcasts/scheduler.test.ts` (new)
+**Files touched:** `db/migrations/0020_broadcast_schedules.sql` (new), `lib/server/main-brain/schedules.ts` (new), `worker/broadcasts/scheduler.ts` (new), `tests/broadcasts/scheduler.test.ts` (new)
 
 #### Red — failing test
 
