@@ -29,6 +29,21 @@ describe("appendEvent", () => {
     expect(await db.one<{ events: number }>(
       "select count(*)::int events from events where type=any($1::text[])", [exactTypes],
     )).toEqual({ events: 0 });
+    const handoffTypes = [
+      "node.handoff.packet.refreshed", "node.handoff.checkpoint.advanced",
+      "node.handoff.refresh.queued",
+      "node.handoff.refresh.claimed", "node.handoff.refresh.retry_scheduled",
+      "node.handoff.refresh.completed", "node.handoff.refresh.failed",
+    ] as const;
+    await expect(appendEvents(db, handoffTypes.map((type, index) => ({
+      aggregateId: `node-handoff-orphan:${index}`, accountId: "exact-owner",
+      actor: { type: "SYSTEM" as const, id: "handoff-refresher" }, type,
+      visibility: "PRIVATE_ACCOUNT" as const,
+      body: { index, type, typed: true }, idempotencyKey: `exact-handoff-body:${index}`,
+    })))).rejects.toThrow("INCOMPLETE_HANDOFF_EVENT");
+    expect(await db.one<{ events: number }>(
+      "select count(*)::int events from events where type=any($1::text[])", [handoffTypes],
+    )).toEqual({ events: 0 });
     const ordinary = await appendEvent(db, {
       aggregateId: "exact-graph-body-digests", accountId: "exact-owner",
       actor: { type: "SYSTEM", id: "exact-writer" }, type: "ordinary.compatible",

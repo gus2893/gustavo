@@ -264,6 +264,13 @@ const EXACT_BODY_DIGEST_EVENT_TYPES = new Set([
   "memory.graph.background.retry_scheduled",
   "memory.graph.background.completed",
   "memory.graph.background.failed",
+  "node.handoff.packet.refreshed",
+  "node.handoff.checkpoint.advanced",
+  "node.handoff.refresh.queued",
+  "node.handoff.refresh.claimed",
+  "node.handoff.refresh.retry_scheduled",
+  "node.handoff.refresh.completed",
+  "node.handoff.refresh.failed",
 ]);
 
 function batchValues(rowCount: number, columnCount: number): string {

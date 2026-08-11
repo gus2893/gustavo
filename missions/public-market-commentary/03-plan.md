@@ -1344,7 +1344,7 @@ Yes. It adds associative structure without changing recall authorization.
 ### T23 — Build privacy-filtered Node-to-Main handoff packets
 
 **Maps to:** R23, R45, R58, R72
-**Files touched:** `db/migrations/0017_handoffs.sql` (new), `lib/server/handoffs/build.ts` (new), `worker/handoffs/refresh.ts` (new), `tests/handoffs/privacy.test.ts` (new)
+**Files touched:** `db/migrations/0017_handoffs.sql` (new), `lib/server/handoffs/build.ts` (new), `worker/handoffs/refresh.ts` (new), `tests/handoffs/privacy.test.ts` (new), `lib/server/events/store.ts` (adjacent T23 exact event-body digest support), `tests/events/event-store.test.ts` (adjacent T23 exact event-body regression coverage), `missions/public-market-commentary/debug-t23-first-postgres.md` (authorized migration parse debug artifact), `missions/public-market-commentary/debug-t23-cold-timeout.md` (authorized cold-schema test timeout debug artifact), `missions/public-market-commentary/debug-t23-related-timeout.md` (authorized combined related-suite timeout debug artifact), `missions/public-market-commentary/debug-t23-incremental-query.md` (authorized incremental query debug artifact), `missions/public-market-commentary/debug-t23-retry-error-check.md` (authorized retry transition debug artifact), `missions/public-market-commentary/debug-t23-node-runtime.md` (authorized full-suite runtime debug artifact), `missions/public-market-commentary/03-plan.md` (modify; T23 scope ledger)
 
 #### Red — failing test
 
