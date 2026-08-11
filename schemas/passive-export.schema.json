@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Passive Local Paper Tracking Export",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["testOnly", "symbol", "tradeType", "price", "side", "stopLoss", "takeProfit", "amounts"],
+  "properties": {
+    "testOnly": { "const": true },
+    "symbol": { "type": "string", "pattern": "\\.cft$" },
+    "tradeType": { "const": "pending" },
+    "price": { "type": "number", "exclusiveMinimum": 0 },
+    "side": { "enum": ["buy", "sell"] },
+    "stopLoss": { "type": "number", "exclusiveMinimum": 0 },
+    "takeProfit": { "type": "number", "exclusiveMinimum": 0 },
+    "amounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["2500", "5000", "10000"],
+      "properties": {
+        "2500": { "type": "number", "exclusiveMinimum": 0 },
+        "5000": { "type": "number", "exclusiveMinimum": 0 },
+        "10000": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}
+
