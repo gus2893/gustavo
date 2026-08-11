@@ -664,6 +664,33 @@ function sourceHighWaterSql(memoryAlias: string, parameter: number): string {
   )`;
 }
 
+function importedMemoryLifecycleSql(
+  memoryAlias: string,
+  historicalAllowed: boolean,
+): string {
+  return `(not exists (
+      select 1 from import_memory_projections imported
+      where imported.memory_id=${memoryAlias}.id
+    ) or exists (
+      select 1
+      from import_memory_projections imported
+      join import_source_items imported_item on imported_item.id=imported.item_id
+      join lateral (
+        select lifecycle.active
+        from import_item_lifecycle_events lifecycle
+        where lifecycle.item_id=imported.item_id
+        order by lifecycle.authority_sequence desc,lifecycle.id desc limit 1
+      ) imported_lifecycle on true
+      where imported.memory_id=${memoryAlias}.id and imported_lifecycle.active
+        and ((imported.lifecycle_class='CANONICAL'
+              and imported.retrieval_profile='CURRENT_GENERAL'
+              and imported_item.retrieval_mode='GENERAL')
+          ${historicalAllowed ? `or (imported.lifecycle_class='HISTORICAL'
+              and imported.retrieval_profile='HISTORICAL_SIMILARITY'
+              and imported_item.retrieval_mode='SIMILARITY_ONLY')` : ""})
+    ))`;
+}
+
 async function runCandidateChannel(
   db: EventDatabase,
   actor: RecallActor,
@@ -673,6 +700,8 @@ async function runCandidateChannel(
   graphDepth: number,
   sourceHighWaterSequence: string,
   resultLimit = MAX_QUERY_CANDIDATES,
+  replaySelection = false,
+  historicalImportAllowed?: boolean,
 ): Promise<readonly CandidateRow[]> {
   const authorization = authorizationSql(actor);
   const offset = authorization.parameters.length;
@@ -740,6 +769,8 @@ async function runCandidateChannel(
          ) channel_match on channel_match.memory_id=m.id`
       : "";
   const effectiveCondition = kind === "ENTITY" || kind === "FULL_TEXT" ? "true" : shifted;
+  const historicalImportedMemoryAllowed = replaySelection
+    || (historicalImportAllowed ?? ["ENTITY", "FULL_TEXT", "VECTOR"].includes(kind));
   const channelScore = kind === "VECTOR"
     ? "coalesce(vector_score,0)"
     : kind === "ENTITY" || kind === "FULL_TEXT"
@@ -758,6 +789,7 @@ async function runCandidateChannel(
        from memory_records m
        ${termJoin}
        where ${authorization.clause} and ${availableSourcesSql()}
+         and ${importedMemoryLifecycleSql("m", historicalImportedMemoryAllowed)}
          and ${sourceHighWaterSql("m", highWaterParameter)} and (${effectiveCondition})
        order by ${kind === "VECTOR" ? "vector_match.bucket_matches desc,"
         : kind === "CURRENT_STATE" ? "(m.valid_to is null and m.conflict_state='CURRENT') desc,"
@@ -846,6 +878,7 @@ async function runGraphChannel(
          and not neighbor.next_memory_id=any(walk.path)
          and ${neighborAuthorization}
          and ${neighborAvailability}
+         and ${importedMemoryLifecycleSql("next_memory", false)}
          and ${sourceHighWaterSql("next_memory", highWaterParameter)}
      ), discovered as (
        select memory_id,min(depth)::int depth from walk where depth>0
@@ -857,6 +890,7 @@ async function runGraphChannel(
      join memory_records m on m.id=discovered.memory_id
      left join memory_sources source on source.memory_id=m.id
      where ${authorization.clause} and ${availableSourcesSql()}
+       and ${importedMemoryLifecycleSql("m", false)}
        and ${sourceHighWaterSql("m", highWaterParameter)}
      group by m.id,discovered.depth
      order by discovered.depth,m.importance desc,m.created_at desc,m.id`,
@@ -1251,12 +1285,22 @@ async function revalidateCandidateBodies<T extends {
   candidates: readonly T[],
   additionalEventIds: readonly string[] = [],
 ): Promise<readonly T[]> {
-  const bodyEventIds = [...new Set(candidates.map(({ bodyEventId }) => bodyEventId))];
+  const recallable = candidates.length === 0 ? [] : await context.db.query<{
+    id: string;
+  } & Record<string, unknown>>(
+    `select memory.id::text from memory_records memory
+      where memory.id=any($1::uuid[]) and ${importedMemoryLifecycleSql("memory", true)}
+      order by memory.id`,
+    [candidates.map(({ id }) => id)],
+  );
+  const recallableIds = new Set(recallable.map(({ id }) => id));
+  const revalidatedCandidates = candidates.filter(({ id }) => recallableIds.has(id));
+  const bodyEventIds = [...new Set(revalidatedCandidates.map(({ bodyEventId }) => bodyEventId))];
   if (bodyEventIds.length === 0) {
     if (additionalEventIds.length > 0) {
       await lockAvailableMemorySourceBodies(context.db, [], additionalEventIds);
     }
-    return candidates;
+    return Object.freeze(revalidatedCandidates);
   }
   if (context.actor.role !== "MAIN_BRAIN") {
     const allowedClause = context.actor.role === "ACCOUNT"
@@ -1286,7 +1330,7 @@ async function revalidateCandidateBodies<T extends {
         context.db, authorizedBodyIds, additionalEventIds,
       );
     const allowed = new Set(locked);
-    return Object.freeze(candidates.filter(({ bodyEventId }) => allowed.has(bodyEventId)));
+    return Object.freeze(revalidatedCandidates.filter(({ bodyEventId }) => allowed.has(bodyEventId)));
   }
   const authorities = await context.db.query<ProposalAuthorizationSnapshot>(
     `/* recall-proposal-body-authority */
@@ -1339,7 +1383,7 @@ async function revalidateCandidateBodies<T extends {
       context.db, authorizedBodyIds, additionalEventIds,
     );
   const allowed = new Set(locked);
-  return Object.freeze(candidates.filter(({ bodyEventId }) => allowed.has(bodyEventId)));
+  return Object.freeze(revalidatedCandidates.filter(({ bodyEventId }) => allowed.has(bodyEventId)));
 }
 
 async function loadRecallSnapshot(context: RecallAuthorizationContext): Promise<{
@@ -1516,7 +1560,7 @@ async function recallAuthorizedCaptured(
     const replayRows = replay.selectedMemoryIds.length === 0 ? [] : await runCandidateChannel(
       context.db, context.actor, "RECENT", "m.id=any($1::uuid[])",
       [replay.selectedMemoryIds], input.graphDepth, replay.highWaterSequence,
-      MAX_CONTEXT_MEMORIES,
+      MAX_CONTEXT_MEMORIES, true,
     );
     const byMemoryId = new Map(replayRows.map((row) => [row.id, row]));
     if (replay.selectedMemoryIds.some((id) => !byMemoryId.has(id))) {
@@ -1596,7 +1640,8 @@ async function recallAuthorizedCaptured(
       [entityTerms, entityDigests], input.graphDepth, highWaterSequence),
     runCandidateChannel(context.db, context.actor, "TIME",
       "m.source_to>=coalesce($1::timestamptz,'-infinity') and m.source_from<=coalesce($2::timestamptz,'infinity')",
-      [input.from, input.to], input.graphDepth, highWaterSequence),
+      [input.from, input.to], input.graphDepth, highWaterSequence,
+      MAX_QUERY_CANDIDATES, false, input.from !== null || input.to !== null),
     runCandidateChannel(context.db, context.actor, "FULL_TEXT",
       `channel_term.kind='KEYWORD'
         and ((channel_term.scope='PUBLIC' and (channel_term.term_text=any($1::text[])
