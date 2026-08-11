@@ -1453,7 +1453,7 @@ Yes. It accelerates existing projections without changing their authority.
 ### T25 — Bootstrap classified trading knowledge with provenance and rollback
 
 **Maps to:** R13, R60, R61, R62, R63, R64, R65, R66, R67, R68
-**Files touched:** `db/migrations/0018_imports.sql` (new), `lib/server/import/classify.ts` (new), `lib/server/import/run.ts` (new), `lib/server/import/verify.ts` (new), `scripts/import-bootstrap.ts` (new), `scripts/archive-legacy-knowledge.ts` (new), `.gitignore` (modify), `tests/import/bootstrap.test.ts` (new)
+**Files touched:** `db/migrations/0018_imports.sql` (new), `lib/server/import/classify.ts` (new), `lib/server/import/run.ts` (new), `lib/server/import/verify.ts` (new), `lib/server/recall/planner.ts` (modify; import-memory lifecycle/retrieval gate), `scripts/import-bootstrap.ts` (new), `scripts/archive-legacy-knowledge.ts` (new), `.gitignore` (modify), `tests/import/bootstrap.test.ts` (new)
 
 #### Red — failing test
 
@@ -1499,6 +1499,8 @@ Expected initial state: the test exits 1 because manifests, lifecycle classifica
 - Classify approved Gustavo boundaries as canonical, structural methods as candidate, dated ETH/AVAX episodes as historical, superseded workflows as deprecated, and execution/CFT material as prohibited audit-only data.
 - Make deterministic import keys no-op on repeat, generate count/hash manifests, verify active retrieval exclusion, and roll back through append-only deactivation events.
 - After manifest verification, archive superseded raw paper-lab files into an operator-owned encrypted bundle outside the public repository, keep only its digest/manifest, and remove those raw files from the public application tree.
+
+**Execution safety deviation:** The dependency-free Node runtime has no OS handle/dirfd-bound conditional rename/unlink primitive, so shipped T25 fails closed instead of deleting. It durably verifies the encrypted archive and digest-only manifest, emits an authenticated exact manual-removal receipt outside the repository, returns `ARCHIVE_ATOMIC_REMOVAL_UNAVAILABLE`, and preserves the raw source for operator-controlled removal.
 
 #### Refactor
 

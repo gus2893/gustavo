@@ -2,6 +2,7 @@
 Thumbs.db
 *.tmp
 *.log
+*.gustavo-archive
 /node_modules/
 /.next/
 /coverage/
