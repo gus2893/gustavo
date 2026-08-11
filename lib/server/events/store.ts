@@ -250,6 +250,21 @@ const EVENT_COLUMNS = `
 `;
 
 const EVENT_APPEND_BATCH_LIMIT = 100;
+const EXACT_BODY_DIGEST_EVENT_TYPES = new Set([
+  "memory.recall.traced",
+  "memory.edge.versioned",
+  "memory.graph.reconciliation.queued",
+  "memory.graph.reconciliation.claimed",
+  "memory.graph.reconciliation.progressed",
+  "memory.graph.reconciliation.retry_scheduled",
+  "memory.graph.reconciliation.completed",
+  "memory.graph.reconciliation.failed",
+  "memory.graph.background.queued",
+  "memory.graph.background.claimed",
+  "memory.graph.background.retry_scheduled",
+  "memory.graph.background.completed",
+  "memory.graph.background.failed",
+]);
 
 function batchValues(rowCount: number, columnCount: number): string {
   return Array.from({ length: rowCount }, (_, row) => (
@@ -406,7 +421,9 @@ export async function appendEvents(
           row.input.idempotencyKey, row.requestHash, row.integrityHash,
         ]),
       );
-      const ordinaryBodyRows = pendingRows.filter(({ input }) => input.type !== "memory.recall.traced");
+      const ordinaryBodyRows = pendingRows.filter(
+        ({ input }) => !EXACT_BODY_DIGEST_EVENT_TYPES.has(input.type),
+      );
       if (ordinaryBodyRows.length > 0) {
         await transaction.query(
           `insert into encrypted_event_bodies
@@ -416,13 +433,15 @@ export async function appendEvents(
             row.keyRow.id, row.encrypted.ciphertext, row.encrypted.iv, row.encrypted.authTag]),
         );
       }
-      const recallBodyRows = pendingRows.filter(({ input }) => input.type === "memory.recall.traced");
-      if (recallBodyRows.length > 0) {
+      const exactBodyRows = pendingRows.filter(
+        ({ input }) => EXACT_BODY_DIGEST_EVENT_TYPES.has(input.type),
+      );
+      if (exactBodyRows.length > 0) {
         await transaction.query(
           `insert into encrypted_event_bodies
              (event_id,aggregate_id,data_key_id,ciphertext,body_iv,body_auth_tag,body_digest)
-           values ${batchValues(recallBodyRows.length, 7)}`,
-          recallBodyRows.flatMap((row) => [row.eventWithoutHash.id, row.input.aggregateId,
+           values ${batchValues(exactBodyRows.length, 7)}`,
+          exactBodyRows.flatMap((row) => [row.eventWithoutHash.id, row.input.aggregateId,
             row.keyRow.id, row.encrypted.ciphertext, row.encrypted.iv, row.encrypted.authTag,
             row.bodyDigest]),
         );
