@@ -1294,7 +1294,7 @@ Yes. It is the complete interactive recall boundary over already-built memory pr
 ### T22 — Version temporal memory graph edges and explicit conflicts
 
 **Maps to:** R70, R73, R74, R79
-**Files touched:** `db/migrations/0016_memory_graph.sql` (new), `lib/server/consolidation/graph.ts` (new), `lib/server/consolidation/conflicts.ts` (new), `tests/memory/conflicts.test.ts` (new)
+**Files touched:** `db/migrations/0016_memory_graph.sql` (new), `lib/server/consolidation/graph.ts` (new), `lib/server/consolidation/conflicts.ts` (new), `lib/server/events/store.ts` (modify; authorized exact T22 canonical body digests), `worker/consolidation/process-event.ts` (modify; authorized Stage A derived-event eligibility exclusion), `tests/memory/conflicts.test.ts` (new), `tests/memory/consolidation.test.ts` (modify; authorized Stage A derived-event eligibility regression), `tests/events/event-store.test.ts` (modify; authorized exact T22 canonical body-digest regressions), `missions/public-market-commentary/debug-t22-first-green.md` (new; authorized first-green debug artifact), `missions/public-market-commentary/debug-t22-stage-a.md` (new; authorized Stage A debug artifact), `missions/public-market-commentary/03-plan.md` (modify; T22 scope ledger)
 
 #### Red — failing test
 

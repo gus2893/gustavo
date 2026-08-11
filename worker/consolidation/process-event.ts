@@ -116,6 +116,11 @@ function sourceScopeMatches(input: ProcessMemoryEventInput, source: SourceEventR
   return source.visibility === "OPERATOR";
 }
 
+function derivedMemoryEventType(type: string): boolean {
+  return type === "memory.consolidation.completed" || type === "memory.edge.versioned"
+    || type.startsWith("memory.graph.");
+}
+
 function bodyFor(
   memories: readonly ConsolidatedMemory[],
   digestSalt: string,
@@ -615,23 +620,43 @@ export async function deriveMemorySearchTermDigest(
   context: ProcessMemoryEventContext,
   input: MemorySearchTermInput,
 ): Promise<string> {
+  return (await deriveMemorySearchTermDigests(context, [input]))[0]!;
+}
+
+export async function deriveMemorySearchTermDigests(
+  context: ProcessMemoryEventContext,
+  inputs: readonly MemorySearchTermInput[],
+): Promise<readonly string[]> {
   if (!memoryWorkerContexts.has(context)) throw new Error("MEMORY_WORKER_CONTEXT_REQUIRED");
-  const captured = captureMemoryInput(input);
-  if (captured.kind !== "KEYWORD" && captured.kind !== "ENTITY") {
-    throw new Error("INVALID_MEMORY_SEARCH_KIND");
+  if (!Array.isArray(inputs) || inputs.length < 1 || inputs.length > 2_200) {
+    throw new Error("MEMORY_SEARCH_TERM_BATCH_LIMIT");
   }
-  const term = required(captured.term, "INVALID_MEMORY_SEARCH_TERM", 120).trim().toLowerCase();
-  if (captured.scope === "PUBLIC") {
-    return canonicalContentDigest({ kind: captured.kind, term });
+  const captured = inputs.map((input) => captureMemoryInput(input));
+  const authority = captured[0]!;
+  if (captured.some((item) => (item.kind !== "KEYWORD" && item.kind !== "ENTITY")
+    || item.scope !== authority.scope || item.accountId !== authority.accountId
+    || item.nodeBrainId !== authority.nodeBrainId
+    || item.conversationId !== authority.conversationId
+    || item.aggregateId !== authority.aggregateId)) {
+    throw new Error("MEMORY_SEARCH_TERM_BATCH_AUTHORITY_MISMATCH");
   }
-  await validatePrivateTopology(context.db, captured);
-  const retrieval = await loadRetrievalKey(context.db, captured, false);
+  const terms = captured.map((item) => required(
+    item.term, "INVALID_MEMORY_SEARCH_TERM", 120,
+  ).trim().toLowerCase());
+  if (authority.scope === "PUBLIC") {
+    return Object.freeze(captured.map((item, index) => canonicalContentDigest({
+      kind: item.kind, term: terms[index]!,
+    })));
+  }
+  await validatePrivateTopology(context.db, authority);
+  const retrieval = await loadRetrievalKey(context.db, authority, false);
   if (!retrieval) throw new Error("MEMORY_RETRIEVAL_KEY_REQUIRED");
   const key = deriveIndexHmacKey(retrieval.dataKey);
   try {
-    return keyedDigest(key, {
-      domain: "gustavo:memory-search:v1", kind: captured.kind, scope: captured.scope, term,
-    });
+    return Object.freeze(captured.map((item, index) => keyedDigest(key, {
+      domain: "gustavo:memory-search:v1", kind: item.kind, scope: item.scope,
+      term: terms[index]!,
+    })));
   } finally {
     key.fill(0);
     retrieval.dataKey.fill(0);
@@ -1028,7 +1053,7 @@ export async function processMemoryEvent(
     );
     const lead = leadRows[0];
     if (!lead) throw new Error("MEMORY_SOURCE_EVENT_REQUIRED");
-    if (lead.type === "memory.consolidation.completed") {
+    if (derivedMemoryEventType(lead.type)) {
       throw new Error("MEMORY_DERIVED_EVENT_NOT_SOURCE");
     }
     if (lead.visibility === "PRIVATE_ACCOUNT"
@@ -1057,7 +1082,7 @@ export async function processMemoryEvent(
     );
     if (sourceRows.length !== eventIds.length) throw new Error("MEMORY_SOURCE_EVENT_REQUIRED");
     const sourceById = new Map(sourceRows.map((source) => [source.id, source]));
-    if (sourceRows.some((source) => source.type === "memory.consolidation.completed")) {
+    if (sourceRows.some((source) => derivedMemoryEventType(source.type))) {
       throw new Error("MEMORY_DERIVED_EVENT_NOT_SOURCE");
     }
     if (sourceRows.some((source) => source.aggregate_id !== lead.aggregate_id)) {
@@ -1125,7 +1150,8 @@ export async function processMemoryEvent(
             `select event.id::text
              from events event
              join transactional_outbox outbox on outbox.event_id=event.id
-             where event.type<>'memory.consolidation.completed'
+             where event.type not in ('memory.consolidation.completed','memory.edge.versioned')
+               and event.type not like 'memory.graph.%'
                and event.ingested_sequence<=$1::bigint
                and (
                  ($2 in ('PRIVATE_ACCOUNT','NODE_BRANCH') and event.visibility='PRIVATE_ACCOUNT'
@@ -1159,7 +1185,8 @@ export async function processMemoryEvent(
           `select event.id::text
            from events event
            join transactional_outbox outbox on outbox.event_id=event.id
-           where event.type<>'memory.consolidation.completed'
+            where event.type not in ('memory.consolidation.completed','memory.edge.versioned')
+             and event.type not like 'memory.graph.%'
              and event.ingested_sequence<=$1::bigint
              and ($2::bigint is null or event.ingested_sequence>$2::bigint)
              and (

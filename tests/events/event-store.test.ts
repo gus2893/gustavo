@@ -11,6 +11,34 @@ import {
 } from "../../lib/server/events/store";
 
 describe("appendEvent", () => {
+  it("rejects orphan canonical graph/job events while preserving ordinary legacy bodies", async () => {
+    const db = await openTestDb();
+    const exactTypes = ["memory.edge.versioned", "memory.graph.reconciliation.queued",
+      "memory.graph.reconciliation.claimed", "memory.graph.reconciliation.progressed",
+      "memory.graph.reconciliation.retry_scheduled", "memory.graph.reconciliation.completed",
+      "memory.graph.reconciliation.failed",
+      "memory.graph.background.queued",
+      "memory.graph.background.claimed", "memory.graph.background.retry_scheduled",
+      "memory.graph.background.completed", "memory.graph.background.failed"] as const;
+    await expect(appendEvents(db, exactTypes.map((type, index) => ({
+      aggregateId: "exact-graph-body-digests", accountId: "exact-owner",
+      actor: { type: "SYSTEM" as const, id: "exact-writer" }, type,
+      visibility: "PRIVATE_ACCOUNT" as const,
+      body: { index, type, typed: true }, idempotencyKey: `exact-graph-body:${index}`,
+    })))).rejects.toThrow("INCOMPLETE_MEMORY_GRAPH_EVENT");
+    expect(await db.one<{ events: number }>(
+      "select count(*)::int events from events where type=any($1::text[])", [exactTypes],
+    )).toEqual({ events: 0 });
+    const ordinary = await appendEvent(db, {
+      aggregateId: "exact-graph-body-digests", accountId: "exact-owner",
+      actor: { type: "SYSTEM", id: "exact-writer" }, type: "ordinary.compatible",
+      visibility: "PRIVATE_ACCOUNT", body: { legacy: true }, idempotencyKey: "ordinary-compatible",
+    });
+    expect(await db.one<{ body_digest: string | null }>(
+      "select body_digest from encrypted_event_bodies where event_id=$1", [ordinary.id],
+    )).toEqual({ body_digest: null });
+  }, 20_000);
+
   it("batch-appends ordered idempotent events atomically with bounded aggregate-key work", async () => {
     const db = await openTestDb();
     let queryCount = 0;

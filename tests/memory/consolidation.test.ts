@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import { consolidateEvents } from "../../lib/server/consolidation/consolidate";
+import {
+  createMemoryGraphWriterContext,
+  versionMemoryGraph,
+} from "../../lib/server/consolidation/graph";
 import { appendEvent, readEventBody } from "../../lib/server/events/store";
 import { canonicalContentDigest, canonicalJson } from "../../lib/server/events/integrity";
 import type { EventDatabase } from "../../lib/server/events/types";
@@ -1037,6 +1041,69 @@ describe("memory consolidation", () => {
     );
     expect(state).toEqual({ source_event_id: fixture.second.id, status: "PUBLISHED" });
     expect(secondResult.highWaterEventId).toBe(fixture.second.id);
+  });
+
+  it("excludes encrypted memory graph events from source eligibility and high-water", async () => {
+    const { db } = await testContext();
+    const fixture = await seedPrivateSource(db, "graph-derived-eligibility");
+    await db.query(
+      `insert into entitlements(id,account_id,active_from,created_at)
+       values ($1,$2,clock_timestamp(),clock_timestamp())`,
+      [randomUUID(), fixture.accountId],
+    );
+    const projected = await processMemoryEvent(createMemoryWorkerContext(db), {
+      ...workerInput(fixture, "graph-derived-eligibility:graph-seed"),
+      observedAt: "2026-08-09T10:02:00.000Z",
+    });
+    const fact = projected.memories.find(({ keywords }) => (
+      keywords.includes("preference") && keywords.includes("aapl")
+    ))!;
+    const entityId = randomUUID();
+    const graph = await versionMemoryGraph(createMemoryGraphWriterContext(db), {
+      scope: "PRIVATE_ACCOUNT", accountId: fixture.accountId,
+      nodeBrainId: fixture.nodeBrainId, conversationId: fixture.conversationId,
+      idempotencyKey: "memory-graph-derived:eligibility",
+      reconcilerVersion: "temporal-memory-graph-v2",
+      observedAt: "2026-08-09T10:02:30.000Z",
+      entities: [{ id: entityId, type: "INSTRUMENT", canonicalName: "AAPL",
+        validFrom: fact.validFrom, aliases: [{ alias: "AAPL", validFrom: fact.validFrom,
+          sourceIds: [fixture.first.id] }] }],
+      claims: [{ memoryId: fact.id, entityId, nodeType: "FACT", predicate: "preference",
+        value: "aapl", approved: true, validFrom: fact.validFrom,
+        sourceIds: [fixture.first.id] }],
+    });
+    const graphEvent = await db.one<{ id: string }>(
+      "select graph_event_id::text id from memory_graph_reconciliation_runs where id=$1",
+      [graph.reconciliationRunId],
+    );
+    const third = await appendPrivateSource(
+      db, fixture, "graph-derived-eligibility:3", "Compare the next close.",
+      "2026-08-09T10:03:00.000Z",
+    );
+    const base = workerInput(fixture, "graph-derived-eligibility");
+    const result = await processMemoryEvent(createMemoryWorkerContext(db), {
+      ...base,
+      sourceEventId: third.id,
+      events: [{
+        id: third.id, at: third.occurredAt.toISOString(), text: "Compare the next close.",
+      }],
+      extracted: {
+        facts: [], procedures: [], episodes: [],
+        goals: [{
+          text: "Compare the next close", sourceIds: [third.id], status: "OPEN" as const,
+        }],
+      },
+      observedAt: "2026-08-09T10:04:00.000Z",
+    });
+    expect(result.highWaterEventId).toBe(third.id);
+    expect(await db.one<{ source_event_id: string }>(
+      "select source_event_id::text from memory_projection_checkpoints where projection_key=$1",
+      [`private_account:conversation:${fixture.conversationId}`],
+    )).toEqual({ source_event_id: third.id });
+    expect(await db.one<{ status: string }>(
+      "select status from transactional_outbox where event_id=$1",
+      [graphEvent.id],
+    )).toEqual({ status: "PENDING" });
   });
 
   it("serializes projections, rejects gaps/behind leads, and publishes every cited source", async () => {
