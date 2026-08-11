@@ -154,6 +154,14 @@ function routeFailure(error: unknown): Response {
       { status: 404, headers: privateHeaders() },
     );
   }
+  if (code === "BROADCAST_CACHE_NOT_READY") {
+    const headers = privateHeaders();
+    headers.set("Retry-After", "1");
+    return Response.json(
+      { error: code },
+      { status: 503, headers },
+    );
+  }
   if (code === "REQUEST_BODY_TOO_LARGE") {
     return Response.json(
       { error: code },

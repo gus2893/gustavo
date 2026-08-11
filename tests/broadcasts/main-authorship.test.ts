@@ -2,9 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { EventDatabase } from "../../lib/server/events/types";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  commitBroadcast,
-  projectDelivery,
+  commitBroadcast as commitBroadcastWithoutFixturePrewarm,
+  projectDelivery as projectDeliveryWithoutFixturePrewarm,
+  type BroadcastContext,
+  type CommitBroadcastInput,
+  type DeliveryProjectionInput,
 } from "../../lib/server/main-brain/broadcasts";
+import { MemoryCacheBackend, scopedCache } from "../../lib/server/cache/store";
+import { runPostgresCacheWorkerOnce } from "../../lib/server/cache/runtime";
 import { canonicalContentDigest } from "../../lib/server/events/integrity";
 import { appendEvent, readEventBody } from "../../lib/server/events/store";
 import {
@@ -28,6 +33,35 @@ vi.mock("../../lib/server/db/postgres", () => ({
 
 import { POST } from "../../app/api/broadcasts/route";
 
+async function markBroadcastPrewarmed(
+  database: EventDatabase,
+  broadcast: Awaited<ReturnType<typeof commitBroadcastWithoutFixturePrewarm>>,
+): Promise<void> {
+  const source = await database.one<{ readonly ingested_sequence: string }>(
+    "select ingested_sequence::text from events where id=$1",
+    [broadcast.commitEventId],
+  );
+  await database.query(
+    `insert into cache_projection_versions (
+       category,entity_id,source_event_id,source_high_water,version_ordinal,content_hash
+     ) values ('BROADCASTS',$1,$2,$3,$4,$5) on conflict do nothing`,
+    [broadcast.id, broadcast.commitEventId, `e${source.ingested_sequence}`,
+      source.ingested_sequence, "0".repeat(64)],
+  );
+}
+
+async function commitBroadcast(context: BroadcastContext, input: CommitBroadcastInput) {
+  const broadcast = await commitBroadcastWithoutFixturePrewarm(context, input);
+  await markBroadcastPrewarmed(context.db, broadcast);
+  return broadcast;
+}
+
+const projectDelivery = (
+  context: BroadcastContext,
+  broadcastId: string,
+  input: DeliveryProjectionInput,
+) => projectDeliveryWithoutFixturePrewarm(context, broadcastId, input);
+
 function deliveryRequest(
   fixture: ConversationFixture,
   body: unknown,
@@ -50,6 +84,55 @@ afterEach(() => {
 });
 
 describe("Main broadcasts", () => {
+  it("requires durable worker prewarm before fan-out and returns a bounded retry boundary", async () => {
+    const fixture = await createConversationFixture("broadcast-cache-gate");
+    routeState.db = fixture.db;
+    vi.stubEnv("NODE_ENV", "production");
+    const broadcast = await commitBroadcastWithoutFixturePrewarm({ db: fixture.db }, {
+      mainStateVersion: 6_100_001,
+      body: "AAPL completed support remains provisional pending the next completed bar.",
+      sourceIds: ["market:AAPL:completed-bar"],
+      idempotencyKey: "broadcast-cache-gate",
+    });
+    const input = {
+      accountId: fixture.accountId,
+      nodeBrainId: fixture.nodeBrainId,
+      locale: "en-US",
+    } as const;
+    await expect(projectDeliveryWithoutFixturePrewarm({ db: fixture.db }, broadcast.id, input))
+      .rejects.toThrow("BROADCAST_CACHE_NOT_READY");
+    const waiting = await POST(deliveryRequest(fixture, {
+      broadcastId: broadcast.id,
+      nodeBrainId: fixture.nodeBrainId,
+      locale: "en-US",
+    }));
+    expect(waiting.status).toBe(503);
+    expect(waiting.headers.get("retry-after")).toBe("1");
+
+    const cache = scopedCache({
+      backend: new MemoryCacheBackend(),
+      encryptionKey: Buffer.alloc(32, 41),
+      authorize: () => true,
+    });
+    for (let index = 0; index < 4; index += 1) {
+      await runPostgresCacheWorkerOnce({
+        db: fixture.db,
+        cache,
+        workerId: `broadcast-cache-worker-${index}`,
+        leaseMs: 5_000,
+        maxAttempts: 3,
+      });
+    }
+    await expect(projectDeliveryWithoutFixturePrewarm({ db: fixture.db }, broadcast.id, input))
+      .resolves.toMatchObject({ broadcastId: broadcast.id, bodyDigest: broadcast.bodyDigest });
+    const delivered = await POST(deliveryRequest(fixture, {
+      broadcastId: broadcast.id,
+      nodeBrainId: fixture.nodeBrainId,
+      locale: "en-US",
+    }));
+    expect(delivered.status).toBe(201);
+  }, 40_000);
+
   it("fans out one committed immutable semantic body without Node authorship", async () => {
     const aFixture = await createConversationFixture("broadcast-a");
     const bFixture = await createConversationFixture("broadcast-b", aFixture.db);

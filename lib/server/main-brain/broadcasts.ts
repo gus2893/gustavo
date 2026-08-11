@@ -317,6 +317,19 @@ async function broadcastRowById(
   return rows[0];
 }
 
+async function assertBroadcastPrewarmed(
+  database: EventDatabase,
+  broadcast: BroadcastRow,
+): Promise<void> {
+  const rows = await database.query<{ readonly ready: boolean }>(
+    `select true ready from cache_projection_versions
+     where category='BROADCASTS' and entity_id=$1 and source_event_id=$2
+     order by version_ordinal desc,id desc limit 1`,
+    [broadcast.id, broadcast.commit_event_id],
+  );
+  if (!rows[0]) throw new Error("BROADCAST_CACHE_NOT_READY");
+}
+
 export async function commitBroadcast(
   context: BroadcastContext,
   input: CommitBroadcastInput,
@@ -392,6 +405,15 @@ export async function commitBroadcast(
         requestDigest,
         event.occurredAt,
       ],
+    );
+    await transaction.query(
+      `insert into cache_main_state_sources (
+         main_state_version,source_event_id,source_ingestion_ordinal,policy_version,created_at
+       )
+       select $1,$2,event.ingested_sequence,$3,$4
+       from events event where event.id=$2
+       on conflict (main_state_version) do nothing`,
+      [mainStateVersion, event.id, BROADCAST_POLICY_VERSION, event.occurredAt],
     );
     return hydrateBroadcast(transaction, rows[0]);
   });
@@ -476,10 +498,11 @@ export async function projectDelivery(
     ]);
     // Account/Node scope is established before any committed body is decrypted.
     await authorizeDelivery(transaction, normalizedInput);
-    const broadcast = await hydrateBroadcast(
-      transaction,
-      await broadcastRowById(transaction, normalizedBroadcastId),
-    );
+    const broadcastRow = await broadcastRowById(transaction, normalizedBroadcastId);
+    // The worker publishes before its durable version record is committed, so
+    // this boundary prevents fan-out from racing an un-prewarmed broadcast.
+    await assertBroadcastPrewarmed(transaction, broadcastRow);
+    const broadcast = await hydrateBroadcast(transaction, broadcastRow);
     const existing = await transaction.query<DeliveryRow>(
       `select ${DELIVERY_COLUMNS}
        from deliveries where broadcast_id=$1 and account_id=$2`,
