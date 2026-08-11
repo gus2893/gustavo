@@ -12,7 +12,9 @@
     "dev": "next dev",
     "build": "next build",
     "invitation:issue": "tsx scripts/issue-invitation.ts",
-    "start": "next start",
+    "cache:rebuild": "tsx scripts/rebuild-projections.ts rebuild",
+    "cache:prewarm": "tsx scripts/rebuild-projections.ts prewarm",
+    "start": "pnpm cache:prewarm && next start",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -21,7 +23,8 @@
     "next": "16.3.0",
     "pg": "8.16.3",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "redis": "6.2.0"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

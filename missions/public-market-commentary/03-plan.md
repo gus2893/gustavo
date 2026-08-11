@@ -1397,7 +1397,7 @@ Yes. It is the explicit privacy bridge between Node and Main memory.
 ### T24 — Add versioned cache keys, invalidation, prewarming, and rebuild
 
 **Maps to:** R54, R55, R56, R57, R58
-**Files touched:** `lib/server/cache/keys.ts` (new), `lib/server/cache/store.ts` (new), `worker/cache/invalidate.ts` (new), `scripts/rebuild-projections.ts` (new), `tests/cache/isolation.test.ts` (new)
+**Files touched:** `db/migrations/0017_zz_cache.sql` (new), `lib/server/cache/keys.ts` (new), `lib/server/cache/store.ts` (new), `lib/server/cache/postgres.ts` (new), `lib/server/cache/runtime.ts` (new), `worker/cache/invalidate.ts` (new), `scripts/rebuild-projections.ts` (new), `tests/cache/isolation.test.ts` (new), `tests/cache/postgres.test.ts` (new), `lib/server/main-brain/broadcasts.ts` (modify; durable prewarm-before-fan-out boundary), `app/api/broadcasts/route.ts` (modify; bounded 503 retry boundary), `tests/broadcasts/main-authorship.test.ts` (modify; worker prewarm/fan-out regression), `instrumentation.ts` (new; startup prewarm and continuous production worker), `package.json` (modify; production Valkey dependency and runnable rebuild/prewarm/start gate), `pnpm-lock.yaml` (modify), `missions/public-market-commentary/debug-t24-related-timeout.md` (new; authorized related-suite timeout debug artifact), `missions/public-market-commentary/debug-t24-full-recall-account.md` (new; authorized isolated full-suite recall-time debug artifact), `missions/public-market-commentary/debug-t24-related-recall-time.md` (new; authorized grouped-load recall/consolidation time-fixture debug artifact), `missions/public-market-commentary/03-plan.md` (modify; T24 scope ledger)
 
 #### Red — failing test
 
