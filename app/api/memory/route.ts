@@ -3,6 +3,7 @@ import {
   authenticateSession,
   sessionCookieName,
 } from "../../../lib/server/auth/sessions";
+import editorialPolicy from "../../../policy/editorial-policy.json";
 import { getDatabase } from "../../../lib/server/db/postgres";
 import {
   archiveConversation,
@@ -50,6 +51,39 @@ function assertSameOrigin(request: Request, environment: string): void {
     environment,
     environment === "production" ? undefined : process.env.GUSTAVO_APP_ORIGIN,
   );
+}
+
+function assertSafeSameOriginGet(request: Request, environment: string): void {
+  const configuredOrigin = environment === "production"
+    ? editorialPolicy.canonicalOrigin
+    : process.env.GUSTAVO_APP_ORIGIN ?? "http://localhost:3000";
+  let allowed: URL;
+  let requested: URL;
+  try {
+    allowed = new URL(configuredOrigin);
+    requested = new URL(request.url);
+  } catch {
+    throw new Error("INVALID_ORIGIN");
+  }
+  if (requested.origin !== allowed.origin) throw new Error("INVALID_ORIGIN");
+  const suppliedHost = request.headers.get("host");
+  if (suppliedHost !== null && suppliedHost.toLowerCase() !== allowed.host.toLowerCase()) {
+    throw new Error("INVALID_ORIGIN");
+  }
+  const origin = request.headers.get("origin");
+  if (origin !== null) {
+    assertSameOrigin(request, environment);
+    if (request.headers.get("sec-fetch-site") === "cross-site") {
+      throw new Error("INVALID_ORIGIN");
+    }
+    return;
+  }
+  if (suppliedHost === null
+      || request.headers.get("sec-fetch-site") !== "same-origin"
+      || !["cors", "same-origin"].includes(request.headers.get("sec-fetch-mode") ?? "")
+      || request.headers.get("sec-fetch-dest") !== "empty") {
+    throw new Error("INVALID_ORIGIN");
+  }
 }
 
 function routeFailure(error: unknown): Response {
@@ -170,7 +204,7 @@ function assertBodyShape(
 export async function GET(request: Request): Promise<Response> {
   const environment = process.env.NODE_ENV ?? "development";
   try {
-    assertSameOrigin(request, environment);
+    assertSafeSameOriginGet(request, environment);
     const database = getDatabase();
     const session = await authenticateSession(database, sessionToken(request, environment));
     const search = new URL(request.url).searchParams;

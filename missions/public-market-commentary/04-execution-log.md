@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 28 / 36
+- Tasks completed: 29 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -290,3 +290,13 @@
 - Spec review: passed with the canonical identity/domain/tagline, educational and non-sentience boundaries, public-only DTO component, accessible safe states, timestamped static metadata, and irreversible placeholder geometry.
 - Quality review: passed after consolidating to one supported root page, emitting `https://gustavo.lol` canonical metadata, and labeling sample activity explicitly as static and not live.
 - Scope: accessible public Gustavo shell, canonical metadata, safe public feed placeholders, honest freshness labeling, software-memory disclosure, and no protected plaintext/ciphertext in server props, HTML, RSC, attributes, or scripts.
+
+### T29 — Build the private chat, memory controls, and Challenge views
+
+- Status: completed
+- Commit: `T29: add authenticated account and Challenge surfaces` (resolve the single-task commit from Git history)
+- Red: component imports first failed because the private surfaces did not exist; integration regressions later captured static pages, disabled controls, wrong history cursors, browser-incompatible T26 GET checks, mixed broadcast chronology, post-await form access, route misattribution, unbounded Challenge history, and non-normalized money.
+- Green: the final focused account-surface suite passed 11/11; related native-history/router/Challenge tests passed 66/66; affected privacy/export tests passed 2/2; strict TypeScript, production build, and diff/whitespace checks passed.
+- Spec review: passed after authenticated pages loaded the assigned conversation and safe shared Challenge projection, used real `after` pagination, separated Main broadcasts, enabled browser-safe same-origin memory/export fetches, and rendered exhaustive proposal states.
+- Quality review: passed after exact persisted response-to-route causation, bounded checkpoint-backed Challenge history, numeric ledger chronology, fixed two-decimal monetary DTOs, and safe deferred form handling closed all blocking issues.
+- Scope: authenticated one-chat UI with Main/Node attribution and proposal status, qualifying-feedback disclosure, paginated history, memory inspect/correct/forget/export controls, account-safe shared Challenge stage/equity/positions/ledger/costs, explicit destructive confirmation, and exact simulation-only labeling.

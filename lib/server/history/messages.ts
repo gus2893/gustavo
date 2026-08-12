@@ -31,6 +31,7 @@ export interface AppendMessageInput {
   readonly role: MessageRole;
   readonly text: string;
   readonly completion?: MessageCompletion;
+  readonly routingEventId?: string;
 }
 
 export interface ConversationMessage {
@@ -232,6 +233,12 @@ export async function appendMessage(
   if (input.role !== "USER" && input.role !== "NODE") {
     throw new Error("INVALID_MESSAGE_ROLE");
   }
+  if (input.role === "USER" && input.routingEventId !== undefined) {
+    throw new Error("INVALID_MESSAGE_ROUTING_EVENT");
+  }
+  const routingEventId = input.routingEventId === undefined
+    ? undefined
+    : requireUuid(input.routingEventId, "INVALID_MESSAGE_ROUTING_EVENT");
 
   const status = input.completion?.status ?? "COMPLETED";
   const explicitAt = input.completion?.at
@@ -251,6 +258,18 @@ export async function appendMessage(
       context.accountId,
       context.conversationId,
     );
+    if (routingEventId !== undefined) {
+      const routes = await transaction.query<{ readonly id: string }>(
+        `select route.id::text
+           from events route
+          where route.id=$1 and route.aggregate_id=$2::text
+            and route.account_id=$3::text
+            and route.actor_type='NODE_BRAIN' and route.actor_id=$4::text
+            and route.type='node.reply.routed' and route.visibility='PRIVATE_ACCOUNT'`,
+        [routingEventId, conversation.id, context.accountId, conversation.node_brain_id],
+      );
+      if (routes.length !== 1) throw new Error("INVALID_MESSAGE_ROUTING_EVENT");
+    }
     const event = await appendEvent(transaction, {
       aggregateId: conversation.id,
       accountId: context.accountId,
@@ -265,6 +284,7 @@ export async function appendMessage(
       visibility: "PRIVATE_ACCOUNT",
       body: messageBody(input, status, abortReason),
       idempotencyKey: eventIdempotencyKey(conversation.id, idempotencyKey),
+      ...(routingEventId === undefined ? {} : { causationId: routingEventId }),
       ...(explicitAt ? { occurredAt: explicitAt } : {}),
     });
     const completionAt = status === "COMPLETED"
