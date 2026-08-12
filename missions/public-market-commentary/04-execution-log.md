@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 27 / 36
+- Tasks completed: 28 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -280,3 +280,13 @@
 - Spec review: passed after replay used a durable database-authoritative stream position, paged beyond 100 entries, and an independent worker published only opaque cursor/event identities without mutating other outbox consumers.
 - Quality review: passed after every allocated position remained replay authority across claim/retry/fail/complete states, closing fanout races and gaps, while publish deadlines, aborts, leases, and top-level cleanup bounded shutdown.
 - Scope: authenticated private no-store SSE, Last-Event-ID recovery, per-event database reload and authorization before protected-body access, minimum T4 DTO projection, entitlement revalidation, bounded heartbeats/backpressure/deduplication, durable independent delivery leases/retries, and event-ID/cursor-only pubsub.
+
+### T28 — Build a public shell that never ships protected words
+
+- Status: completed
+- Commit: `T28: add the public Gustavo shell` (resolve the single-task commit from Git history)
+- Red: the focused test first failed because the public page did not exist; later regressions captured the legacy canonical root, invisible placeholders, duplicate root route structure, missing canonical metadata, and a false live label on static activity.
+- Green: the final public-home suite passed 5/5; related feed-security tests passed 7/7; strict TypeScript and the production build passed; built HTML/RSC contained the canonical link and no protected fixture, ciphertext fixture, or protected field name.
+- Spec review: passed with the canonical identity/domain/tagline, educational and non-sentience boundaries, public-only DTO component, accessible safe states, timestamped static metadata, and irreversible placeholder geometry.
+- Quality review: passed after consolidating to one supported root page, emitting `https://gustavo.lol` canonical metadata, and labeling sample activity explicitly as static and not live.
+- Scope: accessible public Gustavo shell, canonical metadata, safe public feed placeholders, honest freshness labeling, software-memory disclosure, and no protected plaintext/ciphertext in server props, HTML, RSC, attributes, or scripts.
