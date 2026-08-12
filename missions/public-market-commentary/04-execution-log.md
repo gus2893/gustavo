@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 26 / 36
+- Tasks completed: 27 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -270,3 +270,13 @@
 - Spec review: passed after keyless conversations could establish an irreversible forget barrier and forgetting retired/pruned active account export snapshots so old cursors fail closed.
 - Quality review: passed with no Critical or Important findings; global Valkey namespace scanning during forget remains a non-blocking future performance optimization.
 - Scope: authorization-first memory inspection, source provenance, append-only correction/supersession, reversible archive/restore, bounded actor export snapshots, irreversible key-destruction forget barriers, registry-driven propagation, cache publication/read fencing, proposal/disclosure erasure, durable workers, and private no-store API routes.
+
+### T27 — Stream committed event DTOs through authenticated SSE
+
+- Status: completed
+- Commit: `T27: add authenticated durable SSE delivery` (resolve the single-task commit from Git history)
+- Red: the initial focused test failed because `lib/server/stream/events` did not exist; later regressions captured replay truncation, missing production fanout, UUID commit-order loss, publish-before-completion loss, terminal cursor gaps, ambiguous delivery cursors, and unbounded shutdown.
+- Green: the final focused stream suite passed 16/16; related feed-boundary and event-store tests passed 30/30; strict TypeScript and diff/whitespace checks passed under Node 24.14.0.
+- Spec review: passed after replay used a durable database-authoritative stream position, paged beyond 100 entries, and an independent worker published only opaque cursor/event identities without mutating other outbox consumers.
+- Quality review: passed after every allocated position remained replay authority across claim/retry/fail/complete states, closing fanout races and gaps, while publish deadlines, aborts, leases, and top-level cleanup bounded shutdown.
+- Scope: authenticated private no-store SSE, Last-Event-ID recovery, per-event database reload and authorization before protected-body access, minimum T4 DTO projection, entitlement revalidation, bounded heartbeats/backpressure/deduplication, durable independent delivery leases/retries, and event-ID/cursor-only pubsub.

@@ -14,6 +14,7 @@
     "invitation:issue": "tsx scripts/issue-invitation.ts",
     "cache:rebuild": "tsx scripts/rebuild-projections.ts rebuild",
     "cache:prewarm": "tsx scripts/rebuild-projections.ts prewarm",
+    "worker:stream": "tsx worker/stream/publish-events.ts",
     "start": "pnpm cache:prewarm && next start",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
