@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 31 / 36
+- Tasks completed: 32 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -321,3 +321,14 @@
 - Spec review: passed after active scripts/migrations and recursive fresh browser artifacts were covered, security documents specified origin/CSRF/cookie/rate controls, and fake-provider imports were normalized/resolved with exact narrow allowlists.
 - Quality review: passed after comprehensive derived build freshness, comment-aware import parsing, OS-aware repository containment, and cross-platform PowerShell selection closed the portability and bypass gaps.
 - Scope: fail-closed repository safety validator; execution/broker/credential/export, public-secret/entropy, unsafe-claim, fake-provider, active prohibited-import, production-fixture, protected-public-payload, and stale-build gates; privacy, terms, data policy, threat/key/incident/rate/origin/CSRF documentation; explicit legal review requirement before public launch.
+
+### T32 — Prove the working MVP browser path
+
+- Status: completed; working MVP gate passed
+- Commit: `T32: prove the working Gustavo MVP` (resolve the single-task commit from Git history)
+- Red: the real browser stack first failed because `/join` lacked its account form; later regressions captured pre-hydration private query leakage, an orphan delayed-data seed, fixed/ambiguous web ports, and incomplete signal-terminated child ownership checks.
+- Green: the final Playwright suite passed 3/3 against disposable PostgreSQL, real Next, and Chromium; focused account UI passed 11/11; frozen install, strict TypeScript, production build, validator (111 active files and 32 public artifacts), diff checks, and resource cleanup passed.
+- Spec review: passed after the licensed delayed AAPL observation was canonically linked to a visible simulated position/mark/checkpoint and Chromium asserted symbol, exact delay, and observation time.
+- Quality review: passed after the harness used one exclusively checked dynamic IPv4 loopback port, verified Gustavo-specific readiness from its owned child, handled exit codes and signals, isolated trace output, and scanned DOM/network/request URLs and POST bodies for private-text leakage.
+- Scope: real invitation redemption and session cookie, authenticated message persistence, visible Main/Node attribution surfaces, memory controls, canonical simulated Challenge position with delayed-data labeling, cookie-cleared public redaction, production-disabled direct test fixtures, manual smoke documentation, and pre-hydration POST privacy guards.
+- MVP deviation: Docker/Valkey/SSE and live model replies were not required for this browser smoke because the host Docker daemon was unavailable and production model/market adapters do not yet exist; the accepted reload-based path uses no production fake provider or fixture endpoint.

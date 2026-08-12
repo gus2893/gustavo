@@ -173,6 +173,9 @@ describe("authenticated account surfaces", () => {
       />,
     );
 
+    expect(markup).toContain('<form aria-label="Send a message" method="post">');
+    expect(markup).toMatch(/<form aria-label="Send a message" method="post"><fieldset disabled=""/u);
+    expect(markup).not.toContain("?text=");
     expect(markup).toContain('aria-label="Correct a memory"');
     expect(markup).toContain('for="corrected-memory"');
     expect(markup).toContain('<button type="button">Export my data</button>');
@@ -487,7 +490,9 @@ describe("production account surface integration", () => {
     expect(newerMarkup).toContain(secondText);
     expect(newerMarkup).not.toContain(firstText);
     expect(newerMarkup).not.toContain(mainText);
-    expect(newerMarkup).not.toMatch(/<fieldset disabled=""/u);
+    expect(newerMarkup).toMatch(
+      /<form aria-label="Send a message" method="post"><fieldset disabled=""/u,
+    );
   }, 30_000);
 
   it("allows only a canonical same-conversation Node route to cause a Node response", async () => {

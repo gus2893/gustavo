@@ -15,6 +15,7 @@ export default function PublicFeed({
     <section
       aria-busy={isLoading}
       aria-labelledby="public-activity-heading"
+      data-testid="public-feed"
     >
       <header>
         <p>Sample public activity</p>

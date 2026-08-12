@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import type {
   AccountConversationBroadcastDto,
   AccountConversationMessageDto,
@@ -90,7 +90,9 @@ export function Conversation({
   status = "ready",
   proposalDisclosure = false,
 }: ConversationProps) {
+  const [hydrated, setHydrated] = useState(false);
   const [mutationStatus, setMutationStatus] = useState("");
+  useEffect(() => setHydrated(true), []);
   const historyHref = nextCursor === null
     ? null
     : `/chat?after=${encodeURIComponent(nextCursor)}`;
@@ -162,13 +164,14 @@ export function Conversation({
 
       <form
         aria-label="Send a message"
+        method="post"
         onSubmit={(event) => void submitConversationMessage(
           event,
           conversationId,
           setMutationStatus,
         )}
       >
-        <fieldset disabled={!conversationId}>
+        <fieldset disabled={!hydrated || !conversationId}>
           <legend>Send a message</legend>
           <label htmlFor="chat-message">Message</label>
           <textarea id="chat-message" name="text" required />
