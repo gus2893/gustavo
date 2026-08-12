@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 32 / 36
+- Tasks completed: 33 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -332,3 +332,13 @@
 - Quality review: passed after the harness used one exclusively checked dynamic IPv4 loopback port, verified Gustavo-specific readiness from its owned child, handled exit codes and signals, isolated trace output, and scanned DOM/network/request URLs and POST bodies for private-text leakage.
 - Scope: real invitation redemption and session cookie, authenticated message persistence, visible Main/Node attribution surfaces, memory controls, canonical simulated Challenge position with delayed-data labeling, cookie-cleared public redaction, production-disabled direct test fixtures, manual smoke documentation, and pre-hydration POST privacy guards.
 - MVP deviation: Docker/Valkey/SSE and live model replies were not required for this browser smoke because the host Docker daemon was unavailable and production model/market adapters do not yet exist; the accepted reload-based path uses no production fake provider or fixture endpoint.
+
+### T33 — Add encrypted verified backup and isolated restore as an improvement
+
+- Status: completed
+- Commit: `T33: add encrypted verified backup and restore` (resolve the single-task commit from Git history)
+- Red: all focused tests first failed because backup scripts were absent; later regressions captured caller-asserted snapshot metadata, credential URLs in process arguments, mutable remote object names, non-private plaintext staging, and unbounded snapshot subprocess I/O.
+- Green: the final backup suite passed 7/7; deterministic fixture restore, PowerShell syntax, strict TypeScript, production build, safety validator, and diff checks passed.
+- Spec review: passed after schema/high-water metadata derived inside one exported repeatable-read snapshot consumed by `pg_dump`, credentials became environment-only with protected `PGPASSFILE`, and retention bounds were reciprocal.
+- Quality review: passed after immutable conditional generation-specific S3 objects, manifest-last publication, owner-only plaintext work areas, asynchronous stderr draining, bounded snapshot protocol/rollback, and cleanup closed all blocking issues.
+- Scope: authenticated local encryption with external 64-byte key, exact manifest binding, atomic local promotion, optional immutable S3 upload, corruption/wrong-key/tamper/path/reparse/overwrite rejection, database-consistent snapshot, isolated restore with active-database refusal and metadata verification, retention/least-privilege documentation.

@@ -39,4 +39,47 @@ A normal shutdown allows the web and worker processes up to 30 seconds to stop c
 docker compose --env-file infra/.env -f infra/compose.yaml down
 ```
 
-Do not add `--volumes` unless intentionally destroying all local MVP state. The later backup milestone must be completed and restore-tested before public production use; this local task contains no backup credentials or public-exposure setup.
+Do not add `--volumes` unless intentionally destroying all local MVP state.
+
+## Encrypted backup and recovery
+
+Backups are an improvement boundary outside the live request path. `infra/backup/create.ps1` takes a database-consistent custom-format `pg_dump`, encrypts it locally with AES-256-CBC plus encrypt-then-MAC HMAC-SHA256 authentication, verifies the ciphertext and decrypted payload, then atomically promotes the temporary directory. The manifest binds the ciphertext and payload checksums, byte length, schema version, event high-water, key version, algorithm, IV, and retention settings. It contains no key material, database credentials, `.env` content, or plaintext database rows.
+
+Create a 64-byte random key in an OS-protected file outside the repository. Pass its path with `-KeyFile` or set `GUSTAVO_BACKUP_KEY_FILE`; set the credential-bearing PostgreSQL URL in `GUSTAVO_BACKUP_DATABASE_URL`. Never place the key, provider credentials, or database password in the archive, manifest, command arguments, logs, shell history, or repository. Keep old key versions available under the same access controls until every backup encrypted with them expires. A typical local command is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File infra/backup/create.ps1 `
+  -DestinationDirectory D:\gustavo-backups\2026-08-12 `
+  -KeyFile D:\gustavo-secrets\backup-k1.bin `
+  -KeyVersion backup-k1
+```
+
+The script opens a read-only repeatable-read transaction, drains database-tool diagnostics asynchronously, exports its PostgreSQL snapshot under a bounded timeout, derives `SchemaVersion` from `schema_migrations` and `EventHighWater` from `events.ingested_sequence` inside that transaction, and makes `pg_dump` consume the same snapshot. Optional `-ExpectedSchemaVersion` and `-ExpectedEventHighWater` values are assertions only; they cannot populate the manifest and a mismatch prevents finalization. The restore drill compares both authenticated values to the restored database.
+
+Database passwords travel only through a temporary `PGPASSFILE` created inside an owner-only credential directory before secret bytes are written; both are overwritten/removed after the database tools finish. PostgreSQL URLs are strictly parsed from environment variables only: creation uses `GUSTAVO_BACKUP_DATABASE_URL`, while restore uses `GUSTAVO_BACKUP_MAINTENANCE_DATABASE_URL`. The scripts consume and clear those URL variables, exclude them from database-tool child environments, and never pass credentials in process arguments or logs. All temporary directories that can contain a plaintext dump, decrypted payload, fixture, or key are owner-only before file creation; plaintext files receive owner-only permissions before their first content write. The command refuses an existing destination and never invokes a shell expression. Use trusted absolute paths for `psql`, `pg_dump`, `createdb`, `pg_restore`, `dropdb`, and the optional object-storage CLI when system PATH is not operator-controlled.
+
+For provider-neutral S3-compatible storage, add `-S3Uri s3://bucket/prefix`. Upload is optional and occurs only after local verification. Each run publishes conditionally-created immutable objects under `prefix/<generationId>/backup.gbackup` and `prefix/<generationId>/backup.manifest.json`; it prints the immutable manifest URI and never overwrites a fixed key or publishes a mutable “latest” pointer. If the manifest upload fails, the encrypted artifact can remain as an unreferenced orphan, while every previously completed generation remains untouched. Configure the provider's S3 endpoint through its CLI profile/environment, not in this repository. Give the backup identity access only to create objects under the one backup prefix (and object-lock/retention operations if used); give the separately held restore identity only the read access needed for drills. It must not administer the bucket, application, database, DNS, or encryption keys.
+
+Retention is operational configuration with bounded script defaults: 14 daily days, 8 weekly weeks, and 12 monthly months. Adjust `-DailyRetentionDays` (1–366), `-WeeklyRetentionWeeks` (1–104), and `-MonthlyRetentionMonths` (1–120) to the approved policy. Apply lifecycle removal only after a newer generation has passed verification and a restore drill. Versioning and immutable/object-lock retention are recommended where supported.
+
+Verify any downloaded pair locally before restore:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File infra/backup/verify.ps1 `
+  -ManifestPath D:\gustavo-backups\2026-08-12\backup.manifest.json `
+  -KeyFile D:\gustavo-secrets\backup-k1.bin
+```
+
+Run a monthly restore drill (and after PostgreSQL, schema, or key changes) into a new, separately named database. Set its credential-bearing maintenance URL in `GUSTAVO_BACKUP_MAINTENANCE_DATABASE_URL`. The script rejects the active database name, refuses an existing target through `createdb`, verifies authenticated metadata before `pg_restore`, and drops its isolated drill database unless `-KeepRestoredDatabase` is explicitly supplied:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File infra/backup/restore-drill.ps1 `
+  -ManifestPath D:\gustavo-backups\2026-08-12\backup.manifest.json `
+  -KeyFile D:\gustavo-secrets\backup-k1.bin `
+  -ActiveDatabaseName gustavo `
+  -RestoreDatabaseName gustavo_restore_20260812
+```
+
+Record the drill date, backup generation, authenticated schema/high-water/key versions, row-count/hash comparisons, result, and cleanup confirmation without recording protected text or credentials. Test fixture plumbing without Docker or network access with `infra/backup/restore-drill.ps1 -UseFixture`.
+
+Before public exposure, complete recovery verification first, then configure authenticated HTTPS through a hardened reverse proxy or outbound tunnel and update Squarespace DNS. Do not expose PostgreSQL, Valkey, backup endpoints, or router port-forwarding directly to the internet.
