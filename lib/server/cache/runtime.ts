@@ -8,6 +8,8 @@ import {
   rebuildCriticalProjections,
   type CacheBackend,
   type CacheKeyDescriptor,
+  type CacheProtectedGuardContext,
+  type CacheProtectedPublicationGuard,
   type CacheProjectionPublisher,
   type CacheProjectionReader,
   scopedCache,
@@ -68,11 +70,12 @@ function actor(input: PostgresCacheActor): PostgresCacheActor {
 }
 
 async function authorizePostgresCacheRead(
-  database: EventDatabase,
+  database: EventDatabase | undefined,
   boundActor: PostgresCacheActor,
   descriptor: CacheKeyDescriptor,
 ): Promise<boolean> {
   if (descriptor.scope === "PUBLIC" || descriptor.scope === "SHARED") return true;
+  if (!database) throw new Error("CACHE_PROTECTED_TRANSACTION_REQUIRED");
   if (descriptor.scope !== "PRIVATE_ACCOUNT"
       || descriptor.identityId !== boundActor.accountId
       || descriptor.entityId !== boundActor.conversationId
@@ -164,6 +167,77 @@ async function authorizePostgresCacheRead(
   return rows.length === 1;
 }
 
+function protectedContextDatabase(
+  context: CacheProtectedGuardContext | undefined,
+): EventDatabase | undefined {
+  const candidate = context?.database;
+  if (!candidate || typeof candidate !== "object") return undefined;
+  const value = candidate as Partial<EventDatabase>;
+  return typeof value.query === "function"
+      && typeof value.one === "function"
+      && typeof value.transaction === "function"
+    ? value as EventDatabase : undefined;
+}
+
+function expiringTransactionDatabase(transaction: EventDatabase): {
+  readonly database: EventDatabase;
+  drain(): Promise<void>;
+  deactivate(): void;
+} {
+  let active = true;
+  const pending = new Set<Promise<unknown>>();
+  const failures: unknown[] = [];
+  const assertActive = () => {
+    if (!active) throw new Error("CACHE_PROTECTED_TRANSACTION_EXPIRED");
+  };
+  const track = <Result>(operation: Promise<Result>): Promise<Result> => {
+    pending.add(operation);
+    void operation.then(
+      () => { pending.delete(operation); },
+      (error: unknown) => {
+        failures.push(error);
+        pending.delete(operation);
+      },
+    );
+    return operation;
+  };
+  let database!: EventDatabase;
+  database = Object.freeze({
+    query: <Row extends Record<string, unknown> = Record<string, unknown>>(
+      sql: string,
+      parameters?: readonly unknown[],
+    ): Promise<Row[]> => {
+      assertActive();
+      return track(transaction.query<Row>(sql, parameters));
+    },
+    one: <Row extends Record<string, unknown> = Record<string, unknown>>(
+      sql: string,
+      parameters?: readonly unknown[],
+    ): Promise<Row> => {
+      assertActive();
+      return track(transaction.one<Row>(sql, parameters));
+    },
+    transaction: <Result>(work: (database: EventDatabase) => Promise<Result>): Promise<Result> => {
+      assertActive();
+      let operation: Promise<Result>;
+      try {
+        operation = Promise.resolve(work(database));
+      } catch (error) {
+        operation = Promise.reject(error);
+      }
+      return track(operation);
+    },
+  });
+  return Object.freeze({
+    database,
+    async drain() {
+      while (pending.size > 0) await Promise.allSettled([...pending]);
+      if (failures.length > 0) throw failures[0];
+    },
+    deactivate() { active = false; },
+  });
+}
+
 function authorizeTrustedProjectionPublication(descriptor: CacheKeyDescriptor): boolean {
   return descriptor.namespace === "main-state"
     || descriptor.namespace === "broadcast"
@@ -172,9 +246,76 @@ function authorizeTrustedProjectionPublication(descriptor: CacheKeyDescriptor): 
     || descriptor.namespace === "handoff";
 }
 
+function postgresProtectedPublicationGuard(
+  database: EventDatabase,
+  expectedActor?: PostgresCacheActor,
+): CacheProtectedPublicationGuard {
+  return async (descriptor, publish, operation) => {
+    if (descriptor.scope !== "PRIVATE_ACCOUNT"
+        || !CACHE_ACTOR_ID.test(descriptor.identityId ?? "")
+        || !CACHE_ACTOR_ID.test(descriptor.entityId)
+        || (expectedActor !== undefined && (
+          descriptor.identityId !== expectedActor.accountId
+          || descriptor.entityId !== expectedActor.conversationId
+        ))) {
+      throw new Error("CACHE_PRIVACY_SCOPE_INVALID");
+    }
+    return database.transaction(async (transaction) => {
+      await transaction.query(
+        "select pg_advisory_xact_lock(hashtextextended($1,0))",
+        [`privacy-cache-publication:${descriptor.entityId}`],
+      );
+      const authorized = await transaction.query(
+        `select 1 from accounts account
+         join conversations conversation on conversation.account_id=account.id
+           and conversation.id=$2
+         join node_brains node on node.id=conversation.node_brain_id
+           and node.account_id=account.id
+         where account.id=$1
+           and ($3::uuid is null or node.id=$3)
+           and not exists (select 1 from privacy_forget_barriers barrier
+             where barrier.conversation_id=conversation.id)
+           and ($4='INVALIDATE' or (
+             account.status='ACTIVE' and node.status='ACTIVE'
+             and conversation.status='OPEN' and exists (
+               select 1 from entitlements entitlement
+               where entitlement.account_id=account.id and entitlement.revoked_at is null
+                 and entitlement.active_from<=clock_timestamp()
+                 and (entitlement.expires_at is null
+                   or entitlement.expires_at>clock_timestamp())
+             )
+           ))
+         limit 1`,
+        [descriptor.identityId, descriptor.entityId,
+          expectedActor?.nodeBrainId ?? null, operation],
+      );
+      if (authorized.length !== 1) throw new Error("CACHE_PRIVACY_BARRIER");
+      const scope = expiringTransactionDatabase(transaction);
+      try {
+        const outcome = await publish(Object.freeze({ database: scope.database })).then(
+          (value) => ({ ok: true as const, value }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        const drainOutcome = await scope.drain().then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        if (!outcome.ok) throw outcome.error;
+        if (!drainOutcome.ok) throw drainOutcome.error;
+        return outcome.value;
+      } finally {
+        scope.deactivate();
+      }
+    });
+  };
+}
+
 export interface PostgresCacheAccess {
   readonly publisher: CacheProjectionPublisher;
   readerFor(actor: PostgresCacheActor): CacheProjectionReader;
+  purgeConversation(input: PostgresCacheActor): Promise<void>;
+  pruneReaderRegistry(): number;
+  revokedScopeCount(): number;
   destroy(): void;
 }
 
@@ -189,21 +330,83 @@ export function createPostgresCacheAccess(input: {
     backend: input.backend,
     encryptionKey: retainedKey,
     authorize: authorizeTrustedProjectionPublication,
+    protectedPublicationGuard: postgresProtectedPublicationGuard(input.db),
+    requireProtectedPublicationGuard: true,
   });
+  const readers = new Set<WeakRef<ReturnType<typeof scopedCache>>>();
+  const readerFinalizer = new FinalizationRegistry<WeakRef<ReturnType<typeof scopedCache>>>(
+    (reference) => readers.delete(reference),
+  );
+  const revokedScopes = new Set<string>();
+  const scopeKey = (value: PostgresCacheActor) => (
+    `${value.accountId}:${value.nodeBrainId}:${value.conversationId}`
+  );
+  const pruneReaderRegistry = (): number => {
+    let live = 0;
+    for (const reference of readers) {
+      if (reference.deref()) live += 1;
+      else readers.delete(reference);
+    }
+    return live;
+  };
+  const liveReaders = () => {
+    pruneReaderRegistry();
+    const live: ReturnType<typeof scopedCache>[] = [];
+    for (const reference of readers) {
+      const reader = reference.deref();
+      if (reader) live.push(reader);
+    }
+    return live;
+  };
   const publisher = cacheProjectionPublisher(cache);
   return Object.freeze({
     publisher,
     readerFor(inputActor: PostgresCacheActor) {
       if (destroyed) throw new Error("CACHE_ACCESS_DESTROYED");
+      pruneReaderRegistry();
       const boundActor = actor(inputActor);
-      return cacheProjectionReader(scopedCache({
+      const scopedReader = scopedCache({
         backend: input.backend,
         encryptionKey: retainedKey,
-        authorize: (descriptor) => authorizePostgresCacheRead(input.db, boundActor, descriptor),
-      }));
+        authorize: (descriptor, context) => revokedScopes.has(scopeKey(boundActor))
+          ? false : authorizePostgresCacheRead(
+            protectedContextDatabase(context), boundActor, descriptor,
+          ),
+        protectedPublicationGuard: postgresProtectedPublicationGuard(input.db, boundActor),
+        requireProtectedPublicationGuard: true,
+      });
+      const reference = new WeakRef(scopedReader);
+      const unregisterToken = Object.freeze({});
+      readers.add(reference);
+      const projectionReader = cacheProjectionReader(scopedReader, () => {
+        readers.delete(reference);
+        readerFinalizer.unregister(unregisterToken);
+      });
+      readerFinalizer.register(projectionReader, reference, unregisterToken);
+      return projectionReader;
     },
+    async purgeConversation(inputActor: PostgresCacheActor) {
+      if (destroyed) throw new Error("CACHE_ACCESS_DESTROYED");
+      const scope = actor(inputActor);
+      const key = scopeKey(scope);
+      revokedScopes.add(key);
+      try {
+        await Promise.all(liveReaders().map((reader) => reader.purgeConversationLocal(scope)));
+        await cache.purgeConversation(scope);
+      } finally {
+        // The durable database barrier remains the authority after this bounded
+        // in-process race gate is released, including backend-failure retries.
+        revokedScopes.delete(key);
+      }
+    },
+    pruneReaderRegistry,
+    revokedScopeCount: () => revokedScopes.size,
     destroy() {
       destroyed = true;
+      cache.destroy();
+      for (const reader of liveReaders()) reader.destroy();
+      readers.clear();
+      revokedScopes.clear();
       retainedKey.fill(0);
     },
   });
@@ -213,6 +416,7 @@ export interface ProductionCacheRuntime {
   readonly db: EventDatabase;
   readonly publisher: CacheProjectionPublisher;
   readerFor(actor: PostgresCacheActor): CacheProjectionReader;
+  purgeConversation(input: PostgresCacheActor): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -234,6 +438,7 @@ export async function createProductionCacheRuntime(): Promise<ProductionCacheRun
     db,
     publisher: access.publisher,
     readerFor: access.readerFor,
+    purgeConversation: access.purgeConversation,
     async close() {
       try {
         await client.quit();

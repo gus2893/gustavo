@@ -7,6 +7,7 @@ import {
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   cacheKey,
   cachePointerKey,
@@ -188,6 +189,11 @@ export interface CacheBackend {
   acquireLease(key: string, owner: string, expiresAt: number): Promise<boolean>;
   releaseLease(key: string, owner: string): Promise<void>;
   delete(key: string): Promise<void>;
+  deleteMatching(input: {
+    readonly accountId: string;
+    readonly conversationId: string;
+    readonly maximumKeys: number;
+  }): Promise<number>;
   flushAll(): Promise<void>;
 }
 
@@ -366,6 +372,47 @@ export class ValkeyCacheBackend implements CacheBackend {
     await this.#client.del([valkeyStorageKey(key)]);
   }
 
+  async deleteMatching(input: {
+    readonly accountId: string;
+    readonly conversationId: string;
+    readonly maximumKeys: number;
+  }): Promise<number> {
+    let cursor = "0";
+    let pages = 0;
+    const matched = new Set<string>();
+    do {
+      const page = await this.#client.scan(cursor, {
+        MATCH: `${VALKEY_PREFIX}*`, COUNT: 250,
+      });
+      if (!page || typeof page.cursor !== "string" || !Array.isArray(page.keys)) {
+        throw new Error("CACHE_VALKEY_SCAN_INVALID");
+      }
+      pages += 1;
+      if (pages > VALKEY_MAX_SCAN_PAGES) throw new Error("CACHE_VALKEY_PURGE_BOUND_EXCEEDED");
+      const matches = page.keys.filter((key) => {
+        try {
+          const descriptor = inspectCacheKey(key as TypedCacheKey);
+          return descriptor.scope === "PRIVATE_ACCOUNT"
+            && descriptor.identityId === input.accountId
+            && descriptor.entityId === input.conversationId;
+        } catch {
+          return false;
+        }
+      });
+      for (const key of matches) matched.add(key);
+      if (matched.size > input.maximumKeys) {
+        throw new Error("CACHE_VALKEY_PURGE_BOUND_EXCEEDED");
+      }
+      cursor = page.cursor;
+    } while (cursor !== "0");
+    let deleted = 0;
+    const keys = [...matched];
+    for (let offset = 0; offset < keys.length; offset += 250) {
+      deleted += await this.#client.del(keys.slice(offset, offset + 250));
+    }
+    return deleted;
+  }
+
   async flushAll(): Promise<void> {
     let cursor = "0";
     let pages = 0;
@@ -490,6 +537,26 @@ export class MemoryCacheBackend implements CacheBackend {
 
   async delete(key: string): Promise<void> {
     this.#values.delete(key);
+  }
+
+  async deleteMatching(input: {
+    readonly accountId: string;
+    readonly conversationId: string;
+    readonly maximumKeys: number;
+  }): Promise<number> {
+    const matches = [...this.#values.keys()].filter((key) => {
+      try {
+        const descriptor = inspectCacheKey(key as TypedCacheKey);
+        return descriptor.scope === "PRIVATE_ACCOUNT"
+          && descriptor.identityId === input.accountId
+          && descriptor.entityId === input.conversationId;
+      } catch {
+        return false;
+      }
+    });
+    if (matches.length > input.maximumKeys) throw new Error("CACHE_PURGE_BOUND_EXCEEDED");
+    for (const key of matches) this.#values.delete(key);
+    return matches.length;
   }
 
   async flushAll(): Promise<void> {
@@ -644,6 +711,16 @@ class BoundedLru {
 
   delete(key: string) {
     this.#values.delete(key);
+  }
+
+  deleteMatching(predicate: (key: string) => boolean): number {
+    let deleted = 0;
+    for (const key of this.#values.keys()) {
+      if (!predicate(key)) continue;
+      this.#values.delete(key);
+      deleted += 1;
+    }
+    return deleted;
   }
 
   clear() {
@@ -1013,14 +1090,43 @@ export interface CachePublishInput<Value extends CacheJson> {
   readonly sourceOccurredAt?: string;
 }
 
+export interface CacheProtectedGuardContext {
+  /**
+   * A transaction-scoped database facade supplied by the production guard.
+   * It is intentionally opaque here so cache-only callers cannot depend on a
+   * database implementation. The facade expires when the fence is released.
+   */
+  readonly database?: unknown;
+}
+
+export type CacheProtectedPublicationGuard = <Result>(
+  descriptor: CacheKeyDescriptor,
+  publish: (context: CacheProtectedGuardContext) => Promise<Result>,
+  operation: "READ" | "WRITE" | "INVALIDATE",
+) => Promise<Result>;
+
 export interface ScopedCacheOptions {
   readonly backend?: CacheBackend;
   readonly encryptionKey?: Uint8Array;
-  readonly authorize?: (descriptor: CacheKeyDescriptor) => boolean | Promise<boolean>;
+  readonly authorize?: (
+    descriptor: CacheKeyDescriptor,
+    context: CacheProtectedGuardContext | undefined,
+  ) => boolean | Promise<boolean>;
+  readonly protectedPublicationGuard?: CacheProtectedPublicationGuard;
+  readonly requireProtectedPublicationGuard?: boolean;
   readonly processLruEntries?: number;
   readonly authoritativeSource?: CriticalProjectionSource;
   readonly now?: () => number;
   readonly random?: () => number;
+}
+
+interface ProtectedFenceLease {
+  readonly nonce: symbol;
+  readonly descriptor: CacheKeyDescriptor;
+  readonly context: CacheProtectedGuardContext;
+  readonly pending: Set<Promise<unknown>>;
+  readonly failures: unknown[];
+  active: boolean;
 }
 
 type CacheLookup<Value extends CacheJson> =
@@ -1031,12 +1137,20 @@ type CacheLookup<Value extends CacheJson> =
 export class ScopedCache {
   readonly #backend: CacheBackend;
   readonly #secret: Buffer;
-  readonly #authorize: (descriptor: CacheKeyDescriptor) => boolean | Promise<boolean>;
+  readonly #authorize: (
+    descriptor: CacheKeyDescriptor,
+    context: CacheProtectedGuardContext | undefined,
+  ) => boolean | Promise<boolean>;
+  readonly #protectedPublicationGuard: CacheProtectedPublicationGuard | undefined;
+  readonly #requireProtectedPublicationGuard: boolean;
+  readonly #fenceNonce = Symbol("cache-protected-fence");
+  readonly #fenceContext = new AsyncLocalStorage<ProtectedFenceLease>();
   readonly #lru: BoundedLru;
   readonly #metrics = new CacheMetrics();
   readonly #singleFlights = new Map<string, Promise<CacheJson | null>>();
   readonly #now: () => number;
   readonly #random: () => number;
+  #destroyed = false;
   readonly authoritativeSource: CriticalProjectionSource | undefined;
 
   constructor(options: ScopedCacheOptions = {}) {
@@ -1045,6 +1159,11 @@ export class ScopedCache {
     this.#authorize = options.authorize ?? ((descriptor) => (
       descriptor.scope === "PUBLIC" || descriptor.scope === "SHARED"
     ));
+    this.#protectedPublicationGuard = options.protectedPublicationGuard;
+    this.#requireProtectedPublicationGuard = options.requireProtectedPublicationGuard === true;
+    if (this.#requireProtectedPublicationGuard && !this.#protectedPublicationGuard) {
+      throw new Error("CACHE_PROTECTED_PUBLICATION_GUARD_REQUIRED");
+    }
     const lruEntries = options.processLruEntries ?? 64;
     if (!Number.isSafeInteger(lruEntries) || lruEntries < 0 || lruEntries > 10_000) {
       throw new Error("CACHE_LRU_LIMIT_INVALID");
@@ -1055,14 +1174,129 @@ export class ScopedCache {
     this.#random = options.random ?? Math.random;
   }
 
-  async #authorized(key: TypedCacheKey, throwOnDenied: boolean): Promise<CacheKeyDescriptor | null> {
-    const descriptor = inspectCacheKey(key);
-    if (!await this.#authorize(descriptor)) {
-      this.#metrics.authorizationFilteredMisses += 1;
-      if (throwOnDenied) throw new Error("CACHE_NOT_AUTHORIZED");
-      return null;
+  #descriptor(key: TypedCacheKey): CacheKeyDescriptor {
+    if (this.#destroyed) throw new Error("CACHE_DESTROYED");
+    return inspectCacheKey(key);
+  }
+
+  #sameFenceScope(left: CacheKeyDescriptor, right: CacheKeyDescriptor): boolean {
+    return left.scope === right.scope
+      && left.identityId === right.identityId
+      && left.entityId === right.entityId;
+  }
+
+  #trackFenceDescendant<Result>(
+    lease: ProtectedFenceLease,
+    publish: () => Promise<Result>,
+  ): Promise<Result> {
+    let operation: Promise<Result>;
+    try {
+      operation = Promise.resolve(publish());
+    } catch (error) {
+      operation = Promise.reject(error);
     }
-    return descriptor;
+    lease.pending.add(operation);
+    void operation.then(
+      () => { lease.pending.delete(operation); },
+      (error: unknown) => {
+        lease.failures.push(error);
+        lease.pending.delete(operation);
+      },
+    );
+    return operation;
+  }
+
+  async #drainFenceDescendants(lease: ProtectedFenceLease): Promise<void> {
+    // Descendants can start additional cache operations while settling. Keep
+    // taking bounded snapshots until no registered operation remains.
+    while (lease.pending.size > 0) {
+      await Promise.allSettled([...lease.pending]);
+    }
+    if (lease.failures.length > 0) throw lease.failures[0];
+  }
+
+  #guardContext(): CacheProtectedGuardContext | undefined {
+    const lease = this.#fenceContext.getStore();
+    return lease?.nonce === this.#fenceNonce && lease.active ? lease.context : undefined;
+  }
+
+  #authorized(descriptor: CacheKeyDescriptor): boolean | Promise<boolean> {
+    return this.#authorize(descriptor, this.#guardContext());
+  }
+
+  async #guardPublication<Result>(
+    descriptor: CacheKeyDescriptor,
+    publish: () => Promise<Result>,
+    operation: "READ" | "WRITE" | "INVALIDATE" = "WRITE",
+  ): Promise<Result> {
+    const inherited = this.#fenceContext.getStore();
+    if (!protectedDescriptor(descriptor)) {
+      return publish();
+    }
+    if (inherited?.nonce === this.#fenceNonce) {
+      if (!inherited.active) {
+        throw new Error("CACHE_PROTECTED_FENCE_EXPIRED");
+      }
+      return this.#trackFenceDescendant(inherited, async () => {
+        if (!this.#sameFenceScope(inherited.descriptor, descriptor)) {
+          throw new Error("CACHE_PROTECTED_FENCE_SCOPE_MISMATCH");
+        }
+        return publish();
+      });
+    }
+    const guard = this.#protectedPublicationGuard;
+    if (!guard) {
+      if (this.#requireProtectedPublicationGuard) {
+        throw new Error("CACHE_PROTECTED_PUBLICATION_GUARD_REQUIRED");
+      }
+      return publish();
+    }
+    return guard(descriptor, async (context) => {
+      const lease: ProtectedFenceLease = {
+        nonce: this.#fenceNonce,
+        descriptor,
+        context: Object.freeze({ ...context }),
+        pending: new Set(),
+        failures: [],
+        active: true,
+      };
+      try {
+        let result: Result | undefined;
+        let callbackFailed = false;
+        let callbackFailure: unknown;
+        try {
+          result = await this.#fenceContext.run(lease, publish);
+        } catch (error) {
+          callbackFailed = true;
+          callbackFailure = error;
+        }
+        let descendantFailed = false;
+        let descendantFailure: unknown;
+        try {
+          await this.#drainFenceDescendants(lease);
+        } catch (error) {
+          descendantFailed = true;
+          descendantFailure = error;
+        }
+        if (callbackFailed) throw callbackFailure;
+        if (descendantFailed) throw descendantFailure;
+        return result as Result;
+      } finally {
+        lease.active = false;
+      }
+    }, operation);
+  }
+
+  async withPublicationGuard<Result>(
+    key: TypedCacheKey,
+    publish: (context: CacheProtectedGuardContext) => Promise<Result>,
+    operation: "READ" | "WRITE" | "INVALIDATE" = "WRITE",
+  ): Promise<Result> {
+    const descriptor = this.#descriptor(key);
+    return this.#guardPublication(descriptor, async () => {
+      if (!await this.#authorized(descriptor)) throw new Error("CACHE_NOT_AUTHORIZED");
+      return publish(this.#guardContext() ?? Object.freeze({}));
+    }, operation);
   }
 
   #ttlMilliseconds(options: CacheSetOptions, descriptor: CacheKeyDescriptor): number {
@@ -1129,8 +1363,22 @@ export class ScopedCache {
     options: CacheSetOptions,
   ): Promise<void> {
     if (!isCacheVersionKey(key)) throw new Error("CACHE_VERSION_KEY_REQUIRED");
-    const descriptor = await this.#authorized(key, true);
-    if (!descriptor) throw new Error("CACHE_NOT_AUTHORIZED");
+    const descriptor = this.#descriptor(key);
+    await this.#guardPublication(
+      descriptor,
+      async () => {
+        if (!await this.#authorized(descriptor)) throw new Error("CACHE_NOT_AUTHORIZED");
+        await this.#setAuthorized(key, value, options, descriptor);
+      },
+    );
+  }
+
+  async #setAuthorized<Value extends CacheJson>(
+    key: CacheVersionKey,
+    value: Value | null,
+    options: CacheSetOptions,
+    descriptor: CacheKeyDescriptor,
+  ): Promise<void> {
     const protectedValue = protectedDescriptor(descriptor);
     if (containsRawTranscript(value)) {
       throw new Error("CACHE_RAW_PRIVATE_TRANSCRIPT_PROHIBITED");
@@ -1176,7 +1424,7 @@ export class ScopedCache {
       const existingSerialized = await this.#backend.read(key);
       if (existingSerialized === null) {
         // The prior value expired between the atomic check and validation.
-        return this.set(key, value, options);
+        return this.#setAuthorized(key, value, options, descriptor);
       }
       let existing: CacheEnvelope;
       let existingValue: CacheJson | null;
@@ -1203,13 +1451,17 @@ export class ScopedCache {
 
   async get<Value extends CacheJson>(key: CacheVersionKey): Promise<Value | null> {
     if (!isCacheVersionKey(key)) throw new Error("CACHE_VERSION_KEY_REQUIRED");
-    const descriptor = await this.#authorized(key, false);
-    if (!descriptor) return null;
+    const descriptor = this.#descriptor(key);
     try {
-      const lookup = await this.#lookup<Value>(key, descriptor);
-      return lookup.value;
-    } catch {
+      return await this.#guardPublication(descriptor, async () => {
+        if (!await this.#authorized(descriptor)) return null;
+        const lookup = await this.#lookup<Value>(key, descriptor);
+        if (!await this.#authorized(descriptor)) return null;
+        return normalizedJson(lookup.value) as Value | null;
+      }, "READ");
+    } catch (error) {
       this.#metrics.backendFailures += 1;
+      if (error instanceof Error && error.message === "CACHE_DESTROYED") throw error;
       return null;
     }
   }
@@ -1221,8 +1473,24 @@ export class ScopedCache {
     if (!Number.isSafeInteger(options.maxRows) || options.maxRows < 1 || options.maxRows > 10_000) {
       throw new Error("CACHE_FALLBACK_BOUND_INVALID");
     }
-    const descriptor = await this.#authorized(key, true);
-    if (!descriptor) throw new Error("CACHE_NOT_AUTHORIZED");
+    if (!isCacheVersionKey(key)) throw new Error("CACHE_VERSION_KEY_REQUIRED");
+    const descriptor = this.#descriptor(key);
+    return this.#guardPublication(descriptor, async () => {
+      if (!await this.#authorized(descriptor)) throw new Error("CACHE_NOT_AUTHORIZED");
+      let value = await this.#readThroughAuthorized(key, options, descriptor);
+      if (!await this.#authorized(descriptor)) {
+        value = null;
+        throw new Error("CACHE_NOT_AUTHORIZED");
+      }
+      return normalizedJson(value) as Value | null;
+    }, "READ");
+  }
+
+  async #readThroughAuthorized<Value extends CacheJson>(
+    key: CacheVersionKey,
+    options: CacheReadThroughOptions<Value>,
+    descriptor: CacheKeyDescriptor,
+  ): Promise<Value | null> {
 
     if (!options.decisionCritical) {
       try {
@@ -1291,7 +1559,7 @@ export class ScopedCache {
           }
           if (!leaseAcquired && backendAvailable) throw new Error("CACHE_SINGLE_FLIGHT_TIMEOUT");
         }
-        const fallbackValue = await loadAuthority();
+        let fallbackValue = await loadAuthority();
         if (backendAvailable) {
           try {
             if (fallbackValue === null) {
@@ -1304,7 +1572,14 @@ export class ScopedCache {
             } else {
               await this.set(key, fallbackValue, options);
             }
-          } catch {
+          } catch (error) {
+            if (error instanceof Error && [
+              "CACHE_NOT_AUTHORIZED", "CACHE_PRIVACY_BARRIER",
+              "CACHE_PRIVACY_SCOPE_INVALID", "CACHE_DESTROYED",
+            ].includes(error.message)) {
+              fallbackValue = null;
+              throw error;
+            }
             this.#metrics.backendFailures += 1;
           }
         }
@@ -1332,15 +1607,25 @@ export class ScopedCache {
     if (!isCachePointerKey(input.pointerKey) || !isCacheVersionKey(input.versionKey)) {
       throw new Error("CACHE_PUBLISH_KEY_INVALID");
     }
-    const pointerDescriptor = inspectCacheKey(input.pointerKey);
-    const versionDescriptor = inspectCacheKey(input.versionKey);
+    const pointerDescriptor = this.#descriptor(input.pointerKey);
+    const versionDescriptor = this.#descriptor(input.versionKey);
     if (!samePointerScope(pointerDescriptor, versionDescriptor)) {
       throw new Error("CACHE_POINTER_SCOPE_MISMATCH");
     }
-    if (!await this.#authorize(pointerDescriptor) || !await this.#authorize(versionDescriptor)) {
-      this.#metrics.authorizationFilteredMisses += 1;
-      throw new Error("CACHE_NOT_AUTHORIZED");
-    }
+    return this.#guardPublication(pointerDescriptor, async () => {
+      if (!await this.#authorized(pointerDescriptor) || !await this.#authorized(versionDescriptor)) {
+        this.#metrics.authorizationFilteredMisses += 1;
+        throw new Error("CACHE_NOT_AUTHORIZED");
+      }
+      return this.#publishAuthorized(input, versionDescriptor, started);
+    });
+  }
+
+  async #publishAuthorized<Value extends CacheJson>(
+    input: CachePublishInput<Value>,
+    versionDescriptor: CacheKeyDescriptor,
+    started: number,
+  ): Promise<"STORED" | "STALE_IGNORED"> {
     ordinalValue(input.versionOrdinal);
     await this.set(input.versionKey, input.value, input.options);
     const expiresAt = this.#now() + this.#ttlMilliseconds(input.options, versionDescriptor);
@@ -1383,8 +1668,27 @@ export class ScopedCache {
 
   async getCurrent<Value extends CacheJson>(pointerKey: CachePointerKey): Promise<Value | null> {
     if (!isCachePointerKey(pointerKey)) throw new Error("CACHE_POINTER_KEY_REQUIRED");
-    const pointerDescriptor = await this.#authorized(pointerKey, false);
-    if (!pointerDescriptor) return null;
+    const pointerDescriptor = this.#descriptor(pointerKey);
+    try {
+      return await this.#guardPublication(pointerDescriptor, async () => {
+        if (!await this.#authorized(pointerDescriptor)) return null;
+        const value = await this.#getCurrentAuthorized<Value>(pointerKey, pointerDescriptor);
+        if (!await this.#authorized(pointerDescriptor)) return null;
+        return normalizedJson(value) as Value | null;
+      }, "READ");
+    } catch (error) {
+      if (error instanceof Error && error.message === "CACHE_DESTROYED") throw error;
+      if (error instanceof Error && [
+        "CACHE_PRIVACY_BARRIER", "CACHE_PRIVACY_SCOPE_INVALID", "CACHE_NOT_AUTHORIZED",
+      ].includes(error.message)) return null;
+      throw error;
+    }
+  }
+
+  async #getCurrentAuthorized<Value extends CacheJson>(
+    pointerKey: CachePointerKey,
+    pointerDescriptor: CacheKeyDescriptor,
+  ): Promise<Value | null> {
     let serialized: string | null;
     try {
       serialized = await this.#backend.read(pointerKey);
@@ -1415,12 +1719,13 @@ export class ScopedCache {
     // The pointer contains no protected value. Re-authorize the immutable
     // target before its envelope is read or decrypted so live source-specific
     // policy changes can deny a stale pointer safely.
-    if (!await this.#authorize(targetDescriptor)) return null;
+    if (!await this.#authorized(targetDescriptor)) return null;
     const lookup = await this.#lookup<Value>(pointer.target, targetDescriptor);
     if (lookup.status === "MISS") {
       await this.#backend.delete(pointerKey);
       this.#metrics.staleVersionRejections += 1;
     }
+    if (!await this.#authorized(targetDescriptor)) return null;
     return lookup.value;
   }
 
@@ -1430,24 +1735,75 @@ export class ScopedCache {
   ): Promise<"INVALIDATED" | "STALE_IGNORED" | "MISSING"> {
     const started = this.#now();
     if (!isCachePointerKey(pointerKey)) throw new Error("CACHE_POINTER_KEY_REQUIRED");
-    const descriptor = await this.#authorized(pointerKey, true);
-    if (!descriptor) throw new Error("CACHE_NOT_AUTHORIZED");
-    try {
-      const result = await this.#backend.deletePointerThrough(pointerKey, input.throughOrdinal);
-      if (result === "INVALIDATED") this.#metrics.invalidations += 1;
-      if (result === "STALE_IGNORED") this.#metrics.staleVersionRejections += 1;
-      this.#metrics.observe(this.#metrics.invalidationLatencyMs, this.#now() - started);
-      return result;
-    } catch (error) {
-      this.#metrics.invalidationFailures += 1;
-      this.#metrics.backendFailures += 1;
-      throw error;
-    }
+    const descriptor = this.#descriptor(pointerKey);
+    return this.#guardPublication(descriptor, async () => {
+      if (!await this.#authorized(descriptor)) throw new Error("CACHE_NOT_AUTHORIZED");
+      try {
+        const result = await this.#backend.deletePointerThrough(pointerKey, input.throughOrdinal);
+        if (result === "INVALIDATED") this.#metrics.invalidations += 1;
+        if (result === "STALE_IGNORED") this.#metrics.staleVersionRejections += 1;
+        this.#metrics.observe(this.#metrics.invalidationLatencyMs, this.#now() - started);
+        return result;
+      } catch (error) {
+        this.#metrics.invalidationFailures += 1;
+        this.#metrics.backendFailures += 1;
+        throw error;
+      }
+    }, "INVALIDATE");
   }
 
   async flushAll(): Promise<void> {
     await this.#backend.flushAll();
     this.#lru.clear();
+  }
+
+  async purgeConversationLocal(input: {
+    readonly accountId: string;
+    readonly nodeBrainId: string;
+    readonly conversationId: string;
+  }): Promise<void> {
+    if (!EVENT_ID_PATTERN.test(input.accountId)
+        || !EVENT_ID_PATTERN.test(input.nodeBrainId)
+        || !EVENT_ID_PATTERN.test(input.conversationId)) {
+      throw new Error("CACHE_PURGE_SCOPE_INVALID");
+    }
+    const matches = (key: string): boolean => {
+      try {
+        const descriptor = inspectCacheKey(key as TypedCacheKey);
+        return descriptor.scope === "PRIVATE_ACCOUNT"
+          && descriptor.identityId === input.accountId
+          && descriptor.entityId === input.conversationId;
+      } catch {
+        return false;
+      }
+    };
+    // The DB conversation fence drains reads that began before forgetting and
+    // prevents later reads from registering. Never await arbitrary application
+    // loaders while forget holds that fence; only detach a matching stale slot.
+    for (const [key] of this.#singleFlights.entries()) {
+      if (matches(key)) this.#singleFlights.delete(key);
+    }
+    this.#lru.deleteMatching(matches);
+  }
+
+  async purgeConversation(input: {
+    readonly accountId: string;
+    readonly nodeBrainId: string;
+    readonly conversationId: string;
+  }): Promise<void> {
+    await this.purgeConversationLocal(input);
+    await this.#backend.deleteMatching({
+      accountId: input.accountId,
+      conversationId: input.conversationId,
+      maximumKeys: 10_000,
+    });
+  }
+
+  destroy(): void {
+    this.#destroyed = true;
+    this.#secret.fill(0);
+    this.#lru.clear();
+    this.#singleFlights.clear();
   }
 
   localSize(): number {
@@ -1478,13 +1834,15 @@ export function scopedCache(options: ScopedCacheOptions = {}): ScopedCache {
 
 export type CacheProjectionPublisher = Pick<
   ScopedCache,
-  "publish" | "invalidate" | "metrics" | "recordPrewarmFailure" | "recordRebuild"
+  "publish" | "invalidate" | "withPublicationGuard" | "metrics"
+    | "recordPrewarmFailure" | "recordRebuild"
 > & { readonly authoritativeSource?: CriticalProjectionSource };
 
 export function cacheProjectionPublisher(cache: ScopedCache): CacheProjectionPublisher {
   return Object.freeze({
     publish: cache.publish.bind(cache),
     invalidate: cache.invalidate.bind(cache),
+    withPublicationGuard: cache.withPublicationGuard.bind(cache),
     metrics: cache.metrics.bind(cache),
     recordPrewarmFailure: cache.recordPrewarmFailure.bind(cache),
     recordRebuild: cache.recordRebuild.bind(cache),
@@ -1496,14 +1854,24 @@ export function cacheProjectionPublisher(cache: ScopedCache): CacheProjectionPub
 export type CacheProjectionReader = Pick<
   ScopedCache,
   "get" | "getCurrent" | "readThrough" | "metrics"
->;
+> & { dispose(): void };
 
-export function cacheProjectionReader(cache: ScopedCache): CacheProjectionReader {
+export function cacheProjectionReader(
+  cache: ScopedCache,
+  onDispose: () => void = () => undefined,
+): CacheProjectionReader {
+  let disposed = false;
   return Object.freeze({
     get: cache.get.bind(cache),
     getCurrent: cache.getCurrent.bind(cache),
     readThrough: cache.readThrough.bind(cache),
     metrics: cache.metrics.bind(cache),
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      cache.destroy();
+      onDispose();
+    },
   });
 }
 

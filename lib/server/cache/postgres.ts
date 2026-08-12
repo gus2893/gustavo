@@ -4,6 +4,7 @@ import { readEventBody } from "../events/store";
 import { loadHandoff } from "../handoffs/build";
 import {
   CACHE_REQUIRED_CATEGORIES,
+  cachePointerKey,
   projectionCategory,
   projectionCategoryManifests,
   projectionManifestHash,
@@ -889,10 +890,23 @@ class PostgresProjectionSource implements CriticalProjectionSource, CacheChangeS
     readonly topic: string;
     readonly maxRows: number;
     readonly category?: CacheProjectionCategory;
-  }): Promise<CacheProjectionChange> {
+  }, database?: EventDatabase): Promise<CacheProjectionChange> {
+    if (database !== undefined && database !== this.#database) {
+      return new PostgresProjectionSource(database).loadChange(eventId, input);
+    }
     if (!Number.isSafeInteger(input.maxRows) || input.maxRows < 1 || input.maxRows > 1_000) {
       throw new Error("CACHE_CHANGE_SOURCE_BOUND_INVALID");
     }
+    const barred = await this.#database.query(
+      `select 1 from privacy_forget_barriers barrier where
+         exists (select 1 from events event where event.id=$1
+           and event.aggregate_id=barrier.conversation_id::text)
+         or exists (select 1 from cache_authority_changes authority where authority.event_id=$1
+           and authority.conversation_id=barrier.conversation_id)
+       limit 1`,
+      [eventId],
+    );
+    if (barred.length > 0) throw new Error("CACHE_PRIVACY_BARRIER");
     if (input.topic.startsWith("cache.authority.")) {
       if (input.category !== "NODE_DOSSIERS" && input.category !== "NODE_HANDOFFS") {
         throw new Error("CACHE_AUTHORITY_CHANGE_CATEGORY_INVALID");
@@ -965,6 +979,19 @@ class PostgresCacheJobRepository implements CacheJobRepository {
     if (!/^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/u.test(workerId)) throw new Error("CACHE_JOB_WORKER_ID_INVALID");
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 300_000) throw new Error("CACHE_JOB_LEASE_INVALID");
     return this.#database.transaction(async (transaction) => {
+      await transaction.query(
+        `update cache_projection_jobs job
+         set status='FAILED',worker_id=null,lease_token=null,lease_until=null,
+             available_at=clock_timestamp(),completed_at=null,error_code='PRIVACY_FORGET_BARRIER'
+         where job.status in ('PENDING','CLAIMED','RETRY_SCHEDULED') and exists (
+           select 1 from privacy_forget_barriers barrier where
+             exists (select 1 from events event where event.id=job.event_id
+               and event.aggregate_id=barrier.conversation_id::text)
+             or exists (select 1 from cache_authority_changes authority
+               where authority.event_id=job.event_id
+                 and authority.conversation_id=barrier.conversation_id)
+         )`,
+      );
       const rows = await transaction.query<JobRow>(
         `with candidate as (
            select id from cache_projection_jobs
@@ -972,6 +999,14 @@ class PostgresCacheJobRepository implements CacheJobRepository {
              status='PENDING'
              or (status='RETRY_SCHEDULED' and available_at<=clock_timestamp())
              or (status='CLAIMED' and lease_until<=clock_timestamp())
+           )
+           and not exists (
+             select 1 from privacy_forget_barriers barrier where
+               exists (select 1 from events event where event.id=cache_projection_jobs.event_id
+                 and event.aggregate_id=barrier.conversation_id::text)
+               or exists (select 1 from cache_authority_changes authority
+                 where authority.event_id=cache_projection_jobs.event_id
+                   and authority.conversation_id=barrier.conversation_id)
            )
            order by available_at,created_at,id for update skip locked limit 1
          )
@@ -997,55 +1032,153 @@ class PostgresCacheJobRepository implements CacheJobRepository {
     });
   }
 
+  async guardTarget(claim: CacheJobClaim): Promise<{
+    readonly key: ReturnType<typeof cachePointerKey>;
+    readonly operation: "WRITE" | "INVALIDATE";
+  } | null> {
+    if (claim.message.category !== "NODE_DOSSIERS"
+        && claim.message.category !== "NODE_HANDOFFS") return null;
+    const rows = await this.#database.query<{
+      readonly account_id: string;
+      readonly conversation_id: string;
+    } & Record<string, unknown>>(
+      `with claimed as (
+         select job.event_id,job.topic,job.category
+         from cache_projection_jobs job
+         where job.id=$1 and job.event_id=$2 and job.status='CLAIMED'
+           and job.worker_id=$3 and job.lease_token=$4
+           and job.lease_until>clock_timestamp()
+       ), resolved as (
+         select conversation.account_id,conversation.id conversation_id
+         from claimed join events event on event.id=claimed.event_id
+         join conversations conversation on conversation.id::text=event.aggregate_id
+           and conversation.account_id::text=event.account_id
+         union
+         select packet.account_id,packet.conversation_id
+         from claimed join handoff_packets packet on packet.packet_event_id=claimed.event_id
+         union
+         select checkpoint.account_id,checkpoint.conversation_id
+         from claimed join handoff_refresh_checkpoints checkpoint
+           on checkpoint.checkpoint_event_id=claimed.event_id
+         union
+         select authority.account_id,authority.conversation_id
+         from claimed join cache_authority_changes authority
+           on authority.event_id=claimed.event_id
+         union
+         select disclosure.account_id,disclosure.conversation_id
+         from claimed join events event on event.id=claimed.event_id
+           and event.type='proposal.disclosure.revoked'
+         join proposal_disclosure_authorizations disclosure
+           on disclosure.id::text=event.aggregate_id
+       )
+       select account_id::text,conversation_id::text from resolved limit 2`,
+      [claim.jobId, claim.message.eventId, claim.workerId, claim.leaseToken],
+    );
+    if (rows.length !== 1) throw new Error("CACHE_JOB_PROTECTED_SCOPE_INVALID");
+    const namespace = claim.message.category === "NODE_DOSSIERS"
+      ? "node-dossier" as const : "handoff" as const;
+    return Object.freeze({
+      key: cachePointerKey({
+        namespace,
+        scope: "PRIVATE_ACCOUNT",
+        entityId: rows[0]!.conversation_id,
+        identityId: rows[0]!.account_id,
+        topologyVersion: TOPOLOGY_VERSION,
+        policyVersion: "privacy-cache-fence-v1",
+        schemaVersion: CACHE_SCHEMA_VERSION,
+      }),
+      operation: claim.message.topic.startsWith("cache.authority.")
+          || claim.message.topic === "proposal.disclosure.revoked"
+        ? "INVALIDATE" : "WRITE",
+    });
+  }
+
   async #transition(claim: CacheJobClaim, status: "RETRY_SCHEDULED" | "FAILED", errorCode: string) {
     const delay = status === "RETRY_SCHEDULED" ? Math.min(60_000, 250 * (2 ** Math.max(0, claim.attempt - 1))) : 0;
     const rows = await this.#database.query<{ readonly id: string }>(
       `update cache_projection_jobs set status=$1,available_at=clock_timestamp()+($2::int*interval '1 millisecond'),
          worker_id=null,lease_token=null,lease_until=null,error_code=$3
        where id=$4 and status='CLAIMED' and worker_id=$5 and lease_token=$6
-         and lease_until>clock_timestamp() returning id::text`,
+         and lease_until>clock_timestamp() and not exists (
+           select 1 from privacy_forget_barriers barrier where
+             exists (select 1 from events event where event.id=cache_projection_jobs.event_id
+               and event.aggregate_id=barrier.conversation_id::text)
+             or exists (select 1 from cache_authority_changes authority
+               where authority.event_id=cache_projection_jobs.event_id
+                 and authority.conversation_id=barrier.conversation_id)
+         ) returning id::text`,
       [status, delay, errorCode.slice(0, 128), claim.jobId, claim.workerId, claim.leaseToken],
     );
     if (rows.length !== 1) throw new Error("CACHE_JOB_CLAIM_STALE");
   }
 
-  async complete(claim: CacheJobClaim, change?: CacheProjectionChange): Promise<void> {
-    await this.#database.transaction(async (transaction) => {
-      if (change?.action === "PREWARM") {
-        const category = projectionCategory(change.record);
-        const inserted = await transaction.query<{ readonly id: string }>(
-          `insert into cache_projection_versions (
-             job_id,category,entity_id,source_event_id,source_high_water,version_ordinal,content_hash
-           ) select $1,$2,$3,$4,$5,$6,$7
-           where exists (
-             select 1 from cache_projection_jobs where id=$1 and status='CLAIMED'
-               and worker_id=$8 and lease_token=$9 and lease_until>clock_timestamp()
-           ) on conflict do nothing returning id::text`,
-          [claim.jobId, category, change.record.key.entityId, change.recordSourceEventId,
-            change.record.key.sourceHighWater, change.record.versionOrdinal, change.record.contentHash,
-            claim.workerId, claim.leaseToken],
+  async #complete(
+    transaction: EventDatabase,
+    claim: CacheJobClaim,
+    change?: CacheProjectionChange,
+  ): Promise<void> {
+    if (change?.action === "PREWARM") {
+      const category = projectionCategory(change.record);
+      const inserted = await transaction.query<{ readonly id: string }>(
+        `insert into cache_projection_versions (
+           job_id,category,entity_id,source_event_id,source_high_water,version_ordinal,content_hash
+         ) select $1,$2,$3,$4,$5,$6,$7
+         where exists (
+           select 1 from cache_projection_jobs where id=$1 and status='CLAIMED'
+             and worker_id=$8 and lease_token=$9 and lease_until>clock_timestamp()
+             and not exists (
+               select 1 from privacy_forget_barriers barrier where
+                 exists (select 1 from events event
+                   where event.id=cache_projection_jobs.event_id
+                     and event.aggregate_id=barrier.conversation_id::text)
+                 or exists (select 1 from cache_authority_changes authority
+                   where authority.event_id=cache_projection_jobs.event_id
+                     and authority.conversation_id=barrier.conversation_id)
+             )
+         ) on conflict do nothing returning id::text`,
+        [claim.jobId, category, change.record.key.entityId, change.recordSourceEventId,
+          change.record.key.sourceHighWater, change.record.versionOrdinal, change.record.contentHash,
+          claim.workerId, claim.leaseToken],
+      );
+      if (inserted.length === 0) {
+        const existing = await transaction.query<{ readonly content_hash: string }>(
+          `select content_hash from cache_projection_versions
+           where category=$1 and entity_id=$2 and source_high_water=$3 and version_ordinal=$4`,
+          [category, change.record.key.entityId, change.record.key.sourceHighWater,
+            change.record.versionOrdinal],
         );
-        if (inserted.length === 0) {
-          const existing = await transaction.query<{ readonly content_hash: string }>(
-            `select content_hash from cache_projection_versions
-             where category=$1 and entity_id=$2 and source_high_water=$3 and version_ordinal=$4`,
-            [category, change.record.key.entityId, change.record.key.sourceHighWater,
-              change.record.versionOrdinal],
-          );
-          if (existing[0] && existing[0].content_hash !== change.record.contentHash) {
-            throw new Error("CACHE_PROJECTION_VERSION_CONFLICT");
-          }
+        if (existing[0] && existing[0].content_hash !== change.record.contentHash) {
+          throw new Error("CACHE_PROJECTION_VERSION_CONFLICT");
         }
       }
-      const rows = await transaction.query<{ readonly id: string }>(
-        `update cache_projection_jobs set status='COMPLETED',worker_id=null,lease_token=null,
-           lease_until=null,completed_at=clock_timestamp(),error_code=null
-         where id=$1 and status='CLAIMED' and worker_id=$2 and lease_token=$3
-           and lease_until>clock_timestamp() returning id::text`,
-        [claim.jobId, claim.workerId, claim.leaseToken],
-      );
-      if (rows.length !== 1) throw new Error("CACHE_JOB_CLAIM_STALE");
-    });
+    }
+    const rows = await transaction.query<{ readonly id: string }>(
+      `update cache_projection_jobs set status='COMPLETED',worker_id=null,lease_token=null,
+         lease_until=null,completed_at=clock_timestamp(),error_code=null
+       where id=$1 and status='CLAIMED' and worker_id=$2 and lease_token=$3
+         and lease_until>clock_timestamp() and not exists (
+           select 1 from privacy_forget_barriers barrier where
+             exists (select 1 from events event where event.id=cache_projection_jobs.event_id
+               and event.aggregate_id=barrier.conversation_id::text)
+             or exists (select 1 from cache_authority_changes authority
+               where authority.event_id=cache_projection_jobs.event_id
+                 and authority.conversation_id=barrier.conversation_id)
+         ) returning id::text`,
+      [claim.jobId, claim.workerId, claim.leaseToken],
+    );
+    if (rows.length !== 1) throw new Error("CACHE_JOB_CLAIM_STALE");
+  }
+
+  async complete(
+    claim: CacheJobClaim,
+    change?: CacheProjectionChange,
+    database?: EventDatabase,
+  ): Promise<void> {
+    if (database !== undefined) {
+      await this.#complete(database, claim, change);
+      return;
+    }
+    await this.#database.transaction((transaction) => this.#complete(transaction, claim, change));
   }
 
   async retry(claim: CacheJobClaim, errorCode: string): Promise<void> {
@@ -1102,6 +1235,8 @@ export async function synchronizeCanonicalCacheJobs(
          from transactional_outbox outbox join events event on event.id=outbox.event_id
          where event.ingested_sequence > $1 and event.ingested_sequence <= $2
            and outbox.topic=any($3::text[])
+           and not exists (select 1 from privacy_forget_barriers barrier
+             where barrier.conversation_id::text=event.aggregate_id)
          order by event.ingested_sequence,outbox.id limit $4`,
         [backfillState.last_ingested_sequence, backfillState.boundary_ingested_sequence,
           CACHE_OUTBOX_TOPICS, input.limit],
@@ -1136,11 +1271,15 @@ export async function synchronizeCanonicalCacheJobs(
       readonly topic: string;
       readonly created_at: Date;
       readonly ingested_sequence: string;
+      readonly privacy_barred: boolean;
     }>(
       `/* cache-canonical-outbox-poll: bounded by caller limit */
        select staged.outbox_id::text id,staged.event_id::text,staged.topic,
               staged.source_created_at created_at,
-              staged.event_ingested_sequence::text ingested_sequence
+              staged.event_ingested_sequence::text ingested_sequence,
+              exists (select 1 from events event join privacy_forget_barriers barrier
+                on barrier.conversation_id::text=event.aggregate_id
+                where event.id=staged.event_id) privacy_barred
        from cache_outbox_staging staged where staged.processed_at is null
        order by staged.event_ingested_sequence,staged.outbox_id
        for update skip locked limit $1`,
@@ -1156,11 +1295,14 @@ export async function synchronizeCanonicalCacheJobs(
       readonly dossier_policy_version: string | null;
       readonly handoff_policy_version: string | null;
       readonly changed_at: Date;
+      readonly privacy_barred: boolean;
     }>(
       `/* cache-authority-change-poll: bounded by caller limit */
        select authority.sequence::text,authority.event_id::text,authority.topic,
               authority.dossier_policy_version,authority.handoff_policy_version,
-              authority.changed_at
+              authority.changed_at,
+              exists (select 1 from privacy_forget_barriers barrier
+                where barrier.conversation_id=authority.conversation_id) privacy_barred
        from cache_authority_staging staged
        join cache_authority_changes authority
          on authority.event_id=staged.authority_event_id
@@ -1188,6 +1330,7 @@ export async function synchronizeCanonicalCacheJobs(
       string, string, CacheProjectionCategory, Date,
     ]> = [];
     for (const source of consumedOutbox) {
+      if (source.privacy_barred) continue;
       const selected: readonly CacheProjectionCategory[] = source.topic === "main.broadcast.committed"
         ? ["MAIN_STATE", "BROADCASTS"]
         : source.topic === "node.reply.routed" ? ["NODE_DOSSIERS"]
@@ -1203,6 +1346,7 @@ export async function synchronizeCanonicalCacheJobs(
       }
     }
     for (const source of consumedAuthority) {
+      if (source.privacy_barred) continue;
       const selected: readonly CacheProjectionCategory[] = [
         ...(source.dossier_policy_version === null ? [] : ["NODE_DOSSIERS"] as const),
         ...(source.handoff_policy_version === null ? [] : ["NODE_HANDOFFS"] as const),

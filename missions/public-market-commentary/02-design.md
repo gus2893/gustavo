@@ -17,7 +17,8 @@
 - Every Node Brain transmits structured idea briefs to the Main Brain. The Main Brain and Node Brain hold bounded, persisted reviews and record winner decisions.
 - Gustavo retains the complete source interaction history for every account and Brain relationship. Derived summaries, embeddings, and indexes never replace source events.
 - The initial deployment runs on the operator’s computer and remains functional without a hosted application runtime or hosted database.
-- Encrypted cloud backup is required for recovery but is not part of the live request path.
+- Encrypted cloud backup and verified restore remain required before public production launch, but they follow the first working local MVP as an improvement milestone and are never part of the live request path.
+- Delivery is staged: first ship a working local MVP from the completed backend, authenticated streaming, public/private UI, a one-command local runtime, static safety gates, and an MVP smoke path; then continue with backup hardening, scale/performance verification, automated broadcast scheduling, and full-system acceptance proof as improvements.
 - The architecture must scale by adding stateless web/worker instances and database capacity, without changing the one-account/one-Brain/one-chat invariant.
 - Gustavo must preserve all authorized source history while retrieving only the smallest relevant context needed for a response or Brain-to-Brain discussion.
 - Memory lookup cannot require a model call or full transcript scan on the synchronous response path.
@@ -632,6 +633,12 @@ Imports are append-only and individually reversible by appending deactivation ev
 
 ## D — Local deployment, durability, and scale
 
+### Delivery milestones
+
+- **Working MVP gate:** finish privacy controls already in progress, authenticated SSE, the public shell, authenticated chat/memory/Challenge views, one-command local startup, repository/public-payload safety validation, and a browser smoke path covering invitation, chat, Main/Node attribution, memory controls, simulated Challenge state, and public redaction.
+- **Improvement gate:** add encrypted verified backups and isolated restore drills, million-event performance budgets and operator health views, automated scheduled broadcast cycles, hardened public exposure, and the complete recovery/scale acceptance suite.
+- Passing the working MVP gate does not waive or delete improvement requirements. It creates an earlier usable checkpoint before production/public-launch hardening.
+
 ### Local runtime
 
 - Docker Compose is the supported initial deployment path on the operator’s computer.
@@ -729,7 +736,7 @@ A Gustavo post answers:
 3. MVP access is invitation-only through expiring, single-use operator-issued tokens. Paid access remains a later commercial decision and does not alter the one-account/one-Brain/one-chat invariant.
 4. **Gustavo** is the product name, `https://gustavo.lol` is the canonical production origin, and “The market thinks out loud” remains the working tagline.
 5. The first deployment uses Docker Compose, PostgreSQL, and a durable local queue on the operator’s computer.
-6. The cloud-backup vendor and retention durations remain configurable; the design requires an S3-compatible target, local encryption, integrity checks, and restore drills.
+6. The cloud-backup vendor and retention durations remain configurable; before public production launch the design requires an S3-compatible target, local encryption, integrity checks, and restore drills. These are post-working-MVP improvements.
 7. Squarespace remains the registrar/DNS control point for initial deployment. DNS changes are a documented operator step performed only after local security and recovery verification pass.
 8. Public access from the self-hosted computer must use authenticated HTTPS through a hardened reverse proxy or outbound tunnel; the database and queue are never exposed directly, and router port-forwarding is not the default design.
 9. Hybrid memory retrieval initially uses PostgreSQL full-text search plus a vector extension; a separate vector database is deferred until measured scale requires it.
@@ -756,6 +763,20 @@ A Gustavo post answers:
 30. “Brain-like” means layered persistence, consolidation, associative retrieval, conflicts, goals, provenance, and forgetting controls—not sentience or hidden access.
 
 ## Change log
+
+### 2026-08-12 prompt-update: working MVP before improvement tranche
+
+Reason: During execution, the user requested a usable MVP from the completed backend before continuing the remaining work as improvements.
+
+Previous relevant intent preserved verbatim:
+
+> “The initial deployment runs on the operator’s computer and remains functional without a hosted application runtime or hosted database.”
+
+> “Encrypted cloud backup is required for recovery but is not part of the live request path.”
+
+> “Docker Compose is the supported initial deployment path on the operator’s computer.”
+
+The requirements remain committed, but delivery is now milestone-based. The first gate is a working local MVP using the completed T1–T26 backend plus T27–T29, the local-runtime portion of T30, T32, and an MVP slice of T34. Backup/restore hardening, T31 scale verification, T33 automated scheduling, and the remaining T34 proof follow as improvements before public production launch.
 
 ### 2026-08-08 prompt-update: public stock-commentary pivot
 

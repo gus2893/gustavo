@@ -20,6 +20,16 @@ export async function register(): Promise<void> {
         pollIntervalMs: 250,
       });
       void worker.done;
+      const privacyRuntime = await import("./lib/server/memory/forget");
+      const privacyWorker = privacyRuntime.startForgetPropagationWorker({
+        db: runtime.db,
+        cache: runtime,
+        workerId: "privacy-forget-production",
+        leaseMilliseconds: 30_000,
+        maximumSteps: 8,
+        pollIntervalMs: 250,
+      });
+      void privacyWorker.done;
     } catch (error) {
       await runtime.close();
       throw error;

@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 16 / 34
+- Tasks completed: 26 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -260,3 +260,13 @@
 - Spec review: passed after exact UTF-8 byte-range provenance, immutable canonical catalog and prohibited-content precedence, real source-linked Main memory and candidate-review projections, historical channel isolation, current schema/policy/effective/review/visibility gates, serialized prior-version chains, reciprocal durable verification receipts, append-only item lifecycle commands, source-key erasure, and database-authoritative archive receipts closed all contract gaps.
 - Quality review: passed after lifecycle alias reservation, exact null/type-safe SQL authority, pre-allocation input bounds, plaintext zeroization, and destructive-path analysis established that dependency-free Node cannot provide the required handle-bound conditional unlink. Automatic source removal was therefore removed entirely; the shipped path durably verifies the encrypted archive and digest-only public manifest, emits an authenticated exact manual-removal receipt outside the repository, preserves the source, and fails closed with `ARCHIVE_ATOMIC_REMOVAL_UNAVAILABLE`.
 - Scope: deterministic versioned classification into canonical, candidate, historical, deprecated, and prohibited lifecycle classes; exact local-source bytes, encrypted protected bodies, source-linked memory/review projections, immutable provenance and prior chains, concurrent idempotency, reviewed activation/deactivation/reactivation, independent count/hash/high-water verification, cryptographic forgetting, authenticated operator archives, and no imported-prose execution, hidden-memory reconstruction, model/network call, broker/exchange credential, CFT, real order, export, or external execution behavior. No ambiguous repository legacy file was archived or removed.
+
+### T26 — Add memory inspection, correction, archive, export, and forgetting controls
+
+- Status: completed
+- Commit: `T26: add durable privacy and memory controls` (resolve the single-task commit from Git history)
+- Red: focused regressions were captured before the controls module existed and later for cache resurrection, export snapshot commit inversion and growth, proposal/disclosure key survival, mixed-source propagation, missing projection families, untrusted workers, detached cache publication, keyless conversations, and live export cursors surviving a forget barrier.
+- Green: the final focused privacy suite passed 50/50; cache isolation/PostgreSQL passed 40/40; strict TypeScript and `git diff --check` passed under the pinned Node 24 runtime.
+- Spec review: passed after keyless conversations could establish an irreversible forget barrier and forgetting retired/pruned active account export snapshots so old cursors fail closed.
+- Quality review: passed with no Critical or Important findings; global Valkey namespace scanning during forget remains a non-blocking future performance optimization.
+- Scope: authorization-first memory inspection, source provenance, append-only correction/supersession, reversible archive/restore, bounded actor export snapshots, irreversible key-destruction forget barriers, registry-driven propagation, cache publication/read fencing, proposal/disclosure erasure, durable workers, and private no-store API routes.

@@ -132,8 +132,13 @@ The loop may create internal simulated orders only. It never connects to, places
 85. A trading day counts only when a newly opened paper position had at least 0.25% of stage starting balance in initial stop risk. Passing still requires target equity and three distinct qualifying UTC trading days.
 86. The initial stock/ETF simulation charges $0.005 per share with a $1 minimum per order, applies 5 basis points of adverse slippage per fill, uses an observed bid/ask spread when licensed quote data provides one or otherwise applies a 10-basis-point synthetic round-trip spread, charges 5% annualized short borrow by UTC day, and permits no leveraged gross exposure.
 87. The model layer is provider-neutral and requires separately configured Main, Node, and blind-evaluator model identities. Tests use a deterministic fake provider; production records provider, model, prompt, policy, token use, latency, and cost for every generation.
+88. A working local MVP is accepted first when the completed backend supports authenticated streaming, the public shell, private chat/memory/Challenge views, one-command local startup, static safety checks, and a browser smoke path from invitation through public redaction.
+89. Encrypted backup/restore hardening, million-event performance verification, automated scheduled broadcasts, hardened public exposure, and complete recovery/scale proof are improvement milestones after the working MVP and remain required before public production launch.
+90. MVP verification and improvement verification are reported as separate gates so the usable product is not blocked by later operational hardening.
 
 ## History
+
+- 2026-08-12 prompt-update: Re-sequenced delivery into a working local MVP first, followed by backup, scale, scheduling, and full-system hardening as improvements. Approval reset to `needs re-approval`.
 
 - 2026-08-08 prompt-update: Replaced the CFT-specific local paper-trade lab story with public stock-price commentary at the user’s request. Approval reset to `needs re-approval`.
 - 2026-08-08 prompt-update: Added sponsored public seats, stable Brain identities, Core Brain transmissions, recorded debates, winner selection, and a protected streaming feed. Approval remains `needs re-approval`.

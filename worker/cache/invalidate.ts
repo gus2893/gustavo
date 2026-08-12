@@ -3,11 +3,13 @@ import {
   cacheKey,
   cachePointerKey,
   projectionValueHash,
+  type CacheProtectedGuardContext,
   type CachePointerKeyInput,
   type CacheProjectionPublisher,
   type CriticalProjectionRecord,
   type CacheProjectionCategory,
 } from "../../lib/server/cache/store";
+import type { EventDatabase } from "../../lib/server/events/types";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const WORKER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/u;
@@ -46,6 +48,7 @@ export interface CacheChangeSource {
       readonly maxRows: number;
       readonly category?: CacheProjectionCategory;
     },
+    database?: EventDatabase,
   ): Promise<CacheProjectionChange>;
 }
 
@@ -60,7 +63,15 @@ export interface CacheJobClaim {
 
 export interface CacheJobRepository {
   claim(workerId: string, leaseMs: number): Promise<CacheJobClaim | null>;
-  complete(claim: CacheJobClaim, change?: CacheProjectionChange): Promise<void>;
+  guardTarget?(claim: CacheJobClaim): Promise<{
+    readonly key: ReturnType<typeof cachePointerKey>;
+    readonly operation: "WRITE" | "INVALIDATE";
+  } | null>;
+  complete(
+    claim: CacheJobClaim,
+    change?: CacheProjectionChange,
+    database?: EventDatabase,
+  ): Promise<void>;
   retry(claim: CacheJobClaim, errorCode: string): Promise<void>;
   fail(claim: CacheJobClaim, errorCode: string): Promise<void>;
 }
@@ -288,6 +299,16 @@ export type CacheJobProcessResult =
   | "FAILED"
   | "LEASE_LOST";
 
+function guardDatabase(context: CacheProtectedGuardContext): EventDatabase | undefined {
+  const candidate = context.database;
+  if (!candidate || typeof candidate !== "object") return undefined;
+  const value = candidate as Partial<EventDatabase>;
+  return typeof value.query === "function"
+      && typeof value.one === "function"
+      && typeof value.transaction === "function"
+    ? value as EventDatabase : undefined;
+}
+
 export async function processNextCacheJob(input: {
   readonly repository: CacheJobRepository;
   readonly source: CacheChangeSource;
@@ -304,38 +325,68 @@ export async function processNextCacheJob(input: {
   let attemptedAction: CacheProjectionChange["action"] | null = null;
   try {
     validateMessage(claim.message);
-    const change = await input.source.loadChange(claim.message.eventId, {
-      topic: claim.message.topic,
-      maxRows: MAX_CHANGE_SOURCE_ROWS,
-      ...(claim.message.category === undefined ? {} : { category: claim.message.category }),
-    });
-    if (change.triggerEventId !== claim.message.eventId
-        || change.sourceTopic !== claim.message.topic) {
-      throw new Error("CACHE_CHANGE_SOURCE_AUTHORITY_INVALID");
-    }
-    attemptedAction = change.action;
-    if (change.action === "PREWARM") {
-      validatePrewarmRecord(change.record, change.recordSourceEventId);
-      await input.cache.publish({
-        pointerKey: cachePointerKey(change.record.key),
-        versionKey: cacheKey(change.record.key),
-        versionOrdinal: change.record.versionOrdinal,
-        value: change.record.value,
-        options: {
-          ttlSeconds: change.record.key.namespace === "broadcast" ? 300 : 60,
-          encrypted: change.record.key.scope === "PRIVATE_ACCOUNT"
-            || change.record.key.scope === "OPERATOR",
-        },
-        sourceOccurredAt: claim.message.createdAt,
-      });
-    } else if (change.action === "INVALIDATE") {
-      await input.cache.invalidate(cachePointerKey(change.pointer), {
-        throughOrdinal: change.throughOrdinal,
-      });
+    const loadChange = async (database?: EventDatabase): Promise<CacheProjectionChange> => {
+      const change = await input.source.loadChange(claim.message.eventId, {
+        topic: claim.message.topic,
+        maxRows: MAX_CHANGE_SOURCE_ROWS,
+        ...(claim.message.category === undefined ? {} : { category: claim.message.category }),
+      }, database);
+      if (change.triggerEventId !== claim.message.eventId
+          || change.sourceTopic !== claim.message.topic) {
+        throw new Error("CACHE_CHANGE_SOURCE_AUTHORITY_INVALID");
+      }
+      attemptedAction = change.action;
+      return change;
+    };
+    const applyChange = async (
+      change: CacheProjectionChange,
+      database?: EventDatabase,
+    ): Promise<void> => {
+      if (change.action === "PREWARM") {
+        validatePrewarmRecord(change.record, change.recordSourceEventId);
+        await input.cache.publish({
+          pointerKey: cachePointerKey(change.record.key),
+          versionKey: cacheKey(change.record.key),
+          versionOrdinal: change.record.versionOrdinal,
+          value: change.record.value,
+          options: {
+            ttlSeconds: change.record.key.namespace === "broadcast" ? 300 : 60,
+            encrypted: change.record.key.scope === "PRIVATE_ACCOUNT"
+              || change.record.key.scope === "OPERATOR",
+          },
+          sourceOccurredAt: claim.message.createdAt,
+        });
+      } else if (change.action === "INVALIDATE") {
+        await input.cache.invalidate(cachePointerKey(change.pointer), {
+          throughOrdinal: change.throughOrdinal,
+        });
+      } else {
+        throw new Error("CACHE_CHANGE_ACTION_INVALID");
+      }
+      await input.repository.complete(claim, change, database);
+    };
+    const target = await input.repository.guardTarget?.(claim) ?? null;
+    if (target) {
+      await input.cache.withPublicationGuard(target.key, async (context) => {
+        const database = guardDatabase(context);
+        if (!database) throw new Error("CACHE_PROTECTED_TRANSACTION_REQUIRED");
+        const change = await loadChange(database);
+        const operation = change.action === "INVALIDATE" ? "INVALIDATE" : "WRITE";
+        if (target.operation !== operation) throw new Error("CACHE_JOB_GUARD_ACTION_MISMATCH");
+        await applyChange(change, database);
+      }, target.operation);
     } else {
-      throw new Error("CACHE_CHANGE_ACTION_INVALID");
+      const change = await loadChange();
+      const publicationKey = change.action === "PREWARM"
+        ? cacheKey(change.record.key) : cachePointerKey(change.pointer);
+      const protectedChange = change.action === "PREWARM"
+        ? change.record.key.scope === "PRIVATE_ACCOUNT"
+        : change.pointer.scope === "PRIVATE_ACCOUNT";
+      if (protectedChange) throw new Error("CACHE_JOB_PROTECTED_GUARD_TARGET_REQUIRED");
+      await input.cache.withPublicationGuard(publicationKey, async (context) => {
+        await applyChange(change, guardDatabase(context));
+      }, change.action === "INVALIDATE" ? "INVALIDATE" : "WRITE");
     }
-    await input.repository.complete(claim, change);
     return "COMPLETED";
   } catch (error) {
     // invalidate() records backend failures itself; source/authority failures

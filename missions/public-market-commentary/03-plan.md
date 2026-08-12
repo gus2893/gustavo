@@ -2,7 +2,7 @@
 
 **Design status:** approved
 **Plan status:** approved
-**Execution status:** not started
+**Execution status:** T1–T25 complete; T26 in progress; MVP-first remainder replanned
 
 ## Fixed implementation conventions
 
@@ -26,20 +26,20 @@
 - R9 → T11
 - R10 → T11
 - R11 → T1, T28
-- R12 → T1, T32
+- R12 → T1, T31
 - R13 → T25
-- R14 → T4, T32
-- R15 → T2, T5, T6, T7, T8, T9, T10, T33
+- R14 → T4, T31
+- R15 → T2, T5, T6, T7, T8, T9, T10, T35
 - R16 → T19, T21
 - R17 → T30
-- R18 → T30
-- R19 → T2, T30, T31
+- R18 → T33
+- R19 → T2, T30, T34, T36
 - R20 → T26
 - R21 → T19
 - R22 → T19, T21
 - R23 → T21, T23
 - R24 → T2, T19
-- R25 → T31
+- R25 → T34
 - R26 → T21
 - R27 → T26, T29
 - R28 → T12
@@ -50,7 +50,7 @@
 - R33 → T14, T16
 - R34 → T17
 - R35 → T18, T29
-- R36 → T32
+- R36 → T31
 - R37 → T9, T14
 - R38 → T10
 - R39 → T10
@@ -58,7 +58,7 @@
 - R41 → T9, T10
 - R42 → T10
 - R43 → T3, T7, T8
-- R44 → T8, T27, T33
+- R44 → T8, T27, T35
 - R45 → T21, T23
 - R46 → T7
 - R47 → T7
@@ -71,17 +71,17 @@
 - R54 → T24
 - R55 → T24
 - R56 → T24
-- R57 → T24, T30
+- R57 → T24, T30, T33
 - R58 → T23, T24
-- R59 → T31
+- R59 → T34
 - R60 → T25
 - R61 → T25
 - R62 → T25
 - R63 → T25
-- R64 → T25, T32
+- R64 → T25, T31
 - R65 → T25
 - R66 → T25
-- R67 → T25, T32
+- R67 → T25, T31
 - R68 → T25
 - R69 → T5, T20
 - R70 → T19, T22
@@ -92,7 +92,7 @@
 - R75 → T21
 - R76 → T26
 - R77 → T20
-- R78 → T21, T31
+- R78 → T21, T34
 - R79 → T22
 - R80 → T1, T28
 - R81 → T3
@@ -102,7 +102,10 @@
 - R85 → T17
 - R86 → T13, T16
 - R87 → T6
-- R1–R87 integrated acceptance path → T34
+- R88 → T26, T27, T28, T29, T30, T31, T32
+- R89 → T33, T34, T35, T36
+- R90 → T32, T36
+- R1–R90 integrated acceptance paths → T32, T36
 
 ## Task list
 
@@ -1521,7 +1524,7 @@ Yes. It imports explicit local knowledge without altering current market state o
 ### T26 — Support memory inspection, correction, export, and cryptographic forgetting
 
 **Maps to:** R20, R27, R76
-**Files touched:** `db/migrations/0019_privacy_controls.sql` (new), `lib/server/memory/controls.ts` (new), `lib/server/memory/forget.ts` (new), `app/api/memory/route.ts` (new), `app/api/account/export/route.ts` (new), `tests/helpers/postgres.ts` (modify), `tests/privacy/forget-propagation.test.ts` (new)
+**Files touched:** `db/migrations/0019_privacy_controls.sql` (new), `lib/server/memory/controls.ts` (new), `lib/server/memory/forget.ts` (new), `app/api/memory/route.ts` (new), `app/api/account/export/route.ts` (new), `instrumentation.ts` (modify), `lib/server/cache/store.ts` (modify), `lib/server/cache/runtime.ts` (modify), `lib/server/cache/postgres.ts` (modify), `worker/cache/invalidate.ts` (modify), `tests/helpers/postgres.ts` (modify), `tests/privacy/forget-propagation.test.ts` (new)
 
 #### Red — failing test
 
@@ -1733,64 +1736,228 @@ Yes. It contains only authenticated presentation over already-reviewed APIs.
 
 ---
 
-### T30 — Run locally with encrypted verified backup and isolated restore
+### T30 — Boot the working MVP locally with one command
 
-**Maps to:** R17, R18, R19, R57
-**Files touched:** `infra/compose.yaml` (new), `infra/env.example` (new), `infra/backup/create.ps1` (new), `infra/backup/verify.ps1` (new), `infra/backup/restore-drill.ps1` (new), `docs/OPERATIONS.md` (new), `tests/infra/compose-backup.test.ts` (new)
+**Maps to:** R17, R19, R57, R88
+**Files touched:** `infra/compose.yaml` (new), `infra/env.example` (new), `docs/OPERATIONS.md` (new), `tests/infra/local-runtime.test.ts` (new), `package.json` (modify)
 
 #### Red — failing test
 
-File: `tests/infra/compose-backup.test.ts`
+File: `tests/infra/local-runtime.test.ts`
 
 ```ts
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
-describe("local runtime and backup contract", () => {
-  it("keeps state durable and public exposure away from database services", async () => {
+describe("working MVP local runtime", () => {
+  it("starts the web, worker, database, and cache without publishing data services", async () => {
     const compose = parse(await readFile("infra/compose.yaml", "utf8"));
+    const pkg = JSON.parse(await readFile("package.json", "utf8"));
     expect(Object.keys(compose.services)).toEqual(expect.arrayContaining(["web", "worker", "postgres", "valkey"]));
     expect(compose.services.postgres.ports).toBeUndefined();
     expect(compose.services.valkey.ports).toBeUndefined();
     expect(Object.keys(compose.volumes)).toContain("postgres-data");
-  });
-
-  it("provides create, verify, and isolated restore commands", async () => {
-    for (const file of ["infra/backup/create.ps1", "infra/backup/verify.ps1", "infra/backup/restore-drill.ps1"]) {
-      expect((await readFile(file, "utf8")).length).toBeGreaterThan(100);
-    }
+    expect(pkg.scripts["mvp:start"]).toContain("infra/compose.yaml");
   });
 });
 ```
 
-Expected initial state: the test exits 1 because Compose, durable volumes, backup scripts, and the operations runbook do not exist.
+Expected initial state: the test exits 1 because the local Compose contract and `mvp:start` command do not exist.
 
 #### Green — minimum implementation
 
-- Define web, worker, PostgreSQL with vector extension, and Valkey services with health checks, restart policy, local durable volumes, internal networking, and no direct database/queue publication.
-- Create database-consistent encrypted S3-compatible backups with manifest, checksum, schema version, event high-water, key version, and least-privilege credentials outside the archive.
-- Verify every backup and restore into a separately named isolated database; document HTTPS reverse-proxy/outbound-tunnel setup while leaving Squarespace DNS changes as an operator step.
+- Define health-checked web, worker, PostgreSQL, and Valkey services on an internal network with durable PostgreSQL data and no published database/cache ports.
+- Add `pnpm mvp:start` and document configuration, startup, health verification, logs, shutdown, and local browser access.
+- Keep public TLS/DNS and backup credentials out of this local MVP task.
 
 #### Refactor
 
-- Share manifest validation between backup verification and restore drill.
+- Share environment names between Compose and `infra/env.example`; never embed secrets in either file.
 
 #### Verify
 
-Command: `pnpm vitest run tests/infra/compose-backup.test.ts && docker compose -f infra/compose.yaml config --quiet && powershell -NoProfile -File infra/backup/restore-drill.ps1 -UseFixture`
+Command: `pnpm vitest run tests/infra/local-runtime.test.ts && docker compose -f infra/compose.yaml config --quiet`
 
-Expected: 2 passing tests, valid Compose configuration, successful fixture restore with matching checksum/high-water mark, and exit code 0.
+Expected: 1 passing test, valid Compose configuration, and exit code 0.
 
 #### Reviewable as a unit?
 
-Yes. It packages established services and proves recoverability without publishing them.
+Yes. It packages only the already-built services into a usable local runtime.
 
 ---
 
-### T31 — Measure durability, cache, recall, queue, and model health budgets
+### T31 — Gate the MVP against execution behavior, secrets, unsafe claims, and protected public payloads
 
-**Maps to:** R19, R25, R59, R78
+**Maps to:** R12, R14, R36, R64, R67, R88
+**Files touched:** `scripts/validate.ps1` (replace), `tests/security/static-boundaries.test.ts` (new), `docs/SECURITY.md` (new), `docs/PRIVACY.md` (new), `docs/TERMS.md` (new), `docs/DATA_POLICY.md` (new)
+
+#### Red — failing test
+
+File: `tests/security/static-boundaries.test.ts`
+
+```ts
+import { readFile } from "node:fs/promises";
+import { glob } from "glob";
+import { describe, expect, it } from "vitest";
+import { projectFeedEvent } from "../../lib/server/dal/feed";
+
+describe("Gustavo MVP safety boundary", () => {
+  it("contains no execution adapter, public secret, or protected public payload", async () => {
+    const files = await glob(["app/**/*.{ts,tsx}", "lib/**/*.{ts,tsx}", "worker/**/*.ts"], { nodir: true });
+    const source = (await Promise.all(files.map((file) => readFile(file, "utf8")))).join("\n");
+    for (const forbidden of ["placeRealOrder", "NEXT_PUBLIC_MODEL_KEY", "NEXT_PUBLIC_MARKET_DATA_KEY"]) {
+      expect(source).not.toContain(forbidden);
+    }
+    const dto = projectFeedEvent({ role: "PUBLIC" }, {
+      id: "e1", accountId: "acct-a", type: "brain.response.completed",
+      createdAt: "2026-08-09T12:00:00.000Z", protectedText: "secret thesis", topic: "AAPL",
+    });
+    expect(JSON.stringify(dto)).not.toContain("secret thesis");
+  });
+
+  it("ships required privacy and simulation disclosures", async () => {
+    expect(await readFile("docs/PRIVACY.md", "utf8")).toContain("export and forgetting");
+    expect(await readFile("docs/TERMS.md", "utf8")).toContain("SIMULATION ONLY — NOT A REAL TRADE");
+    expect(await readFile("docs/DATA_POLICY.md", "utf8")).toContain("authorized external chat import");
+  });
+});
+```
+
+Expected initial state: the test exits 1 because the final validator and public policy documents do not exist.
+
+#### Green — minimum implementation
+
+- Scan active code and configuration for execution connectivity, public secret names, unsafe claims, and active prohibited imports.
+- Snapshot public DTO/HTML boundaries and fail if protected body fixtures appear.
+- Document privacy, data controls, simulation-only terms, threat model, key rotation, incident response, and required legal review before public launch.
+
+#### Refactor
+
+- Exclude audit-only migration evidence through an explicit path allowlist rather than weakening active-code scans.
+
+#### Verify
+
+Command: `pnpm vitest run tests/security/static-boundaries.test.ts && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 && git diff --check`
+
+Expected: all security tests pass, validation exits 0, diff check is clean, and the command exits 0.
+
+#### Reviewable as a unit?
+
+Yes. It is a read-only safety gate over the MVP tree.
+
+---
+
+### T32 — Prove the working MVP browser path
+
+**Maps to:** R1–R17, R20–R24, R27–R58, R69–R76, R80–R88, R90
+**Files touched:** `playwright.config.ts` (new), `tests/e2e/gustavo-mvp.spec.ts` (new), `tests/e2e/fixtures.ts` (new), `docs/SMOKE_TEST.md` (new)
+
+#### Red — failing test
+
+File: `tests/e2e/gustavo-mvp.spec.ts`
+
+```ts
+import { expect, test } from "@playwright/test";
+import { issueInvitation, seedLicensedObservation } from "./fixtures";
+
+test("an invited user can use the local Gustavo MVP without leaking private text", async ({ page, request }) => {
+  const invitation = await issueInvitation(request);
+  await page.goto(`/join?token=${invitation}`);
+  await page.getByLabel("Display name").fill("Ada");
+  await page.getByLabel("Passphrase").fill("correct horse battery staple");
+  await page.getByRole("button", { name: "Create account" }).click();
+  await expect(page.getByRole("heading", { name: "Your Node Brain" })).toBeVisible();
+  await seedLicensedObservation(request, { symbol: "AAPL", price: "100.00", feedStatus: "DELAYED", delaySeconds: 900 });
+  await page.getByLabel("Message").fill("private completed-close thesis");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.getByText(/Main Brain|Node Brain/)).toBeVisible();
+  await page.goto("/challenge");
+  await expect(page.getByText("SIMULATION ONLY — NOT A REAL TRADE")).toBeVisible();
+  await page.goto("/chat");
+  await expect(page.getByRole("button", { name: "Inspect memories" })).toBeVisible();
+  await page.context().clearCookies();
+  await page.goto("/");
+  await expect(page.getByTestId("public-feed")).not.toContainText("private completed-close thesis");
+});
+```
+
+Expected initial state: the test exits 1 because the MVP browser fixture and integrated pages do not exist.
+
+#### Green — minimum implementation
+
+- Wire invitation, authenticated chat, deterministic model/market fixtures, memory controls, Challenge view, SSE, and the public shell into one isolated local E2E stack.
+- Keep fixture endpoints test-only and fail production startup if they are enabled.
+- Document the same manual smoke path and its expected visible labels.
+
+#### Refactor
+
+- Centralize deterministic E2E identities and cleanup in `tests/e2e/fixtures.ts`.
+
+#### Verify
+
+Command: `pnpm playwright test tests/e2e/gustavo-mvp.spec.ts && pnpm exec tsc --noEmit && pnpm build`
+
+Expected: the MVP browser test passes, TypeScript and production build exit 0, and the combined command exits 0.
+
+#### Reviewable as a unit?
+
+Yes. It adds integration wiring and an explicit MVP acceptance gate without backup or scale work.
+
+---
+
+### T33 — Add encrypted verified backup and isolated restore as an improvement
+
+**Maps to:** R18, R57, R89
+**Files touched:** `infra/backup/create.ps1` (new), `infra/backup/verify.ps1` (new), `infra/backup/restore-drill.ps1` (new), `docs/OPERATIONS.md` (modify), `tests/infra/backup-restore.test.ts` (new)
+
+#### Red — failing test
+
+File: `tests/infra/backup-restore.test.ts`
+
+```ts
+import { readFile } from "node:fs/promises";
+import { describe, expect, it } from "vitest";
+
+describe("encrypted backup and isolated restore", () => {
+  it("provides create, verify, and isolated restore commands with manifest checks", async () => {
+    for (const file of ["infra/backup/create.ps1", "infra/backup/verify.ps1", "infra/backup/restore-drill.ps1"]) {
+      const source = await readFile(file, "utf8");
+      expect(source.length).toBeGreaterThan(100);
+      expect(source).toMatch(/checksum|manifest/i);
+    }
+    expect(await readFile("infra/backup/create.ps1", "utf8")).toMatch(/encrypt/i);
+  });
+});
+```
+
+Expected initial state: the test exits 1 because backup creation, verification, and isolated restore scripts do not exist.
+
+#### Green — minimum implementation
+
+- Create database-consistent, locally encrypted, S3-compatible backups with checksum, schema version, event high-water, and key version.
+- Verify artifacts before upload and restore into a separately named database without touching the active database.
+- Document retention, least-privilege credentials, restore drills, and hardened HTTPS/DNS steps for later public exposure.
+
+#### Refactor
+
+- Share one manifest validator between verification and restore.
+
+#### Verify
+
+Command: `pnpm vitest run tests/infra/backup-restore.test.ts && powershell -NoProfile -File infra/backup/restore-drill.ps1 -UseFixture`
+
+Expected: 1 passing test, a successful isolated fixture restore with matching checksum/high-water, and exit code 0.
+
+#### Reviewable as a unit?
+
+Yes. It adds recovery around the already-running local MVP.
+
+---
+
+### T34 — Measure durability, cache, recall, queue, and model health budgets
+
+**Maps to:** R19, R25, R59, R78, R89
 **Files touched:** `lib/server/observability/metrics.ts` (new), `app/api/operator/health/route.ts` (new), `tests/performance/seed-million.ts` (new), `tests/performance/recall-latency.test.ts` (new), `docs/PERFORMANCE.md` (new)
 
 #### Red — failing test
@@ -1804,7 +1971,6 @@ import { benchmarkRecall } from "../../lib/server/observability/metrics";
 
 describe("reference recall budgets", () => {
   beforeAll(async () => seedMillionMemoryFixture(), 600_000);
-
   it("keeps warm scoped recall and cached handoffs within budget", async () => {
     const result = await benchmarkRecall({ iterations: 200, warmup: 20, excludeModelGeneration: true });
     expect(result.sourceEventCount).toBeGreaterThanOrEqual(1_000_000);
@@ -1815,104 +1981,33 @@ describe("reference recall budgets", () => {
 });
 ```
 
-Expected initial state: the test exits 1 because reference fixture generation, latency instrumentation, and operator metrics do not exist.
+Expected initial state: the test exits 1 because fixture generation, latency instrumentation, and operator metrics do not exist.
 
 #### Green — minimum implementation
 
-- Instrument event commit, outbox/queue age, projection freshness, cache hit/miss/stale rejection, fallback-query latency, rebuild throughput, model latency/cost, and divergence.
-- Add a reproducible one-million-event fixture with known-answer, conflict, temporal, permission, provenance, and stale-memory query cases.
-- Publish authenticated operator health metrics and benchmark p50/p95/p99, cache state, machine profile, and query plans.
+- Instrument commit, queue age, projection freshness, cache state, fallback latency, rebuild throughput, model cost, and divergence with bounded labels.
+- Add the reproducible million-event known-answer/permission/conflict/temporal fixture.
+- Publish authenticated operator health plus p50/p95/p99 and query-plan evidence.
 
 #### Refactor
 
-- Keep metric names and labels bounded to avoid per-account or per-symbol cardinality explosions.
+- Prevent account/symbol identifiers from becoming metric labels.
 
 #### Verify
 
 Command: `pnpm vitest run tests/performance/recall-latency.test.ts --testTimeout=600000`
 
-Expected: the one-million-event fixture reports warm recall p95 at or below 250 ms, cached handoff p95 at or below 100 ms, zero unbounded queries, and exit code 0.
+Expected: warm recall p95 is at most 250 ms, cached handoff p95 is at most 100 ms, unbounded query count is zero, and exit code is 0.
 
 #### Reviewable as a unit?
 
-Yes. It observes and benchmarks existing paths without changing their semantics.
+Yes. It measures existing behavior without altering product semantics.
 
 ---
 
-### T32 — Block execution behavior, secrets, unsafe claims, and protected public payloads
+### T35 — Open scheduled Main broadcast cycles idempotently
 
-**Maps to:** R12, R14, R36, R64, R67
-**Files touched:** `scripts/validate.ps1` (replace), `tests/security/static-boundaries.test.ts` (new), `docs/SECURITY.md` (new), `docs/PRIVACY.md` (new), `docs/TERMS.md` (new), `docs/DATA_POLICY.md` (new)
-
-#### Red — failing test
-
-File: `tests/security/static-boundaries.test.ts`
-
-```ts
-import { readFile } from "node:fs/promises";
-import { glob } from "glob";
-import { describe, expect, it } from "vitest";
-import { projectFeedEvent } from "../../lib/server/dal/feed";
-
-describe("Gustavo static safety boundaries", () => {
-  it("contains no execution adapter, public secret, or active prohibited import", async () => {
-    const files = await glob(["app/**/*.{ts,tsx}", "lib/**/*.{ts,tsx}", "worker/**/*.ts", "policy/**/*.json"], { nodir: true });
-    const source = (await Promise.all(files.map((file) => readFile(file, "utf8")))).join("\n");
-    for (const forbidden of ["trade.cmd", "brokerOrder", "placeRealOrder", "NEXT_PUBLIC_MODEL_KEY", "NEXT_PUBLIC_MARKET_DATA_KEY"]) {
-      expect(source).not.toContain(forbidden);
-    }
-    expect(source).not.toMatch(/PROHIBITED[\s\S]{0,120}active\s*:\s*true/);
-  });
-
-  it("keeps protected words out of a serialized public payload", () => {
-    const dto = projectFeedEvent({ role: "PUBLIC" }, {
-      id: "e1", accountId: "acct-a", type: "brain.response.completed",
-      createdAt: "2026-08-09T12:00:00.000Z", protectedText: "secret thesis", topic: "AAPL",
-    });
-    expect(JSON.stringify(dto)).not.toContain("secret thesis");
-  });
-
-  it("ships the public privacy, terms, and data-control disclosures", async () => {
-    const privacy = await readFile("docs/PRIVACY.md", "utf8");
-    const terms = await readFile("docs/TERMS.md", "utf8");
-    const data = await readFile("docs/DATA_POLICY.md", "utf8");
-    expect(privacy).toContain("private Node Brain conversation");
-    expect(privacy).toContain("export and forgetting");
-    expect(terms).toContain("SIMULATION ONLY — NOT A REAL TRADE");
-    expect(terms).toContain("not individualized financial advice");
-    expect(data).toContain("authorized external chat import");
-  });
-});
-```
-
-Expected initial state: the test exits 1 because the old validation script and repository still describe superseded export/CFT structures and no public payload snapshot test exists.
-
-#### Green — minimum implementation
-
-- Replace legacy validation with JSON/schema checks, forbidden execution/connectivity/credential terms in active code, secret-name scans, lifecycle isolation checks, and required disclaimer checks.
-- Snapshot public HTML/RSC/API payloads and prove protected body fixtures never appear.
-- Document threat model, operator access audit, key rotation, incident response, rate limits, origin/CSRF protections, and the fact that authorized displayed text can be copied.
-- Add public privacy, terms, and data-policy drafts that disclose private Node scope, authorized proposal summaries, external imports, model providers, retention, export/forgetting, delayed data, educational commentary, and simulation-only performance; obtain qualified legal review before public launch.
-
-#### Refactor
-
-- Keep audit-only migration documents excluded through an explicit path allowlist rather than weakening active-code scans.
-
-#### Verify
-
-Command: `pnpm vitest run tests/security/static-boundaries.test.ts && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1 && git diff --check`
-
-Expected: all security tests pass, repository validation exits 0, and `git diff --check` reports no whitespace errors.
-
-#### Reviewable as a unit?
-
-Yes. It is an independent safety gate over the completed tree.
-
----
-
-### T33 — Open scheduled Main broadcast cycles idempotently
-
-**Maps to:** R15, R44
+**Maps to:** R15, R44, R89
 **Files touched:** `db/migrations/0020_broadcast_schedules.sql` (new), `lib/server/main-brain/schedules.ts` (new), `worker/broadcasts/scheduler.ts` (new), `tests/broadcasts/scheduler.test.ts` (new)
 
 #### Red — failing test
@@ -1925,30 +2020,28 @@ import { openDueBroadcastCycles } from "../../lib/server/main-brain/schedules";
 import { testContext } from "../helpers/postgres";
 
 describe("Main broadcast scheduler", () => {
-  it("opens one durable cycle for one due schedule slot across retries", async () => {
+  it("opens one Main-authored durable cycle per due slot across retries", async () => {
     const ctx = await testContext();
     await ctx.db.query("insert into broadcast_schedules(id, cron, timezone, enabled) values ($1,$2,$3,true)", ["market-cycle", "*/15 * * * 1-5", "UTC"]);
     await openDueBroadcastCycles(ctx, new Date("2026-08-10T14:30:00.000Z"));
     await openDueBroadcastCycles(ctx, new Date("2026-08-10T14:30:00.000Z"));
-    expect(await ctx.db.one("select count(*)::int as count from broadcast_cycles where schedule_id=$1 and slot_at=$2", ["market-cycle", "2026-08-10T14:30:00.000Z"]))
-      .toEqual({ count: 1 });
-    expect(await ctx.db.one("select author_type from broadcast_cycles where schedule_id=$1", ["market-cycle"]))
-      .toEqual({ author_type: "MAIN_BRAIN" });
+    expect(await ctx.db.one("select count(*)::int as count, min(author_type) as author_type from broadcast_cycles where schedule_id=$1 and slot_at=$2", ["market-cycle", "2026-08-10T14:30:00.000Z"]))
+      .toEqual({ count: 1, author_type: "MAIN_BRAIN" });
   });
 });
 ```
 
-Expected initial state: the test exits 1 because persisted schedules, unique schedule slots, and the scheduler worker do not exist.
+Expected initial state: the test exits 1 because persisted schedules, unique slots, and the scheduler worker do not exist.
 
 #### Green — minimum implementation
 
-- Add operator-managed versioned cron schedules, timezone, enabled state, next-run projection, cycle slots, and uniqueness on schedule/slot.
-- Let the worker open a cycle and snapshot current Main/policy/market-data versions; retries replay the same cycle ID.
-- Queue Main generation through T6 and commit through T8; no Node may become scheduled-message author.
+- Add versioned operator-managed schedules, timezone, enablement, next-run projection, and unique schedule/slot cycles.
+- Snapshot current Main/policy/market-data versions and queue generation through the existing model/broadcast paths.
+- Make retries replay the same cycle; never permit Node authorship.
 
 #### Refactor
 
-- Keep cron calculation pure and clock-injected so daylight/time-boundary cases remain deterministic.
+- Keep cron calculation pure and clock-injected.
 
 #### Verify
 
@@ -1958,69 +2051,58 @@ Expected: 1 passing test and exit code 0.
 
 #### Reviewable as a unit?
 
-Yes. It adds only schedule-to-cycle orchestration over existing broadcast behavior.
+Yes. It adds only schedule-to-cycle orchestration.
 
 ---
 
-### T34 — Prove the complete Main/Node/memory/Challenge vertical slice
+### T36 — Prove complete production-readiness improvements
 
-**Maps to:** R1–R87
-**Files touched:** `playwright.config.ts` (new), `tests/e2e/gustavo-vertical-slice.spec.ts` (new), `tests/e2e/fixtures.ts` (new), `docs/SMOKE_TEST.md` (new)
+**Maps to:** R1–R90
+**Files touched:** `tests/e2e/gustavo-production-readiness.spec.ts` (new), `tests/e2e/fixtures.ts` (modify), `docs/PRODUCTION_CHECKLIST.md` (new), `docs/SMOKE_TEST.md` (modify)
 
 #### Red — failing test
 
-File: `tests/e2e/gustavo-vertical-slice.spec.ts`
+File: `tests/e2e/gustavo-production-readiness.spec.ts`
 
 ```ts
 import { expect, test } from "@playwright/test";
-import { issueInvitation, seedLicensedObservation, waitForEvent } from "./fixtures";
+import { createVerifiedBackup, restoreFixture, restartCache, waitForScheduledBroadcast } from "./fixtures";
 
-test("one account contributes a better idea to the shared simulated Challenge", async ({ page, request }) => {
-  const invitation = await issueInvitation(request);
-  await page.goto(`/join?token=${invitation}`);
-  await page.getByLabel("Display name").fill("Ada");
-  await page.getByLabel("Passphrase").fill("correct horse battery staple");
-  await page.getByRole("button", { name: "Create account" }).click();
-  await expect(page.getByRole("heading", { name: "Your Node Brain" })).toBeVisible();
-
-  await seedLicensedObservation(request, { symbol: "AAPL", price: "100.00", feedStatus: "DELAYED", delaySeconds: 900 });
-  await page.getByLabel("Message").fill("The completed close rejects resistance; compare that with the Main view.");
-  await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText("Proposal sent to the Main Brain")).toBeVisible();
-
-  const selected = await waitForEvent(request, "decision.selected");
-  expect(selected).toMatchObject({ winnerType: "NODE", mainScore: 82, winnerScore: 87, rubricVersion: "v1" });
-  await page.goto("/challenge");
-  await expect(page.getByText("SIMULATION ONLY — NOT A REAL TRADE")).toBeVisible();
-  await expect(page.getByText("$2,500.00 → $2,750.00")).toBeVisible();
-
-  await page.context().clearCookies();
+test("the hardened system recovers and resumes without leaking protected data", async ({ page }) => {
+  const backup = await createVerifiedBackup();
+  expect(backup.verified).toBe(true);
+  const restored = await restoreFixture(backup);
+  expect(restored.eventHighWater).toBe(backup.eventHighWater);
+  await restartCache();
   await page.goto("/");
-  await expect(page.getByTestId("public-feed")).not.toContainText("The completed close rejects resistance");
+  await expect(page.getByTestId("public-feed")).toBeVisible();
+  const broadcast = await waitForScheduledBroadcast();
+  expect(broadcast.authorType).toBe("MAIN_BRAIN");
+  expect(broadcast.protectedText).toBeUndefined();
 });
 ```
 
-Expected initial state: the test exits 1 because no integrated Gustavo application or browser fixture exists.
+Expected initial state: the test exits 1 because improvement fixtures and the production-readiness checklist do not exist.
 
 #### Green — minimum implementation
 
-- Wire the approved routes, workers, database, Valkey, deterministic model and market-data fixtures, evaluator, Challenge engine, memory jobs, SSE, and pages into one isolated E2E stack.
-- Seed a committed Main score of 82 and a hard-gate-passing Node score of 87 so the exact 5-point rule produces one internal paper intent while keeping all real execution absent.
-- Document the corresponding human smoke path: invitation, one chat, Main/Node labeling, proposal provenance, Challenge simulation, memory inspection, public redaction, cache restart, and backup restore.
+- Wire backup verification/restore, cache loss/rebuild, scheduled broadcast, operator health, and protected-public-boundary checks into one isolated acceptance environment.
+- Keep all fixture endpoints test-only and assert they cannot start in production.
+- Document the final operator checklist covering local health, TLS/DNS, recovery, metrics, legal review, secret rotation, and incident response.
 
 #### Refactor
 
-- Keep E2E fixture endpoints compiled only under the test environment and fail production startup if they are enabled.
+- Reuse the MVP fixture identities and isolate improvement-only recovery helpers.
 
 #### Verify
 
-Command: `pnpm playwright test tests/e2e/gustavo-vertical-slice.spec.ts && pnpm test && pnpm exec tsc --noEmit && pnpm build`
+Command: `pnpm playwright test tests/e2e/gustavo-production-readiness.spec.ts && pnpm test && pnpm exec tsc --noEmit && pnpm build`
 
-Expected: the vertical slice passes, all unit/integration tests pass, TypeScript exits 0, the production build succeeds, and the combined command exits 0.
+Expected: production-readiness E2E, full tests, TypeScript, and build all pass with exit code 0.
 
 #### Reviewable as a unit?
 
-Yes. It adds only integration wiring and acceptance proof over previously reviewed subsystems.
+Yes. It contains acceptance proof only; product subsystems are already independently reviewed.
 
 ---
 
@@ -2039,8 +2121,8 @@ Yes. It adds only integration wiring and acceptance proof over previously review
 - [x] Authorization precedes retrieval, graph expansion, cache access, and DTO projection.
 - [x] No task introduces real execution, broker/prop integration, credentials, or protected public text.
 
-Audit result: 87 unique requirement mappings, 34 sequential tasks, 34 red/green/refactor/verify sets, 34 listed test files with 34 complete test snippets, no forbidden placeholder phrases, and a clean `git diff --check`.
+Audit result: 90 unique requirement mappings, 36 sequential tasks, 36 red/green/refactor/verify sets, 36 listed test files with complete test snippets, an explicit MVP gate at T32, an improvement gate at T36, no forbidden placeholder phrases, and a clean `git diff --check`.
 
 ## Exit gate
 
-Plan approved. Next: `mcax-execute`. Execution is intentionally not started while the user remains in planning mode.
+Plan approved. Next: `mcax-execute`. Resume the in-progress T26 review, then execute T27–T32 for the working MVP before T33–T36 improvements.

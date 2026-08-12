@@ -31,6 +31,15 @@ import {
   openDecisionWindow,
   recordEvaluation,
 } from "../../lib/server/orchestration/decision-window";
+import { appendMessage } from "../../lib/server/history/messages";
+import {
+  createMemoryWorkerContext,
+  processMemoryEvent,
+} from "../../worker/consolidation/process-event";
+import {
+  createMemoryGraphWriterContext,
+  versionMemoryGraph,
+} from "../../lib/server/consolidation/graph";
 
 const execFileAsync = promisify(execFile);
 const TEST_CLUSTER_PREFIX = "gustavo-postgres-";
@@ -47,7 +56,25 @@ export interface ConversationFixture {
   readonly accountId: string;
   readonly nodeBrainId: string;
   readonly conversationId: string;
+  readonly sessionId: string;
   readonly sessionToken: string;
+}
+
+export interface ProtectedConversationFixture extends ConversationFixture {
+  readonly sourceEventId: string;
+  readonly memoryIds: readonly string[];
+  readonly dataKeyId: string;
+  readonly keys: {
+    exists(dataKeyId: string): Promise<boolean>;
+  };
+  readonly cache: {
+    find(text: string): Promise<readonly string[]>;
+    purgeConversation(input: {
+      readonly accountId: string;
+      readonly nodeBrainId: string;
+      readonly conversationId: string;
+    }): Promise<void>;
+  };
 }
 
 export interface ChallengeFixture {
@@ -723,8 +750,141 @@ export async function createConversationFixture(
     accountId,
     nodeBrainId,
     conversationId,
+    sessionId,
     sessionToken,
   };
+}
+
+class ProtectedConversationCache {
+  readonly #values = new Map<string, { readonly conversationId: string; readonly text: string }>();
+
+  seed(conversationId: string, text: string): void {
+    this.#values.set(`${conversationId}:${this.#values.size}`, { conversationId, text });
+  }
+
+  async find(text: string): Promise<readonly string[]> {
+    return Object.freeze([...this.#values.values()]
+      .filter((value) => value.text.includes(text)).map(({ text: value }) => value));
+  }
+
+  async purgeConversation(input: { readonly conversationId: string }): Promise<void> {
+    for (const [key, value] of this.#values) {
+      if (value.conversationId === input.conversationId) this.#values.delete(key);
+    }
+  }
+}
+
+export async function seedProtectedConversation(
+  label: string,
+  text: string,
+  database?: TestDatabase,
+): Promise<ProtectedConversationFixture> {
+  const fixture = await createConversationFixture(label, database);
+  const message = await appendMessage({
+    db: fixture.db,
+    accountId: fixture.accountId,
+    conversationId: fixture.conversationId,
+  }, {
+    role: "USER",
+    text,
+    idempotencyKey: `privacy-source:${label}`,
+  });
+  const sourceAt = message.occurredAt;
+  const observedAt = new Date(new Date(sourceAt).getTime() + 1).toISOString();
+  const projected = await processMemoryEvent(createMemoryWorkerContext(fixture.db), {
+    scope: "PRIVATE_ACCOUNT",
+    accountId: fixture.accountId,
+    nodeBrainId: fixture.nodeBrainId,
+    conversationId: fixture.conversationId,
+    sourceEventId: message.eventId,
+    events: [{ id: message.eventId, at: sourceAt, text }],
+    extracted: {
+      facts: [{
+        text,
+        sourceIds: [message.eventId],
+        keywords: ["secret", "preference"],
+        entities: ["privacy-subject"],
+        embedding: [0.25, -0.5, 0.75],
+      }, {
+        text: `Context for ${text}`,
+        sourceIds: [message.eventId],
+        keywords: ["context", "preference"],
+        entities: ["privacy-context"],
+      }],
+    },
+    versions: {
+      promptVersion: "privacy-fixture-prompt-v1",
+      modelVersion: "deterministic-privacy-fixture-v1",
+      extractorVersion: "privacy-fixture-extractor-v1",
+      embeddingVersion: "privacy-fixture-embedding-v1",
+    },
+    observedAt,
+    idempotencyKey: `privacy-consolidation:${label}`,
+  });
+  const entityOne = randomUUID();
+  const entityTwo = randomUUID();
+  const firstMemory = projected.memories[0]!;
+  const secondMemory = projected.memories[1]!;
+  await versionMemoryGraph(createMemoryGraphWriterContext(fixture.db), {
+    scope: "PRIVATE_ACCOUNT",
+    accountId: fixture.accountId,
+    nodeBrainId: fixture.nodeBrainId,
+    conversationId: fixture.conversationId,
+    idempotencyKey: `privacy-graph:${label}`,
+    reconcilerVersion: "temporal-memory-graph-v2",
+    observedAt: new Date(new Date(sourceAt).getTime() + 2).toISOString(),
+    entities: [{
+      id: entityOne,
+      type: "METHOD",
+      canonicalName: firstMemory.entities[0]!,
+      validFrom: sourceAt,
+      aliases: [{ alias: firstMemory.entities[0]!, validFrom: sourceAt, sourceIds: [message.eventId] }],
+    }, {
+      id: entityTwo,
+      type: "METHOD",
+      canonicalName: secondMemory.entities[0]!,
+      validFrom: sourceAt,
+      aliases: [{ alias: secondMemory.entities[0]!, validFrom: sourceAt, sourceIds: [message.eventId] }],
+    }],
+    claims: [{
+      memoryId: firstMemory.id,
+      entityId: entityOne,
+      nodeType: "FACT",
+      predicate: firstMemory.keywords[0]!,
+      value: firstMemory.keywords[1]!,
+      approved: true,
+      validFrom: sourceAt,
+      sourceIds: [message.eventId],
+    }, {
+      memoryId: secondMemory.id,
+      entityId: entityTwo,
+      nodeType: "FACT",
+      predicate: secondMemory.keywords[0]!,
+      value: secondMemory.keywords[1]!,
+      approved: true,
+      validFrom: sourceAt,
+      sourceIds: [message.eventId],
+    }],
+  });
+  const key = await fixture.db.one<{ id: string }>(
+    "select id::text from aggregate_data_keys where aggregate_id=$1",
+    [fixture.conversationId],
+  );
+  const cache = new ProtectedConversationCache();
+  cache.seed(fixture.conversationId, text);
+  return Object.freeze({
+    ...fixture,
+    sourceEventId: message.eventId,
+    memoryIds: Object.freeze(projected.memories.map(({ id }) => id)),
+    dataKeyId: key.id,
+    keys: Object.freeze({
+      exists: async (dataKeyId: string) => (await fixture.db.query(
+        "select 1 from aggregate_data_keys where id=$1",
+        [dataKeyId],
+      )).length === 1,
+    }),
+    cache,
+  });
 }
 
 export async function seedInvitation(
