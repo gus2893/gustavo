@@ -288,6 +288,29 @@ describe("native conversation history", () => {
     ).toEqual({ count: 0 });
   }, 30_000);
 
+  it("accepts authenticated mutations from explicit local production loopback", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("GUSTAVO_DEPLOYMENT_PROFILE", "local-mvp-v1");
+    vi.stubEnv("GUSTAVO_APP_ORIGIN", "http://localhost:3000");
+    const ctx = await createConversationFixture("acct-route-local-production");
+    routeState.db = ctx.db;
+    const request = new Request(
+      `http://localhost:3000/api/conversations/${ctx.conversationId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: `gustavo-session=${ctx.sessionToken}`,
+          origin: "http://localhost:3000",
+        },
+        body: JSON.stringify({ idempotencyKey: "local-route-message", text: "local text" }),
+      },
+    );
+
+    const response = await POST(request, routeContext(ctx.conversationId));
+    expect(response.status).toBe(201);
+  }, 30_000);
+
   it("reports a reused idempotency key with different content as a stable conflict", async () => {
     vi.stubEnv("NODE_ENV", "production");
     const ctx = await createConversationFixture("acct-route-conflict");

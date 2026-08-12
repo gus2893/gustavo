@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 29 / 36
+- Tasks completed: 30 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -300,3 +300,14 @@
 - Spec review: passed after authenticated pages loaded the assigned conversation and safe shared Challenge projection, used real `after` pagination, separated Main broadcasts, enabled browser-safe same-origin memory/export fetches, and rendered exhaustive proposal states.
 - Quality review: passed after exact persisted response-to-route causation, bounded checkpoint-backed Challenge history, numeric ledger chronology, fixed two-decimal monetary DTOs, and safe deferred form handling closed all blocking issues.
 - Scope: authenticated one-chat UI with Main/Node attribution and proposal status, qualifying-feedback disclosure, paginated history, memory inspect/correct/forget/export controls, account-safe shared Challenge stage/equity/positions/ledger/costs, explicit destructive confirmation, and exact simulation-only labeling.
+
+### T30 — Boot the working MVP locally with one command
+
+- Status: completed
+- Commit: `T30: package the local Gustavo MVP runtime` (resolve the single-task commit from Git history)
+- Red: the focused test first failed because `infra/compose.yaml` did not exist; later regressions captured duplicate worker ownership, localhost production origin/cookie rejection, internal-only provider networking, false worker readiness, and unsupported provider-credential documentation.
+- Green: final infrastructure tests passed 6/6 with one daemon-only smoke skipped; related cache/privacy/SSE tests passed 89 assertions; strict TypeScript, production build, canonical Compose configuration, and diff checks passed under Node 24.7.
+- Spec review: passed after `local-mvp-v1` allowed only exact HTTP loopback origins/cookies while public production remained canonical HTTPS, and web/worker gained outbound networking without exposing PostgreSQL or Valkey.
+- Quality review: passed after worker readiness was emitted only after prewarm and all three controllers started, web waited for readiness, cleanup was bounded, and documentation accurately described the current no-provider local mode.
+- Scope: one-command idempotent migrate/start flow; non-root read-only Node 24 web/worker images; durable PostgreSQL, internal Valkey, migrations, cache prewarm, cache/privacy/SSE workers, explicit single ownership, loopback-only web exposure, external secrets, health ordering, readiness, shutdown, and local operations guide.
+- Deviation: Docker Compose config was validated, but the host Docker daemon was unavailable, so image build/up smoke remains for T32 MVP verification.

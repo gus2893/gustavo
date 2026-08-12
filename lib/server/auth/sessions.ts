@@ -32,6 +32,53 @@ export interface SessionCookieOptions {
   readonly expires?: Date;
 }
 
+const LOCAL_MVP_PROFILE = "local-mvp-v1";
+const PUBLIC_PRODUCTION_PROFILE = "public-production-v1";
+
+function localMvpOrigin(
+  environment: Readonly<Record<string, string | undefined>>,
+): string {
+  const configured = environment.GUSTAVO_APP_ORIGIN?.trim();
+  if (!configured) throw new Error("LOCAL_MVP_ORIGIN_REQUIRED");
+  let url: URL;
+  try {
+    url = new URL(configured);
+  } catch {
+    throw new Error("INVALID_CONFIGURED_ORIGIN");
+  }
+  const loopback = url.hostname === "localhost"
+    || url.hostname === "127.0.0.1"
+    || url.hostname === "[::1]";
+  if (url.protocol !== "http:" || !loopback
+      || url.username !== "" || url.password !== ""
+      || url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+    throw new Error("LOCAL_MVP_ORIGIN_FORBIDDEN");
+  }
+  return url.origin;
+}
+
+export function resolveApplicationOrigin(
+  runtimeEnvironment: string,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  configuredOrigin?: string,
+): string {
+  if (runtimeEnvironment !== "production") {
+    const configured = configuredOrigin ?? environment.GUSTAVO_APP_ORIGIN
+      ?? "http://localhost:3000";
+    try {
+      return new URL(configured).origin;
+    } catch {
+      throw new Error("INVALID_CONFIGURED_ORIGIN");
+    }
+  }
+  const profile = environment.GUSTAVO_DEPLOYMENT_PROFILE;
+  if (profile === LOCAL_MVP_PROFILE) return localMvpOrigin(environment);
+  if (profile !== undefined && profile !== PUBLIC_PRODUCTION_PROFILE) {
+    throw new Error("GUSTAVO_DEPLOYMENT_PROFILE_INVALID");
+  }
+  return new URL(editorialPolicy.canonicalOrigin).origin;
+}
+
 export function generateOpaqueToken(): string {
   return randomBytes(32).toString("base64url");
 }
@@ -57,16 +104,23 @@ export function createSessionToken(now = new Date()): RotatedSession {
 }
 
 export function sessionCookieName(environment: string): string {
-  return environment === "production" ? "__Host-gustavo-session" : "gustavo-session";
+  if (environment !== "production") return "gustavo-session";
+  resolveApplicationOrigin(environment);
+  return process.env.GUSTAVO_DEPLOYMENT_PROFILE === LOCAL_MVP_PROFILE
+    ? "gustavo-session"
+    : "__Host-gustavo-session";
 }
 
 export function sessionCookieOptions(
   environment: string,
   expires?: Date,
 ): SessionCookieOptions {
+  if (environment === "production") resolveApplicationOrigin(environment);
+  const secure = environment === "production"
+    && process.env.GUSTAVO_DEPLOYMENT_PROFILE !== LOCAL_MVP_PROFILE;
   return {
     httpOnly: true,
-    secure: environment === "production",
+    secure,
     sameSite: "strict",
     path: "/",
     ...(expires ? { expires } : {}),
@@ -78,14 +132,9 @@ export function assertRequestOrigin(
   environment: string,
   configuredOrigin?: string,
 ): void {
-  const allowedOrigin = configuredOrigin
-    ?? (environment === "production" ? editorialPolicy.canonicalOrigin : "http://localhost:3000");
-  let normalizedAllowedOrigin: string;
-  try {
-    normalizedAllowedOrigin = new URL(allowedOrigin).origin;
-  } catch {
-    throw new Error("INVALID_CONFIGURED_ORIGIN");
-  }
+  const normalizedAllowedOrigin = resolveApplicationOrigin(
+    environment, process.env, configuredOrigin,
+  );
   const suppliedOrigin = request.headers.get("origin");
   if (!suppliedOrigin) {
     throw new Error("INVALID_ORIGIN");

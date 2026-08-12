@@ -1,9 +1,9 @@
 import {
   assertRequestOrigin,
   authenticateSession,
+  resolveApplicationOrigin,
   sessionCookieName,
 } from "../../../../lib/server/auth/sessions";
-import editorialPolicy from "../../../../policy/editorial-policy.json";
 import { getDatabase } from "../../../../lib/server/db/postgres";
 import { exportAccountData } from "../../../../lib/server/memory/controls";
 
@@ -51,9 +51,7 @@ function pageLimit(value: string | undefined): number | undefined {
 }
 
 function assertSafeSameOriginGet(request: Request, environment: string): void {
-  const configuredOrigin = environment === "production"
-    ? editorialPolicy.canonicalOrigin
-    : process.env.GUSTAVO_APP_ORIGIN ?? "http://localhost:3000";
+  const configuredOrigin = resolveApplicationOrigin(environment);
   let allowed: URL;
   let requested: URL;
   try {

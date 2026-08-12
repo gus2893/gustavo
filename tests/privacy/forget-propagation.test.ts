@@ -66,6 +66,7 @@ vi.mock("../../lib/server/db/postgres", () => ({
 }));
 
 import { GET as getAccountExport } from "../../app/api/account/export/route";
+import { POST as postMemory } from "../../app/api/memory/route";
 import { appendMessage } from "../../lib/server/history/messages";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -385,6 +386,30 @@ async function completeForget(fixture: ProtectedConversationFixture, requestId: 
 }
 
 describe("memory privacy controls", () => {
+  it("accepts an authenticated memory mutation from explicit local production loopback", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("GUSTAVO_DEPLOYMENT_PROFILE", "local-mvp-v1");
+    vi.stubEnv("GUSTAVO_APP_ORIGIN", "http://localhost:3000");
+    const fixture = await seedProtectedConversation(
+      "privacy-local-production-route", "local memory source",
+    );
+    exportRouteState.db = fixture.db;
+    const response = await postMemory(new Request("http://localhost:3000/api/memory", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        cookie: `gustavo-session=${fixture.sessionToken}`,
+        origin: "http://localhost:3000",
+      },
+      body: JSON.stringify({
+        action: "ARCHIVE",
+        conversationId: fixture.conversationId,
+        idempotencyKey: "privacy-local-production-archive",
+      }),
+    }));
+    expect(response.status).toBe(200);
+  }, 30_000);
+
   it("inspects sources, appends a correction, and archives reversibly without erasing memory", async () => {
     const fixture = await seedProtectedConversation("privacy-controls", "secret preference");
     const page = await listAccountMemories(fixture, {

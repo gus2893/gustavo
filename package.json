@@ -15,6 +15,8 @@
     "cache:rebuild": "tsx scripts/rebuild-projections.ts rebuild",
     "cache:prewarm": "tsx scripts/rebuild-projections.ts prewarm",
     "worker:stream": "tsx worker/stream/publish-events.ts",
+    "worker:runtime": "tsx worker/runtime.ts",
+    "mvp:start": "docker compose --env-file infra/.env -f infra/compose.yaml run --rm migrate && docker compose --env-file infra/.env -f infra/compose.yaml up --build --remove-orphans",
     "start": "pnpm cache:prewarm && next start",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

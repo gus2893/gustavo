@@ -19,7 +19,7 @@ vi.mock("../../lib/server/db/postgres", () => ({
 import { POST } from "../../app/api/account/redeem/route";
 
 function redemptionRequest(token: string, origin: string): Request {
-  return new Request("https://gustavo.lol/api/account/redeem", {
+  return new Request(`${origin}/api/account/redeem`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -101,6 +101,38 @@ describe("POST /api/account/redeem", () => {
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: "INVALID_REDEMPTION_BODY" });
   });
+
+  it("supports authenticated loopback HTTP only through the versioned local production profile", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("GUSTAVO_DEPLOYMENT_PROFILE", "local-mvp-v1");
+    vi.stubEnv("GUSTAVO_APP_ORIGIN", "http://localhost:3000");
+    const ctx = await testContext();
+    routeState.db = ctx.db;
+    const token = await seedInvitation(ctx.db, { expiresAt: new Date("2030-01-01T00:00:00Z") });
+
+    const accepted = await POST(redemptionRequest(token, "http://localhost:3000"));
+    expect(accepted.status).toBe(201);
+    const cookie = accepted.headers.get("set-cookie");
+    expect(cookie).toMatch(/^gustavo-session=[A-Za-z0-9_-]{43};/u);
+    expect(cookie).not.toMatch(/;\s*Secure(?:;|$)/iu);
+    expect(cookie).toMatch(/HttpOnly/iu);
+
+    vi.stubEnv("GUSTAVO_APP_ORIGIN", "http://gustavo.example");
+    const rejected = await POST(redemptionRequest(generateOpaqueToken(), "http://gustavo.example"));
+    expect(rejected.status).toBe(500);
+    expect(rejected.headers.get("set-cookie")).toBeNull();
+  }, 30_000);
+
+  it("does not let an origin variable weaken canonical public production", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("GUSTAVO_APP_ORIGIN", "http://localhost:3000");
+    const ctx = await testContext();
+    routeState.db = ctx.db;
+    const token = await seedInvitation(ctx.db, { expiresAt: new Date("2030-01-01T00:00:00Z") });
+
+    const rejected = await POST(redemptionRequest(token, "http://localhost:3000"));
+    expect(rejected.status).toBe(403);
+  }, 30_000);
 
   it("returns a generic 500 for unexpected database failures", async () => {
     vi.stubEnv("NODE_ENV", "production");
