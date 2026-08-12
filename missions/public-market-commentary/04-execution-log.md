@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 30 / 36
+- Tasks completed: 31 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -311,3 +311,13 @@
 - Quality review: passed after worker readiness was emitted only after prewarm and all three controllers started, web waited for readiness, cleanup was bounded, and documentation accurately described the current no-provider local mode.
 - Scope: one-command idempotent migrate/start flow; non-root read-only Node 24 web/worker images; durable PostgreSQL, internal Valkey, migrations, cache prewarm, cache/privacy/SSE workers, explicit single ownership, loopback-only web exposure, external secrets, health ordering, readiness, shutdown, and local operations guide.
 - Deviation: Docker Compose config was validated, but the host Docker daemon was unavailable, so image build/up smoke remains for T32 MVP verification.
+
+### T31 — Gate the MVP against execution behavior, secrets, unsafe claims, and protected public payloads
+
+- Status: completed
+- Commit: `T31: add the MVP static safety gate` (resolve the single-task commit from Git history)
+- Red: the focused suite first failed because policy documents and the hardened validator did not exist; later regressions captured omitted scripts/migrations, stale or incomplete browser artifacts, incomplete CSRF/rate guidance, fake-provider import variants, comment obfuscation, stale build inputs, case-insensitive containment, and Windows-only test invocation.
+- Green: the final focused security suite passed 11/11; related gateway tests passed 38/38 and public/auth/feed/SSE tests passed 36/36; strict TypeScript and production build passed; the validator scanned 110 active files plus 31 fresh browser artifacts and failed injected secrets without printing values.
+- Spec review: passed after active scripts/migrations and recursive fresh browser artifacts were covered, security documents specified origin/CSRF/cookie/rate controls, and fake-provider imports were normalized/resolved with exact narrow allowlists.
+- Quality review: passed after comprehensive derived build freshness, comment-aware import parsing, OS-aware repository containment, and cross-platform PowerShell selection closed the portability and bypass gaps.
+- Scope: fail-closed repository safety validator; execution/broker/credential/export, public-secret/entropy, unsafe-claim, fake-provider, active prohibited-import, production-fixture, protected-public-payload, and stale-build gates; privacy, terms, data policy, threat/key/incident/rate/origin/CSRF documentation; explicit legal review requirement before public launch.
