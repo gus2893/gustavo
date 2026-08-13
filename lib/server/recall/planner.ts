@@ -764,7 +764,7 @@ async function runCandidateChannel(
            union
            select term.memory_id from memory_index_terms term
            where term.kind='KEYWORD' and term.scope<>'PUBLIC'
-             and term.term_digest=any($${offset + 2}::text[])
+             and term.term_digest=any($${offset + 2}::char(64)[])
            ${proposalMembershipTerm}
          ) channel_match on channel_match.memory_id=m.id`
       : "";
@@ -893,7 +893,8 @@ async function runGraphChannel(
        and ${importedMemoryLifecycleSql("m", false)}
        and ${sourceHighWaterSql("m", highWaterParameter)}
      group by m.id,discovered.depth
-     order by discovered.depth,m.importance desc,m.created_at desc,m.id`,
+     order by discovered.depth,m.importance desc,m.created_at desc,m.id
+     limit $${limitParameter}`,
     [...authorization.parameters, anchorIds, depth, sourceHighWaterSequence, MAX_QUERY_CANDIDATES],
   );
 }

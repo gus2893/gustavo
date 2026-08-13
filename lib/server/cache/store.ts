@@ -594,6 +594,8 @@ export interface CacheMetricSnapshot {
   readonly evictions: number;
   readonly backendFailures: number;
   readonly fallbackLatencyMs: Readonly<MetricAggregate>;
+  readonly fallbackLatencySequence: number;
+  readonly fallbackLatencyWindow: readonly Readonly<{ readonly sequence: number; readonly value: number }>[];
   readonly cacheReadLatencyMs: Readonly<MetricAggregate>;
   readonly invalidationLatencyMs: Readonly<MetricAggregate>;
   readonly prewarmLatencyMs: Readonly<MetricAggregate>;
@@ -617,6 +619,8 @@ class CacheMetrics {
   evictions = 0;
   backendFailures = 0;
   readonly fallbackLatencyMs: MetricAggregate = { count: 0, total: 0, max: 0 };
+  fallbackLatencySequence = 0;
+  readonly fallbackLatencyWindow: { sequence: number; value: number }[] = [];
   readonly cacheReadLatencyMs: MetricAggregate = { count: 0, total: 0, max: 0 };
   readonly invalidationLatencyMs: MetricAggregate = { count: 0, total: 0, max: 0 };
   readonly prewarmLatencyMs: MetricAggregate = { count: 0, total: 0, max: 0 };
@@ -638,6 +642,16 @@ class CacheMetrics {
     metric.max = Math.max(metric.max, bounded);
   }
 
+  observeFallback(value: number) {
+    const bounded = Number.isFinite(value) && value >= 0 ? value : 0;
+    this.observe(this.fallbackLatencyMs, bounded);
+    this.fallbackLatencySequence += 1;
+    this.fallbackLatencyWindow.push(Object.freeze({
+      sequence: this.fallbackLatencySequence, value: bounded,
+    }));
+    if (this.fallbackLatencyWindow.length > 4_096) this.fallbackLatencyWindow.shift();
+  }
+
   snapshot(): CacheMetricSnapshot {
     return Object.freeze({
       hits: this.hits,
@@ -654,6 +668,10 @@ class CacheMetrics {
       evictions: this.evictions,
       backendFailures: this.backendFailures,
       fallbackLatencyMs: Object.freeze({ ...this.fallbackLatencyMs }),
+      fallbackLatencySequence: this.fallbackLatencySequence,
+      fallbackLatencyWindow: Object.freeze(this.fallbackLatencyWindow.map((item) => (
+        Object.freeze({ ...item })
+      ))),
       cacheReadLatencyMs: Object.freeze({ ...this.cacheReadLatencyMs }),
       invalidationLatencyMs: Object.freeze({ ...this.invalidationLatencyMs }),
       prewarmLatencyMs: Object.freeze({ ...this.prewarmLatencyMs }),
@@ -1512,7 +1530,7 @@ export class ScopedCache {
         const started = this.#now();
         const fallback = await options.load();
         this.#metrics.fallbacks += 1;
-        this.#metrics.observe(this.#metrics.fallbackLatencyMs, this.#now() - started);
+        this.#metrics.observeFallback(this.#now() - started);
         if (!Number.isSafeInteger(fallback.rowsRead) || fallback.rowsRead < 0) {
           throw new Error("CACHE_FALLBACK_ROWS_INVALID");
         }

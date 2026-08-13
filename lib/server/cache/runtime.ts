@@ -1,6 +1,7 @@
 import { createClient, type RedisClientType } from "redis";
 import type { EventDatabase } from "../events/types";
 import { closeDatabase, getDatabase } from "../db/postgres";
+import { operationalMetrics } from "../observability/metrics";
 import {
   ValkeyCacheBackend,
   cacheProjectionPublisher,
@@ -12,6 +13,7 @@ import {
   type CacheProtectedPublicationGuard,
   type CacheProjectionPublisher,
   type CacheProjectionReader,
+  type CacheMetricSnapshot,
   scopedCache,
   type CriticalProjectionManifest,
   type CriticalProjectionSource,
@@ -25,6 +27,10 @@ import {
   synchronizeCanonicalCacheJobs,
 } from "./postgres";
 import { processNextCacheJob, type CacheJobProcessResult } from "../../../worker/cache/invalidate";
+
+const CACHE_TOPOLOGY_VERSION = "single-main-node-v1";
+const INVALIDATION_FAILURE_TOPOLOGY = `${CACHE_TOPOLOGY_VERSION}:invalidation-failure`;
+const MAX_DURABLE_METRIC_BUCKETS = 1_000;
 
 function cacheEncryptionKey(): Buffer {
   const encoded = process.env.GUSTAVO_CACHE_ENCRYPTION_KEY;
@@ -519,7 +525,7 @@ export async function runPostgresCacheWorkerOnce(input: {
     `select coalesce(max(extract(epoch from (clock_timestamp()-created_at))*1000),0)::float8 milliseconds
      from cache_projection_jobs where status in ('PENDING','RETRY_SCHEDULED','CLAIMED')`,
   );
-  await recordPostgresCacheMetric(input.db, "cache.queue_lag_ms", Math.max(0, lag.milliseconds));
+  await recordPostgresCacheQueueAge(input.db, Math.max(0, lag.milliseconds));
   const before = input.cache.metrics();
   const result = await processNextCacheJob({
     repository: createPostgresCacheJobRepository(input.db),
@@ -530,6 +536,7 @@ export async function runPostgresCacheWorkerOnce(input: {
     maxAttempts: input.maxAttempts,
   });
   const after = input.cache.metrics();
+  await recordPostgresCacheRuntimeDeltas(input.db, before, after);
   if (after.prewarmLatencyMs.count > before.prewarmLatencyMs.count) {
     await recordPostgresCacheMetric(
       input.db, "cache.prewarm_latency_ms",
@@ -542,11 +549,6 @@ export async function runPostgresCacheWorkerOnce(input: {
       after.invalidationLatencyMs.total - before.invalidationLatencyMs.total,
     );
   }
-  if (after.backendFailures > before.backendFailures) {
-    await recordPostgresCacheMetric(
-      input.db, "cache.backend_failure", after.backendFailures - before.backendFailures,
-    );
-  }
   if (after.freshnessLagMs.count > before.freshnessLagMs.count) {
     await recordPostgresCacheMetric(
       input.db, "cache.freshness_lag_ms",
@@ -554,6 +556,125 @@ export async function runPostgresCacheWorkerOnce(input: {
     );
   }
   return result;
+}
+
+export async function recordPostgresCacheRuntimeDeltas(
+  database: EventDatabase,
+  before: CacheMetricSnapshot,
+  after: CacheMetricSnapshot,
+): Promise<void> {
+  for (const namespace of new Set([
+    ...Object.keys(before.byNamespace), ...Object.keys(after.byNamespace),
+  ])) {
+    const prior = before.byNamespace[namespace] ?? { hits: 0, misses: 0 };
+    const current = after.byNamespace[namespace] ?? { hits: 0, misses: 0 };
+    const hitDelta = current.hits - prior.hits;
+    const missDelta = current.misses - prior.misses;
+    if (hitDelta > 0) operationalMetrics.observe(
+      "cache.access", hitDelta, { namespace, result: "hit" },
+    );
+    if (missDelta > 0) operationalMetrics.observe(
+      "cache.access", missDelta, { namespace, result: "miss" },
+    );
+  }
+  const fallbackCount = after.fallbackLatencyMs.count - before.fallbackLatencyMs.count;
+  if (fallbackCount > 0) {
+    const fallbackBatch = after.fallbackLatencyWindow.filter(({ sequence }) => (
+      sequence > before.fallbackLatencySequence
+    ));
+    if (fallbackBatch.length !== fallbackCount
+        || after.fallbackLatencySequence - before.fallbackLatencySequence !== fallbackCount) {
+      throw new Error("CACHE_FALLBACK_METRIC_WINDOW_EXHAUSTED");
+    }
+    const fallbackTotal = fallbackBatch.reduce((sum, { value }) => sum + value, 0);
+    const fallbackAverage = fallbackTotal / fallbackCount;
+    const fallbackMax = Math.max(...fallbackBatch.map(({ value }) => value));
+    operationalMetrics.observe(
+      "cache.fallback.latency_ms",
+      fallbackAverage,
+      {},
+    );
+    await recordDurableCacheAggregate(database, {
+      name: "cache.fallback", topologyVersion: CACHE_TOPOLOGY_VERSION,
+      sampleCount: fallbackCount, valueSum: fallbackTotal, valueMax: fallbackMax,
+    });
+  }
+  const invalidationFailures = after.invalidationFailures - before.invalidationFailures;
+  if (invalidationFailures > 0) {
+    operationalMetrics.observe(
+      "cache.invalidation.failure",
+      invalidationFailures,
+      {},
+    );
+    await recordDurableCacheAggregate(database, {
+      name: "cache.backend_failure", topologyVersion: INVALIDATION_FAILURE_TOPOLOGY,
+      sampleCount: invalidationFailures, valueSum: invalidationFailures, valueMax: 1,
+    });
+  }
+  const backendFailures = Math.max(
+    0, after.backendFailures - before.backendFailures - invalidationFailures,
+  );
+  const deltas = [
+    ["cache.hit", after.hits - before.hits],
+    ["cache.miss", after.misses - before.misses],
+    ["cache.backend_failure", backendFailures],
+  ] as const;
+  for (const [name, delta] of deltas) {
+    if (delta > 0) await recordPostgresCacheMetric(database, name, delta);
+  }
+}
+
+async function recordDurableCacheAggregate(
+  database: EventDatabase,
+  aggregate: {
+    readonly name: "cache.fallback" | "cache.backend_failure";
+    readonly topologyVersion: string;
+    readonly sampleCount: number;
+    readonly valueSum: number;
+    readonly valueMax: number;
+  },
+): Promise<void> {
+  const { sampleCount, valueSum, valueMax } = aggregate;
+  if (!Number.isSafeInteger(sampleCount) || sampleCount <= 0
+      || !Number.isFinite(valueSum) || valueSum < 0
+      || !Number.isFinite(valueMax) || valueMax < 0 || valueSum < valueMax) {
+    throw new Error("CACHE_METRIC_AGGREGATE_INVALID");
+  }
+  const value = valueSum / sampleCount;
+  await database.transaction(async (transaction) => {
+    await transaction.query(
+      `insert into cache_metric_observations (
+         name,value,category,topology_version,bucket_start,sample_count,
+         value_sum,value_max,observed_at
+       ) values (
+         $1,$2,$3,$4,date_trunc('minute',clock_timestamp()),$5,$6,$7,clock_timestamp()
+       ) on conflict (name,category,topology_version,bucket_start) do update
+       set value=excluded.value,
+           sample_count=cache_metric_observations.sample_count+excluded.sample_count,
+           value_sum=cache_metric_observations.value_sum+excluded.value_sum,
+           value_max=greatest(cache_metric_observations.value_max,excluded.value_max),
+           observed_at=excluded.observed_at`,
+      [aggregate.name, value, null, aggregate.topologyVersion,
+        sampleCount, valueSum, valueMax],
+    );
+    await transaction.query(
+      `delete from cache_metric_observations where id in (
+         select id from cache_metric_observations
+         where name=$1 and category is null and topology_version=$2
+         order by bucket_start desc,id desc offset $3
+       )`,
+      [aggregate.name, aggregate.topologyVersion, MAX_DURABLE_METRIC_BUCKETS],
+    );
+  });
+}
+
+export async function recordPostgresCacheQueueAge(
+  database: EventDatabase,
+  milliseconds: number,
+): Promise<void> {
+  const age = Math.max(0, milliseconds);
+  operationalMetrics.observe("queue.age_ms", age, { queue: "cache_projection" });
+  await recordPostgresCacheMetric(database, "cache.queue_lag_ms", age);
 }
 
 export interface PostgresCacheWorkerController {

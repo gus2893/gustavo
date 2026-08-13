@@ -1,5 +1,6 @@
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import type { EventDatabase } from "../events/types";
+import type { CommitMeasurement } from "../observability/metrics";
 
 interface Queryable {
   query<Row extends QueryResultRow = QueryResultRow>(
@@ -10,6 +11,30 @@ interface Queryable {
 
 let sharedPool: Pool | undefined;
 let sharedDatabase: EventDatabase | undefined;
+
+const COMMIT_LATENCY_BUCKETS_MS = Object.freeze([
+  1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
+]);
+
+async function persistCommitMeasurement(pool: Pool, measurement: CommitMeasurement): Promise<void> {
+  const durationMs = Math.max(0, measurement.durationMs);
+  const latencyBucketMs = COMMIT_LATENCY_BUCKETS_MS.find((upper) => durationMs <= upper) ?? 60_000;
+  await pool.query(
+    `with pruned as (
+       delete from database_commit_metric_buckets
+       where bucket_start<date_trunc('minute',clock_timestamp()-interval '48 hours')
+     )
+     insert into database_commit_metric_buckets (
+       outcome,latency_bucket_ms,bucket_start,sample_count,value_sum,value_max,observed_at
+     ) values ($1,$2,date_trunc('minute',clock_timestamp()),1,$3,$3,clock_timestamp())
+     on conflict (outcome,latency_bucket_ms,bucket_start) do update
+     set sample_count=database_commit_metric_buckets.sample_count+1,
+         value_sum=database_commit_metric_buckets.value_sum+excluded.value_sum,
+         value_max=greatest(database_commit_metric_buckets.value_max,excluded.value_max),
+         observed_at=excluded.observed_at`,
+    [measurement.outcome, latencyBucketMs, durationMs],
+  );
+}
 
 function databaseFor(
   queryable: Queryable,
@@ -47,17 +72,29 @@ function clientDatabase(client: PoolClient): EventDatabase {
 
 export function databaseFromPool(pool: Pool): EventDatabase {
   return databaseFor(pool, async (work) => {
+    // Resolve the observer before opening a transaction so first-load module work
+    // can never extend the database transaction lifetime.
+    const { measureCommit } = await import("../observability/metrics");
     const client = await pool.connect();
+    let commitMeasurement: CommitMeasurement | undefined;
     try {
       await client.query("begin");
       const result = await work(clientDatabase(client));
-      await client.query("commit");
+      await measureCommit(
+        () => client.query("commit"),
+        (measurement) => { commitMeasurement = measurement; },
+      );
       return result;
     } catch (error) {
       await client.query("rollback");
       throw error;
     } finally {
       client.release();
+      if (commitMeasurement) {
+        // The source transaction has already committed or failed. Metrics are
+        // deliberately best-effort and cannot change that durable outcome.
+        await persistCommitMeasurement(pool, commitMeasurement).catch(() => undefined);
+      }
     }
   });
 }

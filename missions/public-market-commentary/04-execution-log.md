@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 33 / 36
+- Tasks completed: 34 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -342,3 +342,14 @@
 - Spec review: passed after schema/high-water metadata derived inside one exported repeatable-read snapshot consumed by `pg_dump`, credentials became environment-only with protected `PGPASSFILE`, and retention bounds were reciprocal.
 - Quality review: passed after immutable conditional generation-specific S3 objects, manifest-last publication, owner-only plaintext work areas, asynchronous stderr draining, bounded snapshot protocol/rollback, and cleanup closed all blocking issues.
 - Scope: authenticated local encryption with external 64-byte key, exact manifest binding, atomic local promotion, optional immutable S3 upload, corruption/wrong-key/tamper/path/reparse/overwrite rejection, database-consistent snapshot, isolated restore with active-database refusal and metadata verification, retention/least-privilege documentation.
+
+### T34 — Measure durability, cache, recall, queue, and model health budgets
+
+- Status: completed with an accepted partial projected-million verification
+- Commit: `T34: add performance and operator health budgets` (resolve the single-task commit from Git history)
+- Red: the focused test first failed because the metrics module did not exist; later regressions captured synthetic health commits, false-zero health, process-local metrics, inaccurate fallback aggregates, registry rollover inconsistency, unbounded health reads, permissive query-plan classification, and an event-only fixture that did not scale recall projections.
+- Green: root verification passed 16/16 focused tests plus strict TypeScript and diff hygiene. The fully authoritative 10,003-memory/10,043-event projection calibration produced warm recall p95 207.23 ms, cached handoff p95 0.9557 ms, nine root-limited/indexed normal-planner plans, and zero unbounded queries or permission leaks. Related cache, database lifecycle, and model suites, production build, and safety validator passed during implementation.
+- Spec review: passed after production commit/cache/queue/model paths were durably instrumented across processes and exact recall SQL was explained under normal planner settings.
+- Quality review: passed after health stopped fabricating samples, empty states became unknown, durable aggregates and registry windows were corrected, percentile sources were bounded/indexed, strict plan evidence rejected candidate scans, and operator queries used time-leading indexes with direct single-row reads.
+- Scope: authenticated private no-store operator health; durable bounded commit/cache/queue/model observations; p50/p95/p99 and cost-divergence summaries; strict plan evidence; deterministic known-answer/permission/conflict/temporal recall fixture; and bounded health/query-label policies.
+- Deviation: the opt-in fully projected 1,000,000-memory gate remains partial. Attempts exceeded the ten-minute gate or hit host disk/WAL limits; an experimental index/trigger shortcut failed PostgreSQL authority rules and was fully removed. Earlier 1,000,227-event evidence is documented as event-log scale only, not projected recall scale. The always-on fully validated projected calibration remains green and the limitation is documented in `docs/PERFORMANCE.md` and the T34 debug artifact.

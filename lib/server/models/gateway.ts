@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { EventDatabase } from "../events/types";
+import { operationalMetrics } from "../observability/metrics";
 import {
   MODEL_ROLES,
   MODEL_PROVIDER_SAFE_ERROR_CODES,
@@ -714,12 +715,13 @@ export function createModelGateway(
             : reportedUsage.estimatedCostMicrousd
           ).toString()
         : null;
-    await database.transaction(async (transaction) => {
+    const latencyMs = postgresLatency(clockMilliseconds(clock) - prepared.startedAtMs);
+    const didFinalize = await database.transaction(async (transaction) => {
       const run = await transaction.one<{ completion_status: string }>(
         `select completion_status from model_runs where id=$1 for update`,
         [prepared.runId],
       );
-      if (run.completion_status !== "IN_PROGRESS") return;
+      if (run.completion_status !== "IN_PROGRESS") return false;
       const row = await transaction.one<{ committed_cost_microusd: string }>(
         `select committed_cost_microusd from model_budget_usage
          where role=$1 and budget_month=$2 for update`,
@@ -756,7 +758,7 @@ export function createModelGateway(
         [
           prepared.runId,
           outputTokens,
-          postgresLatency(clockMilliseconds(clock) - prepared.startedAtMs),
+          latencyMs,
           actualCost.toString(),
           input.status,
           input.errorCode,
@@ -765,7 +767,17 @@ export function createModelGateway(
           providerReportedCostMicrousd,
         ],
       );
+      return true;
     });
+    if (!didFinalize) return;
+    const labels = { role: prepared.role, status: input.status } as const;
+    const reportedCost = providerReportedCostMicrousd === null
+      ? actualCost : BigInt(providerReportedCostMicrousd);
+    const divergence = reportedCost >= actualCost
+      ? reportedCost - actualCost : actualCost - reportedCost;
+    operationalMetrics.observe("model.latency_ms", latencyMs, labels);
+    operationalMetrics.observe("model.cost_microusd", Number(actualCost), labels);
+    operationalMetrics.observe("model.divergence_microusd", Number(divergence), labels);
   }
 
   async function* stream(

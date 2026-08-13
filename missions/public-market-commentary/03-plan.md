@@ -1958,7 +1958,7 @@ Yes. It adds recovery around the already-running local MVP.
 ### T34 — Measure durability, cache, recall, queue, and model health budgets
 
 **Maps to:** R19, R25, R59, R78, R89
-**Files touched:** `lib/server/observability/metrics.ts` (new), `app/api/operator/health/route.ts` (new), `tests/performance/seed-million.ts` (new), `tests/performance/recall-latency.test.ts` (new), `docs/PERFORMANCE.md` (new)
+**Files touched:** `lib/server/observability/metrics.ts` (new), `app/api/operator/health/route.ts` (new), `db/migrations/0020_observability.sql` (new), `lib/server/cache/runtime.ts` (modify), `lib/server/cache/store.ts` (modify), `lib/server/db/postgres.ts` (modify), `lib/server/models/gateway.ts` (modify), `lib/server/recall/planner.ts` (modify), `tests/performance/seed-million.ts` (new), `tests/performance/recall-latency.test.ts` (new), `docs/PERFORMANCE.md` (new), `missions/public-market-commentary/debug-t34-performance.md` (new; authorized debug artifact)
 
 #### Red — failing test
 
@@ -2008,7 +2008,7 @@ Yes. It measures existing behavior without altering product semantics.
 ### T35 — Open scheduled Main broadcast cycles idempotently
 
 **Maps to:** R15, R44, R89
-**Files touched:** `db/migrations/0020_broadcast_schedules.sql` (new), `lib/server/main-brain/schedules.ts` (new), `worker/broadcasts/scheduler.ts` (new), `tests/broadcasts/scheduler.test.ts` (new)
+**Files touched:** `db/migrations/0021_broadcast_schedules.sql` (new), `lib/server/main-brain/schedules.ts` (new), `worker/broadcasts/scheduler.ts` (new), `tests/broadcasts/scheduler.test.ts` (new)
 
 #### Red — failing test
 
