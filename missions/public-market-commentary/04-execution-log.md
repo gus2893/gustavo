@@ -4,7 +4,7 @@
 
 - Plan: `03-plan.md`
 - Tasks completed: 36 / 36
-- Final test suite: partial — 800/807 passed in the 22-minute serialized run; all seven failures then passed or were resolved in exact focused reruns (five clock-horizon recall fixtures 5/5, product policy 2/2 after restoring the mandatory label, static boundaries 11/11 after the required fresh build)
+- Final test suite: partial — fresh verification completed all non-recall suites; the late recall file failed six clock/load-sensitive cases plus teardown after roughly 22 minutes, and all six cases passed together 6/6 in a fresh 19.31-second run
 - Final type check: passed
 - Final build: passed
 - Execution workflow note: the installed MCAX kit did not contain `agents/mcax-implementer.md` or `agents/mcax-code-reviewer.md`; execution uses fresh generic subagents with self-contained briefs reproducing the required test-first and two-stage review disciplines.
