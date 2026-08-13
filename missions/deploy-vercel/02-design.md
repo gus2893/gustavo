@@ -8,6 +8,7 @@
    - Reuse project `prj_HoIxQexO64tsgXrNI6m89g3P87TB` in team `team_2ZsWunVLuTIHx2h2zmWEAvAH`.
    - Build with Node 24 and pnpm 11.16.0 through Corepack; verify Preview before promoting to `gustavo.lol`.
    - Redirect `www.gustavo.lol` to the apex, retain the exact simulation label, and exclude operator data, live quotes, secrets, and ciphertext from all public output.
+   - Every committed `vercel.json` function pattern must match a route that exists in the same commit; route-specific duration configuration lands atomically with that route.
 
 2. **R2 — Create a fresh, invitation-only production account** → Story 2 / AC1–AC5.
    - Provision an empty Neon Free database; never copy local accounts, conversations, memories, quotes, or backups.
@@ -146,6 +147,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `POST /api/internal/maintenance` accepts a valid QStash signature for the exact production URL/body only.
 - An advisory lock prevents overlap; a deadline below 55 seconds bounds cache invalidation, forget propagation, stream publication, due cycles, and stale bridge leases.
 - SSE has a 55-second maximum, bounded heartbeats/cleanup, and reconnects through existing ordered database replay.
+- The initial deployment manifest may configure the existing SSE route. The maintenance duration entry is added only in the same task/commit that creates `app/api/internal/maintenance/route.ts`, preventing Vercel's unmatched-function-pattern deployment error.
 
 ### New files
 
@@ -287,6 +289,10 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 
 - 2026-08-13 initial draft grounded in repository code, Vercel project/build logs, official Vercel/OpenAI docs, and provider free-tier docs.
 - 2026-08-13 approved by the user.
+- 2026-08-13 prompt-update: require every committed Vercel function pattern to match an existing route after T1 Stage B found that unmatched patterns fail deployment.
+  - Previous intent: `vercel.json`: bounded Vercel runtime configuration, with both the SSE and future maintenance route entries created in T1.
+  - Revised intent: T1 configures only the already-existing SSE route; the maintenance entry is committed atomically with the new maintenance route in T16. Final production behavior and the 60-second bounds are unchanged.
+- 2026-08-13 prompt-update approved by the user; execution may resume after T1/T16 plan regeneration.
 
 ## Self-review checklist
 

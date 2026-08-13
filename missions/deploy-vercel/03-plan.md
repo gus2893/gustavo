@@ -41,13 +41,18 @@ describe("Vercel hybrid deployment contract", () => {
       "@upstash/qstash": expect.any(String),
       "@vercel/functions": expect.any(String),
     });
-    expect(vercel.functions).toMatchObject({
+    expect(vercel.functions).toEqual({
       "app/api/feed/stream/route.ts": { maxDuration: 60 },
-      "app/api/internal/maintenance/route.ts": { maxDuration: 60 },
     });
-    expect(env).toContain("ENABLE_EXPERIMENTAL_COREPACK=1");
-    expect(env).toContain("GUSTAVO_HYBRID_BRIDGE_ENABLED=false");
-    expect(env).toContain("GUSTAVO_MARKET_POLLER_ENABLED=false");
+    const active = env.split(/\r?\n/u)
+      .filter((line) => line.trim() !== "" && !line.trimStart().startsWith("#"))
+      .map((line) => line.split("=", 2) as [string, string]);
+    const values = (name: string) => active
+      .filter(([key]) => key === name)
+      .map(([, value]) => value);
+    expect(values("ENABLE_EXPERIMENTAL_COREPACK")).toEqual(["1"]);
+    expect(values("GUSTAVO_HYBRID_BRIDGE_ENABLED")).toEqual(["false"]);
+    expect(values("GUSTAVO_MARKET_POLLER_ENABLED")).toEqual(["false"]);
     expect(env).not.toMatch(/OPENAI_API_KEY|PAID_FALLBACK|OVERAGE_ENABLED/);
   });
 });
@@ -57,7 +62,7 @@ Expected initial state: importing the fixture reaches `readFileSync("vercel.json
 
 #### Green — minimum implementation
 
-- Add `vercel.json` with only the two 60-second route bounds and the canonical Next.js framework declaration.
+- Add `vercel.json` with only the existing SSE route's 60-second bound and the canonical Next.js framework declaration. Do not configure the future maintenance route before its source file exists.
 - Add `@upstash/qstash` and `@vercel/functions` with `pnpm add`, preserving the existing Node and pnpm engine pins.
 - Add `infra/vercel.env.example` containing names and inert feature flags only; every secret value is blank and no paid-provider variable exists.
 - Preserve the existing scripts and application dependencies.
@@ -70,7 +75,7 @@ Expected initial state: importing the fixture reaches `readFileSync("vercel.json
 
 Command: `pnpm vitest run tests/deployment/vercel-hybrid.test.ts -t "pins Node 24, pnpm 11, bounded functions, and explicit free-tier flags"`
 
-Expected: one test passes, zero fail, exit code 0; `pnpm install --frozen-lockfile` exits 0.
+Expected: one test passes, zero fail, exit code 0; commented, duplicated, conflicting, or suffixed safety values fail the exact-assignment assertions; `pnpm install --frozen-lockfile` exits 0.
 
 #### Reviewable as a unit?
 
@@ -1012,13 +1017,14 @@ Yes. It adds the local service boundary and installation scripts without changin
 ### T16 — Run hosted maintenance as one signed bounded Vercel invocation
 
 **Maps to:** R5, R6
-**Files touched:** `app/api/internal/maintenance/route.ts` (new), `tests/privacy/forget-propagation.test.ts` (modify), `tests/cache/postgres.test.ts` (modify)
+**Files touched:** `app/api/internal/maintenance/route.ts` (new), `vercel.json` (modify), `tests/privacy/forget-propagation.test.ts` (modify), `tests/cache/postgres.test.ts` (modify)
 
 #### Red — failing test
 
 File: `tests/privacy/forget-propagation.test.ts`
 
 ```ts
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { runBoundedMaintenance } from "../../app/api/internal/maintenance/route";
 
@@ -1042,6 +1048,11 @@ describe("Vercel one-shot maintenance", () => {
 
     expect(order).toEqual(["verify", "lock", "cache", "privacy", "stream", "schedules", "bridgeLeases"]);
     expect(result).toEqual({ processed: 5, deadlineReached: false });
+    const vercel = JSON.parse(readFileSync("vercel.json", "utf8"));
+    expect(vercel.functions).toMatchObject({
+      "app/api/feed/stream/route.ts": { maxDuration: 60 },
+      "app/api/internal/maintenance/route.ts": { maxDuration: 60 },
+    });
   });
 });
 ```
@@ -1051,6 +1062,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 #### Green — minimum implementation
 
 - Export the testable core and a `POST` handler that validates the exact QStash URL/body/signature before opening the database.
+- Add the maintenance route's exact 60-second `vercel.json` function entry in this same task/commit, now that the source path exists.
 - Hold one fixed PostgreSQL advisory transaction lock and call existing one-shot cache invalidation, privacy propagation, stream publisher, due-schedule, and stale-bridge-lease functions with small batch limits.
 - Check the shared deadline before and after each batch; stop below 55 seconds and return only aggregate counts/safe codes with `Cache-Control: no-store`.
 - Return 204 for valid overlap/no work, 401 for invalid signature, 409 for lock conflict, and bounded 503 for database failure.
