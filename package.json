@@ -12,6 +12,7 @@
     "dev": "next dev",
     "build": "next build",
     "invitation:issue": "tsx scripts/issue-invitation.ts",
+    "production:migrate": "tsx scripts/migrate-production.ts",
     "cache:rebuild": "tsx scripts/rebuild-projections.ts rebuild",
     "cache:prewarm": "tsx scripts/rebuild-projections.ts prewarm",
     "worker:stream": "tsx worker/stream/publish-events.ts",

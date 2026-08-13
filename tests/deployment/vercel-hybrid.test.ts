@@ -1,6 +1,279 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { postgresPoolPolicy } from "../../lib/server/db/postgres";
+import { runProductionMigrations } from "../../scripts/migrate-production";
+
+describe("production migrations", () => {
+  it("takes one advisory lock and applies each ordered migration once", async () => {
+    const query = vi.fn(async (sql: string) => ({
+      rows: sql.includes("select name, checksum_sha256")
+        ? [{
+          name: "0001_events.sql",
+          checksum_sha256: createHash("sha256")
+            .update("-- 0001_events.sql", "utf8")
+            .digest("hex"),
+        }]
+        : [],
+    }));
+
+    const result = await runProductionMigrations({
+      databaseUrl: "postgresql://example.invalid/db",
+      migrationFiles: ["0001_events.sql", "0002_event_metadata.sql"],
+      readMigration: (name) => `-- ${name}`,
+      withClient: async (work) => work({ query } as never),
+    });
+
+    expect(query.mock.calls[0]?.[0]).toBe("begin");
+    expect(query.mock.calls[1]?.[0]).toContain("pg_advisory_xact_lock");
+    expect(result).toEqual({ applied: ["0002_event_metadata.sql"], skipped: ["0001_events.sql"] });
+    expect(query.mock.calls.at(-1)?.[0]).toBe("commit");
+  });
+
+  it("replays recorded checksums and rejects changed migration contents", async () => {
+    const ledger = new Map<string, string>();
+    const appliedSql: string[] = [];
+    const query = vi.fn(async (sql: string, values: unknown[] = []) => {
+      if (sql.includes("select name, checksum_sha256")) {
+        return {
+          rows: [...ledger].map(([name, checksum_sha256]) => ({
+            name,
+            checksum_sha256,
+          })),
+        };
+      }
+      if (sql.includes("insert into") && values.length === 2) {
+        ledger.set(String(values[0]), String(values[1]));
+      }
+      if (sql.startsWith("-- migration ")) appliedSql.push(sql);
+      return { rows: [] };
+    });
+    let changed = false;
+    const run = () => runProductionMigrations({
+      databaseUrl: "postgresql://example.invalid/db",
+      migrationFiles: ["0002_event_metadata.sql", "0001_events.sql"],
+      readMigration: (name: string) => [
+        `-- migration ${name}`,
+        changed && name === "0002_event_metadata.sql" ? "-- changed" : "",
+      ].filter(Boolean).join("\n"),
+      withClient: async (work) => work({ query } as never),
+    });
+
+    await expect(run()).resolves.toEqual({
+      applied: ["0001_events.sql", "0002_event_metadata.sql"],
+      skipped: [],
+    });
+    await expect(run()).resolves.toEqual({
+      applied: [],
+      skipped: ["0001_events.sql", "0002_event_metadata.sql"],
+    });
+    expect(appliedSql).toEqual([
+      "-- migration 0001_events.sql",
+      "-- migration 0002_event_metadata.sql",
+    ]);
+    const transactionCalls = query.mock.calls.map(([sql]) => sql);
+    expect(transactionCalls.filter((sql) => sql === "begin")).toHaveLength(2);
+    expect(transactionCalls.filter((sql) => sql === "commit")).toHaveLength(2);
+
+    changed = true;
+    await expect(run())
+      .rejects.toThrow("MIGRATION_CHECKSUM_CHANGED:0002_event_metadata.sql");
+    expect(query.mock.calls.at(-1)?.[0]).toBe("rollback");
+    expect(query.mock.calls[1]?.[0]).toContain("gustavo:production-migrations:v1");
+  });
+
+  it("rejects a ledger row without its durable checksum", async () => {
+    const query = vi.fn(async (sql: string) => ({
+      rows: sql.includes("select name, checksum_sha256")
+        ? [{ name: "0001_events.sql" }]
+        : [],
+    }));
+
+    await expect(runProductionMigrations({
+      databaseUrl: "postgresql://example.invalid/db",
+      migrationFiles: ["0001_events.sql"],
+      readMigration: (name) => `-- ${name}`,
+      withClient: async (work) => work({ query } as never),
+    })).rejects.toThrow("MIGRATION_LEDGER_INVALID:0001_events.sql");
+    expect(query.mock.calls.at(-1)?.[0]).toBe("rollback");
+  });
+
+  it("holds one transaction-scoped advisory lock across the complete batch", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+
+    await runProductionMigrations({
+      databaseUrl: "postgresql://example.invalid/db",
+      migrationFiles: ["0001_events.sql", "0002_identity.sql"],
+      readMigration: (name) => `-- migration ${name}`,
+      withClient: async (work) => work({ query } as never),
+    });
+
+    const sql = query.mock.calls.map(([statement]) => statement);
+    const beginIndex = sql.indexOf("begin");
+    const lockIndex = sql.findIndex((statement) => statement.includes(
+      "pg_advisory_xact_lock(hashtextextended('gustavo:production-migrations:v1', 0))",
+    ));
+    const commitIndex = sql.indexOf("commit");
+    expect(sql.filter((statement) => statement === "begin")).toHaveLength(1);
+    expect(lockIndex).toBe(beginIndex + 1);
+    expect(sql.filter((statement) => statement === "commit")).toHaveLength(1);
+    expect(sql.filter((statement) => statement.includes("-- migration ")))
+      .toHaveLength(2);
+    expect(sql.slice(lockIndex + 1, commitIndex).filter((statement) => statement
+      .includes("insert into schema_migrations"))).toHaveLength(2);
+    expect(sql.join("\n")).not.toMatch(/pg_advisory_lock\(|pg_advisory_unlock\(/u);
+  });
+
+  it("shares the checksum-aware schema ledger used by backup and restore", async () => {
+    const backup = readFileSync("infra/backup/create.ps1", "utf8");
+    const restore = readFileSync("infra/backup/restore-drill.ps1", "utf8");
+    const query = vi.fn().mockResolvedValue({ rows: [] });
+
+    await runProductionMigrations({
+      databaseUrl: "postgresql://example.invalid/db",
+      migrationFiles: ["0001_events.sql"],
+      readMigration: (name) => `-- migration ${name}`,
+      withClient: async (work) => work({ query } as never),
+    });
+
+    expect(backup).toContain("from schema_migrations");
+    expect(restore).toContain("from schema_migrations");
+    const sql = query.mock.calls.map(([statement]) => statement).join("\n");
+    expect(sql).toContain("create table if not exists schema_migrations");
+    expect(sql).toContain("alter table schema_migrations add column if not exists checksum_sha256 char(64)");
+    expect(sql).toContain("select name, checksum_sha256");
+    expect(sql).toContain("insert into schema_migrations");
+    expect(sql).not.toContain("production_migration_ledger");
+  });
+
+  it("hashes and executes one canonical LF form across checkout line endings", async () => {
+    const inspect = async (migrationSql: string) => {
+      const query = vi.fn().mockResolvedValue({ rows: [] });
+      await runProductionMigrations({
+        databaseUrl: "postgresql://example.invalid/db",
+        migrationFiles: ["0001_events.sql"],
+        readMigration: () => migrationSql,
+        withClient: async (work) => work({ query } as never),
+      });
+      const insert = query.mock.calls.find(([statement]) => statement
+        .includes("insert into"));
+      const executed = query.mock.calls.find(([statement]) => statement.startsWith("select 1;"));
+      return {
+        checksum: insert?.[1]?.[1],
+        sql: executed?.[0],
+      };
+    };
+
+    const forms = await Promise.all([
+      inspect("select 1;\nselect 2;\n"),
+      inspect("select 1;\r\nselect 2;\r\n"),
+      inspect("select 1;\rselect 2;\r"),
+    ]);
+    expect(new Set(forms.map(({ checksum }) => checksum)).size).toBe(1);
+    expect(forms[0]?.checksum).toMatch(/^[a-f0-9]{64}$/u);
+    expect(forms.map(({ sql }) => sql)).toEqual([
+      "select 1;\nselect 2;\n",
+      "select 1;\nselect 2;\n",
+      "select 1;\nselect 2;\n",
+    ]);
+  });
+
+  it("rolls back the whole batch when a later migration fails", async () => {
+    let transaction: string[] | null = null;
+    const durableLedger: string[] = [];
+    let commits = 0;
+    let rollbacks = 0;
+    const query = vi.fn(async (sql: string, values: unknown[] = []) => {
+      if (sql === "begin") {
+        transaction = [];
+      } else if (sql === "commit") {
+        commits += 1;
+        durableLedger.push(...(transaction ?? []));
+        transaction = null;
+      } else if (sql === "rollback") {
+        rollbacks += 1;
+        transaction = null;
+      } else if (sql.includes("select filename, checksum_sha256")
+          || sql.includes("select name, checksum_sha256")) {
+        return { rows: [] };
+      } else if (sql.includes("insert into") && values.length === 2) {
+        transaction?.push(String(values[0]));
+      } else if (sql === "-- migration two") {
+        throw new Error("MIGRATION_TWO_FAILED");
+      }
+      return { rows: [] };
+    });
+
+    await expect(runProductionMigrations({
+      databaseUrl: "postgresql://example.invalid/db",
+      migrationFiles: ["0001_events.sql", "0002_identity.sql"],
+      readMigration: (name) => name.startsWith("0001")
+        ? "-- migration one"
+        : "-- migration two",
+      withClient: async (work) => work({ query } as never),
+    })).rejects.toThrow("MIGRATION_TWO_FAILED");
+    expect(commits).toBe(0);
+    expect(rollbacks).toBe(1);
+    expect(durableLedger).toEqual([]);
+    expect(query.mock.calls.at(-1)?.[0]).toBe("rollback");
+  });
+
+  it("does not let concurrent migration runs enter the protected body together", async () => {
+    let locked = false;
+    const waiters: Array<() => void> = [];
+    const blockedBodies: Array<() => void> = [];
+    let activeBodies = 0;
+    let bodyEntries = 0;
+    let maximumActiveBodies = 0;
+    const acquire = async () => {
+      if (!locked) {
+        locked = true;
+        return;
+      }
+      const available = new Promise<void>((resolve) => waiters.push(resolve));
+      blockedBodies.shift()?.();
+      await available;
+      locked = true;
+    };
+    const release = () => {
+      locked = false;
+      waiters.shift()?.();
+    };
+    const withClient = async <T,>(work: (client: never) => Promise<T>): Promise<T> => {
+      let ownsLock = false;
+      const query = async (sql: string) => {
+        if (sql.includes("pg_advisory_xact_lock")) {
+          await acquire();
+          ownsLock = true;
+        } else if (sql === "commit" || sql === "rollback") {
+          if (ownsLock) release();
+          ownsLock = false;
+        } else if (sql.startsWith("-- protected migration")) {
+          activeBodies += 1;
+          bodyEntries += 1;
+          maximumActiveBodies = Math.max(maximumActiveBodies, activeBodies);
+          if (bodyEntries === 1 && waiters.length === 0) {
+            await new Promise<void>((resolve) => blockedBodies.push(resolve));
+          } else if (activeBodies === 2) {
+            blockedBodies.shift()?.();
+          }
+          activeBodies -= 1;
+        }
+        return { rows: [] };
+      };
+      return work({ query } as never);
+    };
+    const run = () => runProductionMigrations({
+      databaseUrl: "postgresql://example.invalid/db",
+      migrationFiles: ["0001_events.sql"],
+      readMigration: () => "-- protected migration",
+      withClient,
+    });
+
+    await Promise.all([run(), run()]);
+    expect(maximumActiveBodies).toBe(1);
+  });
+});
 
 const EXPECTED_ACTIVE_ENV_KEYS = [
   "CODEX_HOME",
