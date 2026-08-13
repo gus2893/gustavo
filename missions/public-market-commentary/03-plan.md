@@ -2008,7 +2008,7 @@ Yes. It measures existing behavior without altering product semantics.
 ### T35 — Open scheduled Main broadcast cycles idempotently
 
 **Maps to:** R15, R44, R89
-**Files touched:** `db/migrations/0021_broadcast_schedules.sql` (new), `lib/server/main-brain/schedules.ts` (new), `worker/broadcasts/scheduler.ts` (new), `tests/broadcasts/scheduler.test.ts` (new)
+**Files touched:** `db/migrations/0021_broadcast_schedules.sql` (new), `lib/server/main-brain/schedules.ts` (new), `worker/broadcasts/scheduler.ts` (new), `worker/runtime.ts` (modify; production scheduler lifecycle), `tests/broadcasts/scheduler.test.ts` (new), `missions/public-market-commentary/debug-t35-scheduler-timeout.md` (new; authorized debug artifact), `missions/public-market-commentary/debug-t35-cron.md` (new; authorized debug artifact)
 
 #### Red — failing test
 

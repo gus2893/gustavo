@@ -11,13 +11,27 @@ import {
   startPostgresCacheWorker,
 } from "../lib/server/cache/runtime";
 import { startForgetPropagationWorker } from "../lib/server/memory/forget";
+import type { EventDatabase } from "../lib/server/events/types";
 import {
   startCommittedEventPublisher,
   STREAM_EVENT_CHANNEL,
 } from "./stream/publish-events";
+import { startBroadcastScheduler } from "./broadcasts/scheduler";
 
 const SHUTDOWN_TIMEOUT_MS = 25_000;
 const WORKER_READINESS_FILE = "/tmp/gustavo-worker-ready";
+
+export function startProductionBroadcastScheduler(db: EventDatabase) {
+  return startBroadcastScheduler({
+    db,
+    pollIntervalMs: 15_000,
+    onError: (error) => {
+      process.stderr.write(
+        `${error instanceof Error ? error.message : "BROADCAST_SCHEDULER_FAILED"}\n`,
+      );
+    },
+  });
+}
 
 export async function clearWorkerReadiness(markerFile: string): Promise<void> {
   try {
@@ -66,6 +80,7 @@ export async function runProductionWorker(): Promise<void> {
   let cacheWorker: ReturnType<typeof startPostgresCacheWorker> | undefined;
   let privacyWorker: ReturnType<typeof startForgetPropagationWorker> | undefined;
   let streamWorker: ReturnType<typeof startCommittedEventPublisher> | undefined;
+  let broadcastScheduler: ReturnType<typeof startBroadcastScheduler> | undefined;
 
   try {
     await streamClient.connect();
@@ -101,6 +116,7 @@ export async function runProductionWorker(): Promise<void> {
         await streamClient.publish(STREAM_EVENT_CHANNEL, cursor);
       },
     });
+    broadcastScheduler = startProductionBroadcastScheduler(runtime.db);
     await markWorkerReady(WORKER_READINESS_FILE);
 
     await new Promise<void>((resolve) => {
@@ -115,6 +131,7 @@ export async function runProductionWorker(): Promise<void> {
       } finally {
         try {
           await Promise.all([
+            broadcastScheduler?.stop(),
             streamWorker?.stop(),
             privacyWorker?.stop(),
             cacheWorker?.stop(),

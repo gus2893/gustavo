@@ -3,7 +3,7 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 34 / 36
+- Tasks completed: 35 / 36
 - Final test suite: not run
 - Final type check: not run
 - Final build: not run
@@ -353,3 +353,13 @@
 - Quality review: passed after health stopped fabricating samples, empty states became unknown, durable aggregates and registry windows were corrected, percentile sources were bounded/indexed, strict plan evidence rejected candidate scans, and operator queries used time-leading indexes with direct single-row reads.
 - Scope: authenticated private no-store operator health; durable bounded commit/cache/queue/model observations; p50/p95/p99 and cost-divergence summaries; strict plan evidence; deterministic known-answer/permission/conflict/temporal recall fixture; and bounded health/query-label policies.
 - Deviation: the opt-in fully projected 1,000,000-memory gate remains partial. Attempts exceeded the ten-minute gate or hit host disk/WAL limits; an experimental index/trigger shortcut failed PostgreSQL authority rules and was fully removed. Earlier 1,000,227-event evidence is documented as event-log scale only, not projected recall scale. The always-on fully validated projected calibration remains green and the limitation is documented in `docs/PERFORMANCE.md` and the T34 debug artifact.
+
+### T35 — Open scheduled Main broadcast cycles idempotently
+
+- Status: completed
+- Commit: `T35: add idempotent Main broadcast scheduling` (resolve the single-task commit from Git history)
+- Red: the focused test first failed because the schedule module did not exist; later regressions captured missed first-poll catch-up, schedule starvation beyond 100, cron wildcard/leap/DST errors, invalid-schedule starvation, missing production wiring, unbounded tick backlog, mutable generation outbox authority, slow sparse/dense cron evaluation, and incorrect dense fall-back ordering.
+- Green: root verification passed 11/11 focused scheduler tests plus strict TypeScript and diff hygiene. The full broadcast suite passed 94/94 during implementation. The deterministic dense page benchmark completed 6,400 next-slot calculations in 123 ms against a 2,500 ms budget, and sparse leap-day/DST cases remained green.
+- Spec review: passed after bounded created-at/runtime catch-up, fair paginated polling, cron edge/DST correctness, per-schedule error isolation, exact same-slot replay, controller restart/shutdown, and production worker lifecycle integration.
+- Quality review: passed after coalescing overlapping polls, containing error callbacks, protecting canonical generation-outbox semantics, replacing minute scans with bounded calendar-aware evaluation, and fixing dense DST overlap chronology while preserving performance budgets.
+- Scope: immutable versioned schedules, bounded catch-up and fairness, one Main-authored encrypted event/outbox/cycle per due slot, durable replay/error cursors, exact cron/timezone behavior, protected generation jobs, and production worker start/stop integration. No live posting or trading execution behavior was added.
