@@ -1,4 +1,5 @@
-import { Pool, type PoolClient, type QueryResultRow } from "pg";
+import { attachDatabasePool as attachVercelDatabasePool } from "@vercel/functions";
+import { Pool, type PoolClient, type PoolConfig, type QueryResultRow } from "pg";
 import type { EventDatabase } from "../events/types";
 import type { CommitMeasurement } from "../observability/metrics";
 
@@ -99,20 +100,39 @@ export function databaseFromPool(pool: Pool): EventDatabase {
   });
 }
 
-function configuredPool(): Pool {
-  const connectionString = process.env.DATABASE_URL;
+export function postgresPoolPolicy(
+  env: Readonly<Record<string, string | undefined>>,
+  attachDatabasePool: (pool: Pool) => void,
+): { options: PoolConfig; attach: (pool: Pool) => void } {
+  const connectionString = env.DATABASE_URL;
   if (!connectionString) {
     throw new Error("DATABASE_URL_REQUIRED");
   }
-  return new Pool({
-    connectionString,
-    application_name: "gustavo",
-    max: 10,
-    connectionTimeoutMillis: 5_000,
-    ...(process.env.GUSTAVO_DATABASE_SSL === "require"
-      ? { ssl: { rejectUnauthorized: true } }
-      : {}),
-  });
+  const isVercel = env.VERCEL === "1";
+  return {
+    options: {
+      connectionString,
+      application_name: "gustavo",
+      max: isVercel ? 5 : 10,
+      connectionTimeoutMillis: 5_000,
+      ...(isVercel ? { idleTimeoutMillis: 5_000 } : {}),
+      ...(env.GUSTAVO_DATABASE_SSL === "require"
+        ? { ssl: { rejectUnauthorized: true } }
+        : {}),
+    },
+    attach(pool): void {
+      if (isVercel) {
+        attachDatabasePool(pool);
+      }
+    },
+  };
+}
+
+function configuredPool(): Pool {
+  const policy = postgresPoolPolicy(process.env, attachVercelDatabasePool);
+  const pool = new Pool(policy.options);
+  policy.attach(pool);
+  return pool;
 }
 
 export function getDatabase(): EventDatabase {

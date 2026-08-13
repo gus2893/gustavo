@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { postgresPoolPolicy } from "../../lib/server/db/postgres";
 
 const EXPECTED_ACTIVE_ENV_KEYS = [
   "CODEX_HOME",
@@ -121,5 +122,24 @@ describe("Vercel hybrid deployment contract", () => {
     expect(env).not.toMatch(
       /OPENAI_API_KEY|PAID_FALLBACK|OVERAGE_ENABLED|GUSTAVO_EVENT_ENCRYPTION_KEY|GUSTAVO_INVITATION_HMAC_KEY|GUSTAVO_MEMORY_ENCRYPTION_KEY|GUSTAVO_NODE_SEED_ENCRYPTION_KEY|GUSTAVO_PASSWORD_PEPPER|GUSTAVO_SESSION_HMAC_KEY|GUSTAVO_THOUGHT_ENCRYPTION_KEY/,
     );
+  });
+});
+
+describe("Vercel PostgreSQL policy", () => {
+  it("uses a bounded Vercel pool and attaches exactly that pool", () => {
+    const attach = vi.fn();
+    const policy = postgresPoolPolicy(
+      { VERCEL: "1", DATABASE_URL: "postgresql://example.invalid/db" },
+      attach,
+    );
+
+    expect(policy.options).toMatchObject({
+      max: 5,
+      connectionTimeoutMillis: 5_000,
+      idleTimeoutMillis: 5_000,
+    });
+    policy.attach({ marker: "pool" } as never);
+    expect(attach).toHaveBeenCalledOnce();
+    expect(attach).toHaveBeenCalledWith({ marker: "pool" });
   });
 });
