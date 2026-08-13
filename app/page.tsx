@@ -31,6 +31,7 @@ export default async function PublicHome() {
           Educational market commentary about current prices, uncertainty, and
           competing interpretations—not individualized financial advice.
         </p>
+        <p>SIMULATION ONLY — NOT A REAL TRADE</p>
       </header>
 
       <PublicFeed events={publicActivity} />

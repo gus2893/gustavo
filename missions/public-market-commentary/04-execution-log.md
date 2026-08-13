@@ -3,10 +3,10 @@
 ## Summary
 
 - Plan: `03-plan.md`
-- Tasks completed: 35 / 36
-- Final test suite: not run
-- Final type check: not run
-- Final build: not run
+- Tasks completed: 36 / 36
+- Final test suite: partial — 800/807 passed in the 22-minute serialized run; all seven failures then passed or were resolved in exact focused reruns (five clock-horizon recall fixtures 5/5, product policy 2/2 after restoring the mandatory label, static boundaries 11/11 after the required fresh build)
+- Final type check: passed
+- Final build: passed
 - Execution workflow note: the installed MCAX kit did not contain `agents/mcax-implementer.md` or `agents/mcax-code-reviewer.md`; execution uses fresh generic subagents with self-contained briefs reproducing the required test-first and two-stage review disciplines.
 
 ## Tasks
@@ -363,3 +363,14 @@
 - Spec review: passed after bounded created-at/runtime catch-up, fair paginated polling, cron edge/DST correctness, per-schedule error isolation, exact same-slot replay, controller restart/shutdown, and production worker lifecycle integration.
 - Quality review: passed after coalescing overlapping polls, containing error callbacks, protecting canonical generation-outbox semantics, replacing minute scans with bounded calendar-aware evaluation, and fixing dense DST overlap chronology while preserving performance budgets.
 - Scope: immutable versioned schedules, bounded catch-up and fairness, one Main-authored encrypted event/outbox/cycle per due slot, durable replay/error cursors, exact cron/timezone behavior, protected generation jobs, and production worker start/stop integration. No live posting or trading execution behavior was added.
+
+### T36 — Prove production readiness across recovery, cache, scheduling, health, and public safety
+
+- Status: completed with accepted partial full-suite evidence
+- Commit: `T36: prove Gustavo production readiness` (resolve the single-task commit from Git history)
+- Red: the production-readiness browser test first failed because its recovery helpers did not exist. Real integration then exposed PostgreSQL 17 snapshot-token incompatibility, in-memory rather than Valkey restart proof, mojibake in the exact simulation label, process-local cleanup ownership, inherited Windows ACLs, fail-open Docker inspection, an unprotected backup key, missing Compose operator-health credentials, and the public root missing the mandatory simulation label.
+- Green: root verification passed the real production-readiness Playwright suite 4/4 against disposable PostgreSQL, real Next, real `pg_dump`/verify/isolated restore, and the pinned Valkey container restart/prewarm path. Backup passed 7/7, local runtime passed 8/8 during implementation, product policy passed 2/2, static boundaries passed 11/11 after a fresh production build, strict TypeScript and diff hygiene passed, and all owned containers/processes/temp roots were removed.
+- Spec review: passed after real Valkey loss/restart, exact UTF-8 safety labeling, owner-only cross-process cleanup registries, direct-parent/non-reparse validation, Docker ownership labels, fail-closed cleanup retries, and the web-only required operator-health token.
+- Quality review: passed after backup-key ACL hardening, pre-launch Valkey ownership registration, web-only Compose token wiring, portable PowerShell documentation, and the final public simulation label restoration.
+- Scope: real encrypted backup verification and isolated restore, canonical cache rebuild/restart/prewarm, scheduled Main cycle, authenticated no-store operator health, safe public HTML/API output, production-disabled fixtures, hardened cross-process cleanup, and a launch checklist/manual smoke flow. No fake production provider, live posting, or trading execution was added.
+- Deviation: the serialized 46-file Windows suite completed with 800/807 passing. Five late recall assertions were the documented module-level clock-horizon fixtures and passed 5/5 fresh; the stale-build validator passed 11/11 after rebuilding; the missing public safety label was fixed and product policy passed 2/2. The T34 fully projected million-memory benchmark remains explicitly unverified. Stale inactive disposable PostgreSQL directories that exhausted C: were moved recoverably to `D:\gustavo-test-fixture-cleanup-20260812-final` and documented in the T36 debug artifact.

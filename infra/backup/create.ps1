@@ -142,7 +142,7 @@ select coalesce(max(ingested_sequence)::text,'0') from events;
   $snapshot = $lines[0]
   $schema = $lines[1]
   $highWater = $lines[2]
-  if ($snapshot -notmatch '^[0-9]+-[0-9]+$' -or $schema -notmatch '^[A-Za-z0-9._:-]+$' -or
+  if ($snapshot -notmatch '^[0-9A-F]{8}-[0-9A-F]{8}-[0-9]+$' -or $schema -notmatch '^[A-Za-z0-9._:-]+$' -or
       $highWater -notmatch '^[A-Za-z0-9._:-]+$') {
     try { $process.Kill() } catch { }
     $process.Dispose()

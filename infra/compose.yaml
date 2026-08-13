@@ -99,7 +99,9 @@ services:
     tmpfs:
       - /tmp:size=32m,mode=1777
       - /app/.next/cache:size=64m,mode=1777,uid=1000,gid=1000
-    environment: *app-environment
+    environment:
+      <<: *app-environment
+      GUSTAVO_OPERATOR_HEALTH_TOKEN: ${GUSTAVO_OPERATOR_HEALTH_TOKEN}
     ports:
       - "127.0.0.1:${GUSTAVO_PORT:-3000}:3000"
     depends_on:

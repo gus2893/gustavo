@@ -79,7 +79,7 @@ describe("encrypted backup and isolated restore", () => {
       `>>"${audit}" echo psql-pgpass:%PGPASSFILE%`,
       `>>"${audit}" echo psql-url:%GUSTAVO_BACKUP_DATABASE_URL%`,
       `powershell -NoProfile -Command "$target=Split-Path -Parent (Split-Path -Parent $env:PGPASSFILE); (Get-Acl -LiteralPath $target).AreAccessRulesProtected" >>"${audit}"`,
-      "echo 00000003-1",
+      "echo 00000003-000000BC-1",
       "echo 0019_zz_stream.sql",
       "echo 987654",
       "more >nul",
@@ -117,7 +117,7 @@ describe("encrypted backup and isolated restore", () => {
     };
     expect(manifest).toMatchObject({ schemaVersion: "0019_zz_stream.sql", eventHighWater: "987654" });
     const auditText = await readFile(audit, "utf8");
-    expect(auditText).toContain("--snapshot=00000003-1");
+    expect(auditText).toContain("--snapshot=00000003-000000BC-1");
     expect(auditText).not.toContain("env-secret");
     expect(auditText).not.toContain("postgresql://");
     expect(auditText).toMatch(/psql-url:\s*(?:\r?\n)/);

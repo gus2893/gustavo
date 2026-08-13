@@ -2058,7 +2058,7 @@ Yes. It adds only schedule-to-cycle orchestration.
 ### T36 — Prove complete production-readiness improvements
 
 **Maps to:** R1–R90
-**Files touched:** `tests/e2e/gustavo-production-readiness.spec.ts` (new), `tests/e2e/fixtures.ts` (modify), `docs/PRODUCTION_CHECKLIST.md` (new), `docs/SMOKE_TEST.md` (modify)
+**Files touched:** `tests/e2e/gustavo-production-readiness.spec.ts` (new), `tests/e2e/fixtures.ts` (modify), `docs/PRODUCTION_CHECKLIST.md` (new), `docs/SMOKE_TEST.md` (modify), `infra/backup/create.ps1` (modify; PostgreSQL 17 snapshot-token compatibility), `tests/infra/backup-restore.test.ts` (modify; snapshot-token regression), `infra/compose.yaml` (modify; web-only operator health token), `infra/env.example` (modify), `tests/infra/local-runtime.test.ts` (modify), `app/page.tsx` (modify; exact public simulation label), `missions/public-market-commentary/debug-t36-postgres-snapshot-token.md` (new; authorized debug artifact), `missions/public-market-commentary/debug-t36-full-suite.md` (new; authorized debug artifact)
 
 #### Red — failing test
 

@@ -70,3 +70,34 @@ checks:
 The production local stack has no model or live market-data adapter yet. Do not
 turn on test fixtures to simulate one; the deterministic licensed observation is
 owned only by the automated isolated smoke.
+
+## Production-readiness improvement smoke
+
+Run the integrated improvement proof with Node 24, PostgreSQL 17 tools, a
+running Docker Engine, the locked dependencies, and installed Chromium. The
+harness runs the Compose-pinned `valkey/valkey:8.1.3-bookworm` image. On
+non-Windows hosts, PowerShell 7 (`pwsh`) is also required to run the production
+backup scripts:
+
+```powershell
+pnpm playwright test tests/e2e/gustavo-production-readiness.spec.ts
+```
+
+The test uses one disposable PostgreSQL cluster and a real Next server. It
+creates protected account history, runs the production encrypted backup and
+shared verifier, restores into a separately named database, and compares the
+authenticated schema version and event high-water. It destroys a disposable
+Valkey container, confirms the replacement starts empty, and rebuilds/prewarms
+it through PostgreSQL-authoritative production cache APIs. It opens a due Main
+Brain broadcast through the production scheduler,
+and authenticates the bounded operator-health route. It then clears cookies and
+checks the public page and API for private text, ciphertext fields, execution
+language, and false live-post labeling. The isolated restore database, backup
+directory, web process, and PostgreSQL cluster are removed after the run.
+
+This smoke proves integration and recovery behavior, not the projected-million
+performance budget. `docs/PERFORMANCE.md` records that only the smaller
+projected calibration has passed; the full projected-million benchmark remains
+required before public launch. Complete every item in
+`docs/PRODUCTION_CHECKLIST.md` before changing Squarespace DNS or enabling public
+ingress.

@@ -129,6 +129,16 @@ describe("working MVP local runtime", () => {
     expect(example).not.toMatch(/backup|s3|dns|tls/iu);
   });
 
+  it("passes the required operator-health token to web only", async () => {
+    const compose = await readFile("infra/compose.yaml", "utf8");
+    const example = await readFile("infra/env.example", "utf8");
+    const interpolation = "GUSTAVO_OPERATOR_HEALTH_TOKEN: ${GUSTAVO_OPERATOR_HEALTH_TOKEN}";
+    expect(example).toMatch(/^GUSTAVO_OPERATOR_HEALTH_TOKEN=$/mu);
+    expect(serviceBlock(compose, "web")).toContain(interpolation);
+    expect(serviceBlock(compose, "worker")).not.toContain("GUSTAVO_OPERATOR_HEALTH_TOKEN");
+    expect(compose).not.toContain("${GUSTAVO_OPERATOR_HEALTH_TOKEN:-");
+  });
+
   it("fails closed unless production worker ownership is singular and explicit", () => {
     expect(() => resolveProductionWorkerOwner({})).toThrow(
       "GUSTAVO_BACKGROUND_WORKER_OWNER_REQUIRED",
