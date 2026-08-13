@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   BRIDGE_JOB_RETENTION_DAYS,
+  BRIDGE_JOB_LEASE_MINUTES,
   BRIDGE_JOB_KINDS,
   BRIDGE_JOB_ROLES,
   BRIDGE_JOB_STATUSES,
   BRIDGE_ROLE_PRIORITIES,
   BRIDGE_SAFE_TERMINAL_CODES,
+  claimNextBridgeJob,
+  completeBridgeJob,
   DEPLOYMENT_QUOTA_NAMES,
   HYBRID_WORKER_COMPONENTS,
   HYBRID_WORKER_SAFE_CODES,
@@ -16,12 +19,16 @@ import {
   MARKET_SYMBOL_KINDS,
   MARKET_WINDOW_SAFE_CODES,
   MARKET_WINDOW_STATUSES,
+  failBridgeJob,
+  type BridgeCallerFailureCode,
   type MarketLatestQuoteRow,
   type MarketPollWindowRow,
   type HybridWorkerHeartbeatRow,
 } from "../../lib/server/bridge/jobs";
+import { appendEvent } from "../../lib/server/events/store";
 import { appendMessage } from "../../lib/server/history/messages";
-import { createConversationFixture } from "../helpers/postgres";
+import { routeNodeReply } from "../../lib/server/node-brains/router";
+import { createConversationFixture, type ConversationFixture } from "../helpers/postgres";
 
 const EXPECTED_STOCKS = "AAPL, MSFT, NVDA, AMZN, GOOGL, GOOG, META, TSLA, BRK.B, AVGO, JPM, LLY, V, XOM, MA, UNH, COST, WMT, NFLX, ORCL, HD, PG, JNJ, BAC, ABBV, KO, CRM, CVX, MRK, AMD, PLTR, CSCO, ACN, MCD, IBM, GE, CAT, GS, MS, AXP, BX, TMO, ISRG, LIN, ABT, DIS, NOW, QCOM, TXN, AMGN, DHR, PEP, PM, INTU, BKNG, RTX, AMAT, SPGI, NEE, LOW, UPS, HON, PFE, C, MU, SBUX, COP, SCHW, GILD, ADP, DE, BLK, PANW, LRCX, KLAC".split(", ");
 const EXPECTED_ETFS = "SPY, QQQ, DIA, IWM, VTI, VO, VB, VOO, IVV, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XLB, XLRE, ARKK".split(", ");
@@ -33,6 +40,27 @@ function forbiddenFieldIntersection(
   forbidden: readonly string[],
 ): readonly string[] {
   return Object.freeze(Object.keys(row).filter((key) => forbidden.includes(key)).sort());
+}
+
+async function expireClaimedBridgeLease(
+  db: ConversationFixture["db"],
+  jobId: string,
+): Promise<void> {
+  await db.transaction(async (transaction) => {
+    await transaction.query(
+      "alter table bridge_model_jobs disable trigger bridge_model_jobs_are_semantically_immutable",
+    );
+    await transaction.query(
+      `update bridge_model_jobs
+          set updated_at=created_at,
+              lease_expires_at=created_at+interval '1 millisecond'
+        where job_id=$1`,
+      [jobId],
+    );
+    await transaction.query(
+      "alter table bridge_model_jobs enable trigger bridge_model_jobs_are_semantically_immutable",
+    );
+  });
 }
 
 const MARKET_POLL_WINDOW_ROW_CONTRACT = {
@@ -478,12 +506,12 @@ describe("bridge job authority", () => {
     await expect(fixture.db.query(
       `insert into deployment_quota_counters
          (quota_name,bucket_date,used_count,limit_count)
-       values ('PAID_FALLBACK',date '2026-08-13',0,1)`,
+       values ('PAID_FALLBACK',(clock_timestamp() at time zone 'UTC')::date,0,1)`,
     )).rejects.toThrow();
     await expect(fixture.db.query(
       `insert into deployment_quota_counters
          (quota_name,bucket_date,used_count,limit_count)
-       values ('CODEX_JOBS',date '2026-08-13',0,101)`,
+       values ('CODEX_JOBS',(clock_timestamp() at time zone 'UTC')::date,0,101)`,
     )).rejects.toThrow();
     await expect(fixture.db.query(
       "insert into market_symbol_catalog(ordinal,symbol,kind) values (96,'PAYW','STOCK')",
@@ -554,7 +582,7 @@ describe("bridge job authority", () => {
     await fixture.db.query(
       `insert into deployment_quota_counters (
          quota_name,bucket_date,used_count,limit_count
-       ) values ('CODEX_JOBS',date '2026-08-13',0,100)`,
+       ) values ('CODEX_JOBS',(clock_timestamp() at time zone 'UTC')::date,0,100)`,
     );
 
     const rows = [
@@ -578,7 +606,8 @@ describe("bridge job authority", () => {
       ), FORBIDDEN_MARKET_FIELDS],
       [await fixture.db.one<Record<string, unknown>>(
         `select * from deployment_quota_counters
-          where quota_name='CODEX_JOBS' and bucket_date=date '2026-08-13'`,
+          where quota_name='CODEX_JOBS'
+            and bucket_date=(clock_timestamp() at time zone 'UTC')::date`,
       ), [...FORBIDDEN_JOB_FIELDS, ...FORBIDDEN_MARKET_FIELDS]],
       [await fixture.db.one<Record<string, unknown>>(
         "select * from market_symbol_catalog where symbol='AAPL'",
@@ -752,6 +781,7 @@ describe("bridge job authority", () => {
     }
     expect(BRIDGE_ROLE_PRIORITIES).toEqual({ NODE: 0, EVALUATOR: 10, MAIN: 20 });
     expect(BRIDGE_JOB_RETENTION_DAYS).toBe(7);
+    expect(BRIDGE_JOB_LEASE_MINUTES).toBe(15);
     expect(HYBRID_WORKER_SAFE_CODES).toEqual([
       "AUTH_REQUIRED",
       "QUOTA_EXHAUSTED",
@@ -824,5 +854,616 @@ describe("bridge job authority", () => {
         for (const value of tuple) expect(sqlDomain).toContain(`'${value}'`);
       }
     }
+  }, 30_000);
+});
+
+describe("bridge claiming", () => {
+  it("serializes one active job, orders Node/Evaluator/Main, and rejects job 101", async () => {
+    const fixture = await createConversationFixture("bridge-claim-order");
+    await appendMessage(fixture, { idempotencyKey: "claim-1", role: "USER", text: "one" });
+    await appendMessage(fixture, { idempotencyKey: "claim-2", role: "USER", text: "two" });
+
+    expect(BRIDGE_ROLE_PRIORITIES).toEqual({ NODE: 0, EVALUATOR: 10, MAIN: 20 });
+    const first = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    const overlapping = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v2",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    expect(first?.role).toBe("NODE");
+    expect(overlapping).toBeNull();
+    await expect(fixture.db.one(
+      `select used_count
+         from deployment_quota_counters
+        where quota_name='CODEX_JOBS'
+          and bucket_date=(clock_timestamp() at time zone 'UTC')::date`,
+    )).resolves.toEqual({ used_count: 1 });
+
+    const capped = await createConversationFixture("bridge-claim-cap");
+    await appendMessage(capped, { idempotencyKey: "cap-1", role: "USER", text: "capped" });
+    await capped.db.query(
+      `insert into deployment_quota_counters (quota_name,bucket_date,used_count,limit_count)
+       values ('CODEX_JOBS',(clock_timestamp() at time zone 'UTC')::date,100,100)
+       on conflict (quota_name,bucket_date) do update set used_count=100,limit_count=100`,
+    );
+    const bucket = await capped.db.one<{
+      readonly bucket_date: string;
+      readonly database_bucket: string;
+    }>(
+      `select to_char(bucket_date,'YYYY-MM-DD') bucket_date,
+              to_char((clock_timestamp() at time zone 'UTC')::date,'YYYY-MM-DD') database_bucket
+         from deployment_quota_counters
+        where quota_name='CODEX_JOBS'
+          and bucket_date=(clock_timestamp() at time zone 'UTC')::date`,
+    );
+    expect(bucket.bucket_date).toBe(bucket.database_bucket);
+    await expect(claimNextBridgeJob(capped.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:01:00Z"),
+    })).rejects.toThrow("CODEX_DAILY_QUOTA_EXHAUSTED");
+    await expect(capped.db.one(
+      `select status,attempt_count,used_count
+         from bridge_model_jobs
+         cross join deployment_quota_counters
+        where quota_name='CODEX_JOBS'
+          and bucket_date=(clock_timestamp() at time zone 'UTC')::date`,
+    )).resolves.toEqual({ status: "PENDING", attempt_count: 0, used_count: 100 });
+  }, 30_000);
+
+  it("claims all roles by priority and preserves identity on expired recovery", async () => {
+    const fixture = await createConversationFixture("bridge-priority-recovery");
+    const node = await appendMessage(fixture, {
+      idempotencyKey: "priority-node",
+      role: "USER",
+      text: "node",
+    });
+    const evaluator = await appendMessage(fixture, {
+      idempotencyKey: "priority-evaluator",
+      role: "USER",
+      text: "evaluator",
+    });
+    const main = await appendMessage(fixture, {
+      idempotencyKey: "priority-main",
+      role: "USER",
+      text: "main",
+    });
+    await fixture.db.transaction(async (transaction) => {
+      await transaction.query(
+        "alter table bridge_model_jobs disable trigger bridge_model_jobs_are_semantically_immutable",
+      );
+      try {
+        await transaction.query(
+          `update bridge_model_jobs
+              set role='EVALUATOR',kind='EVALUATOR_REVIEW',priority=10
+            where source_event_id=$1`,
+          [evaluator.eventId],
+        );
+        await transaction.query(
+          `update bridge_model_jobs
+              set role='MAIN',kind='MAIN_GENERATION',priority=20
+            where source_event_id=$1`,
+          [main.eventId],
+        );
+      } finally {
+        await transaction.query(
+          "alter table bridge_model_jobs enable trigger bridge_model_jobs_are_semantically_immutable",
+        );
+      }
+    });
+
+    const first = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    expect(first).toMatchObject({ sourceEventId: node.eventId, role: "NODE", attemptCount: 1 });
+    await failBridgeJob(fixture.db, {
+      jobId: first!.jobId,
+      workerId: "local-v1",
+      attemptCount: first!.attemptCount,
+      safeCode: "CODEX_PROCESS_FAILED",
+    });
+    const second = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:01:00Z"),
+    });
+    expect(second).toMatchObject({ sourceEventId: evaluator.eventId, role: "EVALUATOR" });
+    await failBridgeJob(fixture.db, {
+      jobId: second!.jobId,
+      workerId: "local-v1",
+      attemptCount: second!.attemptCount,
+      safeCode: "CODEX_PROCESS_FAILED",
+    });
+    const third = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:02:00Z"),
+    });
+    expect(third).toMatchObject({ sourceEventId: main.eventId, role: "MAIN" });
+    await failBridgeJob(fixture.db, {
+      jobId: third!.jobId,
+      workerId: "local-v1",
+      attemptCount: third!.attemptCount,
+      safeCode: "CODEX_PROCESS_FAILED",
+    });
+
+    const recoveryFixture = await createConversationFixture("bridge-expired-recovery");
+    const source = await appendMessage(recoveryFixture, {
+      idempotencyKey: "recovery-source",
+      role: "USER",
+      text: "recover",
+    });
+    const original = await recoveryFixture.db.one<{
+      readonly job_id: string;
+      readonly request_digest: string;
+    }>(
+      "select job_id::text,request_digest::text from bridge_model_jobs where source_event_id=$1",
+      [source.eventId],
+    );
+    await recoveryFixture.db.query(
+      `update bridge_model_jobs job
+          set status='CLAIMED',attempt_count=1,lease_owner='expired-v1',
+              updated_at=transition.at,
+              lease_expires_at=transition.at+interval '25 milliseconds'
+         from (select clock_timestamp() as at) transition
+        where job.source_event_id=$1`,
+      [source.eventId],
+    );
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    const recovered = await claimNextBridgeJob(recoveryFixture.db, {
+      workerId: "local-v2",
+      now: new Date("2026-08-13T12:03:00Z"),
+    });
+    expect(recovered).toMatchObject({
+      jobId: original.job_id,
+      requestDigest: original.request_digest,
+      attemptCount: 2,
+      leaseOwner: "local-v2",
+    });
+  }, 30_000);
+
+  it("binds completion to the routed output and replays terminal transitions safely", async () => {
+    const fixture = await createConversationFixture("bridge-completion-binding");
+    const source = await appendMessage(fixture, {
+      idempotencyKey: "completion-source",
+      role: "USER",
+      text: "source",
+    });
+    const claim = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    const unbound = await appendMessage(fixture, {
+      idempotencyKey: "unbound-output",
+      role: "NODE",
+      text: "unbound",
+    });
+    await expect(completeBridgeJob(fixture.db, {
+      jobId: claim!.jobId,
+      workerId: "local-v1",
+      attemptCount: claim!.attemptCount,
+      outputEventId: unbound.eventId,
+    })).rejects.toThrow("OUTPUT_AUTHORITY_INVALID");
+
+    const routed = await routeNodeReply({
+      db: fixture.db,
+      accountId: fixture.accountId,
+      conversationId: fixture.conversationId,
+      nodeBrainId: fixture.nodeBrainId,
+      userMessageEventId: source.eventId,
+      coveredByMain: false,
+      contradiction: false,
+      materialEvidence: false,
+      confidence: 0.9,
+      mainStateVersion: "bridge-test-main-v1",
+      sourceIds: [source.eventId],
+    }, async () => "generated");
+    const sourceAuthority = await fixture.db.one<{ readonly correlation_id: string }>(
+      "select correlation_id::text from events where id=$1",
+      [source.eventId],
+    );
+    const outputEvent = await appendEvent(fixture.db, {
+      aggregateId: fixture.conversationId,
+      accountId: fixture.accountId,
+      actor: { type: "NODE_BRAIN", id: fixture.nodeBrainId },
+      type: "brain.response.completed",
+      visibility: "PRIVATE_ACCOUNT",
+      body: { text: "bound", role: "NODE", completion: { status: "COMPLETED", reason: null } },
+      idempotencyKey: "bridge-canonical-bound-output",
+      causationId: routed.routingEventId,
+      correlationId: sourceAuthority.correlation_id,
+    });
+    await fixture.db.query(
+      `insert into messages (
+         event_id,conversation_id,account_id,role,idempotency_key,status,
+         occurred_at,completed_at,aborted_at,abort_reason
+       ) values ($1,$2,$3,'NODE','bound-output','COMPLETED',$4,$4,null,null)`,
+      [outputEvent.id, fixture.conversationId, fixture.accountId, outputEvent.occurredAt],
+    );
+    const output = { eventId: outputEvent.id } as const;
+    const completed = await completeBridgeJob(fixture.db, {
+      jobId: claim!.jobId,
+      workerId: "local-v1",
+      attemptCount: claim!.attemptCount,
+      outputEventId: output.eventId,
+    });
+    expect(completed).toMatchObject({ status: "COMPLETED", outputEventId: output.eventId });
+    await expect(completeBridgeJob(fixture.db, {
+      jobId: claim!.jobId,
+      workerId: "local-v1",
+      attemptCount: claim!.attemptCount,
+      outputEventId: output.eventId,
+    })).resolves.toEqual(completed);
+    await expect(completeBridgeJob(fixture.db, {
+      jobId: claim!.jobId,
+      workerId: "local-v1",
+      attemptCount: claim!.attemptCount,
+      outputEventId: unbound.eventId,
+    })).rejects.toThrow("OUTPUT_AUTHORITY_INVALID");
+
+    const failureFixture = await createConversationFixture("bridge-failure-replay");
+    await appendMessage(failureFixture, {
+      idempotencyKey: "failure-source",
+      role: "USER",
+      text: "failure",
+    });
+    const failureClaim = await claimNextBridgeJob(failureFixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    const failed = await failBridgeJob(failureFixture.db, {
+      jobId: failureClaim!.jobId,
+      workerId: "local-v1",
+      attemptCount: failureClaim!.attemptCount,
+      safeCode: "CODEX_TIMEOUT",
+    });
+    expect(failed).toMatchObject({ status: "FAILED", safeCode: "CODEX_TIMEOUT" });
+    await expect(failBridgeJob(failureFixture.db, {
+      jobId: failureClaim!.jobId,
+      workerId: "local-v1",
+      attemptCount: failureClaim!.attemptCount,
+      safeCode: "CODEX_TIMEOUT",
+    })).resolves.toEqual(failed);
+    await expect(failBridgeJob(failureFixture.db, {
+      jobId: failureClaim!.jobId,
+      workerId: "local-v1",
+      attemptCount: failureClaim!.attemptCount,
+      safeCode: "SECRET_DATABASE_FAILURE" as BridgeCallerFailureCode,
+    })).rejects.toThrow("BRIDGE_SAFE_CODE_INVALID");
+  }, 30_000);
+
+  it("rejects routed Node output with a mismatched source correlation", async () => {
+    const fixture = await createConversationFixture("bridge-correlation-binding");
+    const source = await appendMessage(fixture, {
+      idempotencyKey: "correlation-source",
+      role: "USER",
+      text: "source",
+    });
+    const claim = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    const routed = await routeNodeReply({
+      db: fixture.db,
+      accountId: fixture.accountId,
+      conversationId: fixture.conversationId,
+      nodeBrainId: fixture.nodeBrainId,
+      userMessageEventId: source.eventId,
+      coveredByMain: false,
+      contradiction: false,
+      materialEvidence: false,
+      confidence: 0.9,
+      mainStateVersion: "bridge-test-main-v1",
+      sourceIds: [source.eventId],
+    }, async () => "generated");
+    const mismatched = await appendMessage(fixture, {
+      idempotencyKey: "mismatched-correlation-output",
+      role: "NODE",
+      text: "wrong correlation",
+      routingEventId: routed.routingEventId,
+    });
+
+    await expect(completeBridgeJob(fixture.db, {
+      jobId: claim!.jobId,
+      workerId: "local-v1",
+      attemptCount: claim!.attemptCount,
+      outputEventId: mismatched.eventId,
+    })).rejects.toThrow("OUTPUT_AUTHORITY_INVALID");
+  }, 30_000);
+
+  it.each([
+    ["MAIN", "MAIN_GENERATION", 20, "MAIN_BRAIN", "gustavo-main"],
+    ["EVALUATOR", "EVALUATOR_REVIEW", 10, "EVALUATOR", "018f7b22-9f76-7b4d-a4e8-1a2b3c4d5e6f"],
+  ] as const)("fails %s completion closed until its exact authority exists", async (
+    role,
+    kind,
+    priority,
+    actorType,
+    actorId,
+  ) => {
+    const fixture = await createConversationFixture(`bridge-${role.toLowerCase()}-closed`);
+    const source = await appendMessage(fixture, {
+      idempotencyKey: `${role.toLowerCase()}-closed-source`,
+      role: "USER",
+      text: "source",
+    });
+    await fixture.db.transaction(async (transaction) => {
+      await transaction.query(
+        "alter table bridge_model_jobs disable trigger bridge_model_jobs_are_semantically_immutable",
+      );
+      try {
+        await transaction.query(
+          "update bridge_model_jobs set role=$2,kind=$3,priority=$4 where source_event_id=$1",
+          [source.eventId, role, kind, priority],
+        );
+      } finally {
+        await transaction.query(
+          "alter table bridge_model_jobs enable trigger bridge_model_jobs_are_semantically_immutable",
+        );
+      }
+    });
+    const claim = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    const sourceAuthority = await fixture.db.one<{
+      readonly aggregate_id: string;
+      readonly account_id: string;
+      readonly correlation_id: string;
+    }>(
+      "select aggregate_id,account_id,correlation_id::text from events where id=$1",
+      [source.eventId],
+    );
+    const output = await appendEvent(fixture.db, {
+      aggregateId: sourceAuthority.aggregate_id,
+      accountId: sourceAuthority.account_id,
+      actor: { type: actorType, id: actorId },
+      type: role === "MAIN" ? "bridge.main.output" : "bridge.evaluator.output",
+      visibility: "SHARED",
+      body: { protected: true },
+      idempotencyKey: `bridge-${role.toLowerCase()}-permissive-output`,
+      causationId: source.eventId,
+      correlationId: sourceAuthority.correlation_id,
+    });
+
+    await expect(completeBridgeJob(fixture.db, {
+      jobId: claim!.jobId,
+      workerId: "local-v1",
+      attemptCount: claim!.attemptCount,
+      outputEventId: output.id,
+    })).rejects.toThrow("OUTPUT_AUTHORITY_INVALID");
+  }, 30_000);
+
+  it("terminalizes an expired third attempt without charging a fourth job", async () => {
+    const fixture = await createConversationFixture("bridge-attempt-exhaustion");
+    await appendMessage(fixture, {
+      idempotencyKey: "attempt-source",
+      role: "USER",
+      text: "source",
+    });
+    const first = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    await expireClaimedBridgeLease(fixture.db, first!.jobId);
+    const second = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v2",
+      now: new Date("2026-08-13T12:01:00Z"),
+    });
+    expect(second).toMatchObject({ jobId: first!.jobId, attemptCount: 2 });
+    await expireClaimedBridgeLease(fixture.db, second!.jobId);
+    const third = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v3",
+      now: new Date("2026-08-13T12:02:00Z"),
+    });
+    expect(third).toMatchObject({ jobId: first!.jobId, attemptCount: 3 });
+    await expireClaimedBridgeLease(fixture.db, third!.jobId);
+
+    await expect(claimNextBridgeJob(fixture.db, {
+      workerId: "local-v4",
+      now: new Date("2026-08-13T12:03:00Z"),
+    })).resolves.toBeNull();
+    await expect(fixture.db.one(
+      `select job.status,job.attempt_count,job.safe_code,quota.used_count
+         from bridge_model_jobs job
+         join deployment_quota_counters quota
+           on quota.quota_name='CODEX_JOBS'
+          and quota.bucket_date=(clock_timestamp() at time zone 'UTC')::date
+        where job.job_id=$1`,
+      [third!.jobId],
+    )).resolves.toEqual({
+      status: "FAILED",
+      attempt_count: 3,
+      safe_code: "ATTEMPT_LIMIT_EXHAUSTED",
+      used_count: 3,
+    });
+  }, 30_000);
+
+  it("commits attempt-three exhaustion before a later pending job hits the daily cap", async () => {
+    const fixture = await createConversationFixture("bridge-exhaustion-quota-rollback");
+    await appendMessage(fixture, {
+      idempotencyKey: "exhaustion-first",
+      role: "USER",
+      text: "first",
+    });
+    await appendMessage(fixture, {
+      idempotencyKey: "exhaustion-second",
+      role: "USER",
+      text: "second",
+    });
+    const first = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    await expireClaimedBridgeLease(fixture.db, first!.jobId);
+    const secondAttempt = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v2",
+      now: new Date("2026-08-13T12:01:00Z"),
+    });
+    await expireClaimedBridgeLease(fixture.db, secondAttempt!.jobId);
+    const thirdAttempt = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v3",
+      now: new Date("2026-08-13T12:02:00Z"),
+    });
+    await expireClaimedBridgeLease(fixture.db, thirdAttempt!.jobId);
+    await fixture.db.query(
+      `update deployment_quota_counters
+          set used_count=100,updated_at=clock_timestamp()
+        where quota_name='CODEX_JOBS'
+          and bucket_date=(clock_timestamp() at time zone 'UTC')::date`,
+    );
+
+    await expect(claimNextBridgeJob(fixture.db, {
+      workerId: "local-v4",
+      now: new Date("2026-08-13T12:03:00Z"),
+    })).rejects.toThrow("CODEX_DAILY_QUOTA_EXHAUSTED");
+    await expect(fixture.db.one(
+      `select status,attempt_count,safe_code
+         from bridge_model_jobs where job_id=$1`,
+      [thirdAttempt!.jobId],
+    )).resolves.toEqual({
+      status: "FAILED",
+      attempt_count: 3,
+      safe_code: "ATTEMPT_LIMIT_EXHAUSTED",
+    });
+    await expect(fixture.db.one(
+      `select status,attempt_count
+         from bridge_model_jobs
+        where job_id<>$1
+        order by created_at,job_id limit 1`,
+      [thirdAttempt!.jobId],
+    )).resolves.toEqual({ status: "PENDING", attempt_count: 0 });
+  }, 30_000);
+
+  it("continues once after exhaustion cleanup and claims the next pending job", async () => {
+    const fixture = await createConversationFixture("bridge-exhaustion-continues");
+    await appendMessage(fixture, {
+      idempotencyKey: "cleanup-first",
+      role: "USER",
+      text: "first",
+    });
+    const pending = await appendMessage(fixture, {
+      idempotencyKey: "cleanup-second",
+      role: "USER",
+      text: "second",
+    });
+    const first = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    await expireClaimedBridgeLease(fixture.db, first!.jobId);
+    const secondAttempt = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v2",
+      now: new Date("2026-08-13T12:01:00Z"),
+    });
+    await expireClaimedBridgeLease(fixture.db, secondAttempt!.jobId);
+    const thirdAttempt = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v3",
+      now: new Date("2026-08-13T12:02:00Z"),
+    });
+    await expireClaimedBridgeLease(fixture.db, thirdAttempt!.jobId);
+
+    const next = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v4",
+      now: new Date("2026-08-13T12:03:00Z"),
+    });
+    expect(next).toMatchObject({
+      sourceEventId: pending.eventId,
+      attemptCount: 1,
+      leaseOwner: "local-v4",
+    });
+    await expect(fixture.db.one(
+      `select status,attempt_count,safe_code
+         from bridge_model_jobs where job_id=$1`,
+      [thirdAttempt!.jobId],
+    )).resolves.toEqual({
+      status: "FAILED",
+      attempt_count: 3,
+      safe_code: "ATTEMPT_LIMIT_EXHAUSTED",
+    });
+    await expect(fixture.db.one(
+      `select used_count
+         from deployment_quota_counters
+        where quota_name='CODEX_JOBS'
+          and bucket_date=(clock_timestamp() at time zone 'UTC')::date`,
+    )).resolves.toEqual({ used_count: 4 });
+  }, 30_000);
+
+  it("rejects a forged Node actor outside the source conversation authority", async () => {
+    const fixture = await createConversationFixture("bridge-forged-node-actor");
+    const source = await appendMessage(fixture, {
+      idempotencyKey: "forged-actor-source",
+      role: "USER",
+      text: "source",
+    });
+    const claim = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+    const sourceAuthority = await fixture.db.one<{ readonly correlation_id: string }>(
+      "select correlation_id::text from events where id=$1",
+      [source.eventId],
+    );
+    const forgedNodeId = "018f7b22-9f76-7b4d-a4e8-1a2b3c4d5e6f";
+    const forgedRoute = await appendEvent(fixture.db, {
+      aggregateId: fixture.conversationId,
+      accountId: fixture.accountId,
+      actor: { type: "NODE_BRAIN", id: forgedNodeId },
+      type: "node.reply.routed",
+      visibility: "PRIVATE_ACCOUNT",
+      body: { forged: true },
+      idempotencyKey: "bridge-forged-node-route",
+      causationId: source.eventId,
+      correlationId: sourceAuthority.correlation_id,
+    });
+    const forgedOutput = await appendEvent(fixture.db, {
+      aggregateId: fixture.conversationId,
+      accountId: fixture.accountId,
+      actor: { type: "NODE_BRAIN", id: forgedNodeId },
+      type: "brain.response.completed",
+      visibility: "PRIVATE_ACCOUNT",
+      body: { text: "forged", role: "NODE", completion: { status: "COMPLETED", reason: null } },
+      idempotencyKey: "bridge-forged-node-output",
+      causationId: forgedRoute.id,
+      correlationId: sourceAuthority.correlation_id,
+    });
+    await fixture.db.query(
+      `insert into messages (
+         event_id,conversation_id,account_id,role,idempotency_key,status,
+         occurred_at,completed_at,aborted_at,abort_reason
+       ) values ($1,$2,$3,'NODE','forged-node-output','COMPLETED',$4,$4,null,null)`,
+      [forgedOutput.id, fixture.conversationId, fixture.accountId, forgedOutput.occurredAt],
+    );
+
+    await expect(completeBridgeJob(fixture.db, {
+      jobId: claim!.jobId,
+      workerId: "local-v1",
+      attemptCount: claim!.attemptCount,
+      outputEventId: forgedOutput.id,
+    })).rejects.toThrow("OUTPUT_AUTHORITY_INVALID");
+  }, 30_000);
+
+  it("reserves attempt-limit exhaustion for expired attempt-three recovery", async () => {
+    const fixture = await createConversationFixture("bridge-reserved-exhaustion-code");
+    await appendMessage(fixture, {
+      idempotencyKey: "reserved-exhaustion-source",
+      role: "USER",
+      text: "source",
+    });
+    const claim = await claimNextBridgeJob(fixture.db, {
+      workerId: "local-v1",
+      now: new Date("2026-08-13T12:00:00Z"),
+    });
+
+    await expect(failBridgeJob(fixture.db, {
+      jobId: claim!.jobId,
+      workerId: "local-v1",
+      attemptCount: claim!.attemptCount,
+      safeCode: "ATTEMPT_LIMIT_EXHAUSTED" as BridgeCallerFailureCode,
+    })).rejects.toThrow("BRIDGE_SAFE_CODE_INVALID");
+    await expect(fixture.db.one(
+      "select status,attempt_count,safe_code from bridge_model_jobs where job_id=$1",
+      [claim!.jobId],
+    )).resolves.toEqual({ status: "CLAIMED", attempt_count: 1, safe_code: null });
   }, 30_000);
 });
