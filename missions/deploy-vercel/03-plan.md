@@ -409,10 +409,10 @@ Yes. It is an isolated transport-authority module with injected side effects.
 
 ---
 
-### T7 — Run Codex with a fixed isolated process contract
+### T7 — Run Codex in one pinned, ephemeral container
 
 **Maps to:** R3, R6
-**Files touched:** `worker/hybrid/codex-runner.ts` (new), `tests/bridge/codex-cli.test.ts` (new)
+**Files touched:** `worker/hybrid/codex-runner.ts` (new), `worker/hybrid/codex-container/Dockerfile` (new), `worker/hybrid/codex-container/node.schema.json` (new), `worker/hybrid/codex-container/main.schema.json` (new), `worker/hybrid/codex-container/evaluator.schema.json` (new), `tests/bridge/codex-cli.test.ts` (new)
 
 #### Red — failing test
 
@@ -422,31 +422,44 @@ File: `tests/bridge/codex-cli.test.ts`
 import { describe, expect, it, vi } from "vitest";
 import { runIsolatedCodex } from "../../worker/hybrid/codex-runner";
 
-describe("isolated Codex runner", () => {
-  it("uses only fixed noninteractive arguments, stdin, schema output, and a process-tree deadline", async () => {
+describe("container-isolated Codex runner", () => {
+  it("uses one fixed resource-bounded container and stdin-only prompt bytes", async () => {
     const execute = vi.fn().mockResolvedValue({
       exitCode: 0,
       stdout: '{"response":"bounded response"}\n',
       stderr: "",
+      containerExitProven: true,
     });
+    const image = `gustavo-codex@sha256:${"a".repeat(64)}`;
     const result = await runIsolatedCodex({
       role: "NODE",
       prompt: "private prompt",
-      workspace: "C:\\gustavo-codex-empty\\run-1",
-      codexHome: "C:\\gustavo-codex-home",
+      image,
+      authVolume: "gustavo-codex-auth-v1",
       timeoutMs: 30_000,
       execute,
     });
 
     const invocation = execute.mock.calls[0][0];
-    expect(invocation.args).toEqual([
-      "exec", "--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
-      "--sandbox", "read-only", "--ask-for-approval", "never", "--json",
-      "--output-schema", expect.stringMatching(/node\.schema\.json$/),
-      "-C", "C:\\gustavo-codex-empty\\run-1", "-",
-    ]);
+    expect(invocation.command).toBe("docker");
+    expect(invocation.args).toEqual(expect.arrayContaining([
+      "run", "--rm", "--read-only", "--init", "--cap-drop=ALL",
+      "--security-opt", "no-new-privileges:true", "--pids-limit", "64",
+      "--memory", "512m", "--cpus", "1.0", "--network", "bridge",
+      "--tmpfs", "/workspace:rw,noexec,nosuid,nodev,size=16777216",
+      "--mount", "type=volume,src=gustavo-codex-auth-v1,dst=/codex-home",
+      "--env", "CODEX_HOME=/codex-home", image,
+      "/usr/bin/timeout", "--signal=KILL", "--kill-after=5s", "30s",
+      "codex", "exec", "--ephemeral", "--ignore-user-config",
+      "--skip-git-repo-check", "--sandbox", "read-only",
+      "--ask-for-approval", "never", "--model", "gpt-5.6-sol", "--json",
+      "--output-schema", "/schemas/node.schema.json", "-C", "/workspace", "-",
+    ]));
     expect(invocation.stdin).toBe("private prompt");
-    expect(invocation.env).not.toHaveProperty("OPENAI_API_KEY");
+    expect(invocation.env).toEqual(expect.not.objectContaining({
+      OPENAI_API_KEY: expect.anything(), DATABASE_URL: expect.anything(),
+      VALKEY_URL: expect.anything(), FINNHUB_API_KEY: expect.anything(),
+    }));
     expect(result).toEqual({ response: "bounded response" });
   });
 });
@@ -456,25 +469,27 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 
 #### Green — minimum implementation
 
-- Implement the exact fixed argument vector shown in the test; user content is stdin only and cannot contribute argv, environment names, paths, model, or flags.
-- Require a dedicated `CODEX_HOME`, a real empty workspace outside the repository, and an allowlisted role schema generated in that workspace.
-- Remove model API keys, MCP/plugin/connector variables, repository paths, browser variables, and inherited `CODEX_HOME` from the child environment before adding the dedicated value.
-- Bound stdin, stdout, stderr, JSON events, final response, and wall time; kill the full Windows process tree on abort/timeout and discard partial output.
-- Reject malformed JSON, extra schema keys, nonzero exit, unsupported role, unavailable configured model, and any output after the bound with safe codes only.
+- Replace the stale direct-Windows-spawn draft with an injected Docker controller. Accept only image references with an immutable SHA-256 digest and the exact auth volume `gustavo-codex-auth-v1`; generate cryptorandom exact-name/label values internally.
+- Use the fixed `docker run` resource/security arguments in the test. Pass no repository path, Docker socket, host workspace, bind mount, application environment, arbitrary model, or user-controlled argv. User prompt bytes go only to stdin.
+- Pin `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03` and `@openai/codex@0.146.0` in the nested Dockerfile. Bake exact additional-properties-false role schemas under `/schemas`; create no schema or workspace on Windows.
+- Bound stdin, stdout, stderr, JSON event count/line size, final response, container name, and wall time. Use both `/usr/bin/timeout --signal=KILL --kill-after=5s` inside the container and bounded host abort that starts `docker wait` before `docker kill` for the exact labeled name.
+- Treat container exit as proven only when the attached `docker run` and exact `docker wait` authority agree. If Docker is unavailable, the image digest differs, kill/wait cannot prove exit, output arrives after the bound, or cleanup cannot prove the exact container absent, return a safe error and expose a process-level lock that prevents further Codex launches until startup reconciliation succeeds.
+- Reject malformed/fatal-UTF-8 JSON, extra schema keys, nonzero exit, unsupported role, unavailable configured model, usage/output overflow, and partial output. Never include raw Docker/Codex stderr, paths, image names, container IDs, or prompt/output in thrown messages.
+- Add an opt-in Docker integration case using a local fixture image that spawns a descendant marker; abort must prove the labeled container is gone and the marker never appears. Unit tests inject Docker run/wait/kill/inspect and cover daemon loss, duplicate names, stale-label rejection, output bounds, and cleanup.
 
 #### Refactor
 
-- Keep process spawning behind the injected `execute` contract so process-safety cases use a fake child and one later integration test uses a fixture executable.
+- Centralize the frozen Docker argument builder, exact-label parser, bounded stream collector, and safe termination state machine. No generic command runner is exported.
 
 #### Verify
 
-Command: `pnpm vitest run tests/bridge/codex-cli.test.ts -t "uses only fixed noninteractive arguments, stdin, schema output, and a process-tree deadline"`
+Command: `pnpm vitest run tests/bridge/codex-cli.test.ts -t "uses one fixed resource-bounded container and stdin-only prompt bytes"`
 
-Expected: one selected test passes, zero fail, exit code 0; the same file's timeout and malformed-output cases pass.
+Expected: one selected test passes, zero fail, exit code 0; the full file's daemon-loss, kill/wait, schema, malformed-output, bounds, and optional fixture-container cases pass.
 
 #### Reviewable as a unit?
 
-Yes. It is a standalone process boundary and does not yet read or write Gustavo data.
+Yes. It is a standalone local container boundary and does not yet read or write Gustavo data.
 
 ---
 
@@ -525,6 +540,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 - Map NODE, MAIN, and EVALUATOR to separate strict output schemas and existing gateway token/time limits.
 - Return bounded usage metadata only when Codex reports it; otherwise return explicit unknown usage rather than estimated billable cost.
 - Map CLI quota/auth/model-unavailable/timeout/malformed cases to safe provider errors; do not instantiate another provider.
+- Map unproven container termination or Docker/image unavailability to a non-retryable local-provider unavailable result for that drain; never downgrade it to an ordinary model error or launch a fallback.
 
 #### Refactor
 
@@ -980,8 +996,9 @@ describe("hybrid worker host boundary", () => {
     const setup = readFileSync("scripts/setup-hybrid-worker.ps1", "utf8");
     const start = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
     expect(setup).toContain("Gustavo Hybrid Worker");
-    expect(setup).toContain("DedicatedCodexHome");
-    expect(setup).toContain("EmptyWorkspaceRoot");
+    expect(setup).toContain("gustavo-codex-auth-v1");
+    expect(setup).toContain("docker image inspect");
+    expect(setup).toContain("@openai/codex@0.146.0");
     expect(start).toContain("tailscale funnel --bg");
     expect(start).not.toMatch(/0\.0\.0\.0|OPENAI_API_KEY|--dangerously-bypass-approvals-and-sandbox/);
   });
@@ -993,14 +1010,15 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 #### Green — minimum implementation
 
 - Bind only `127.0.0.1`; accept only `POST /wake`, bound body bytes, and T6 verification before calling a coalesced runtime wake.
-- Runtime startup drains expired/pending work, permits one active Codex child, coalesces additional wakes, and can run one market window independently of model work.
-- Runtime stop aborts wake acceptance, any active child/poll, pending follow-up, pool, and server inside a fixed 25-second bound.
-- Setup script validates a dedicated Windows account, owner-only dedicated `CODEX_HOME`, randomized empty workspace root, no repository ACL, Node 24, pnpm 11, standalone Codex sign-in, and Tailscale sign-in before creating the exact task.
+- Runtime startup verifies Docker Desktop, the exact locally recorded image digest, the dedicated auth volume, and absence of stale exact-label containers before it drains expired/pending work. It permits one active Codex container, coalesces additional wakes, and can run one market window independently of model work.
+- Runtime stop aborts wake acceptance, kills/waits the exact active container, stops any poll/follow-up/pool/server, and proves no exact-label container remains inside a fixed 25-second host bound. Unproven termination leaves the CODEX component offline and blocks further claims.
+- Setup script validates a dedicated Windows account, Docker Desktop Personal, Node 24, pnpm 11, Tailscale sign-in, and owner-only local configuration before building the nested Dockerfile with `--pull --no-cache`. It records the resulting immutable local image digest, creates only the exact `gustavo-codex-auth-v1` volume, and performs interactive ChatGPT device authentication inside a one-shot container before creating the exact task.
+- The setup/start scripts never copy the repository, host Codex home, database/provider secrets, or Docker socket into the Codex image/volume. Start refuses a digest mismatch or unrelated container label/name.
 - Start script launches the loopback service first, then `tailscale funnel --bg http://127.0.0.1:<validated-port>`; logs contain safe codes/job IDs only.
 
 #### Refactor
 
-- Export one-shot `wakeModelDrain` and `wakeMarketWindow` methods so controller tests avoid timers and real network services.
+- Export one-shot `wakeModelDrain` and `wakeMarketWindow` methods plus an injected container-controller seam so unit tests avoid timers and Docker while an opt-in fixture test exercises the real engine.
 
 #### Verify
 
@@ -1274,6 +1292,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 #### Green — minimum implementation
 
 - Project only fixed component names, `AVAILABLE|DEGRADED|OFFLINE|UNKNOWN`, safe codes, bounded ages, pending count, and used/limit integers.
+- Map Docker/image/auth-volume unavailability to the existing bounded `PROVIDER_UNAVAILABLE` health authority and unproven container termination to `WORKER_OFFLINE`; never expose daemon text, image/container/volume names, digests, host paths, or IDs.
 - Read heartbeats and quota buckets from PostgreSQL so a Vercel process restart does not erase health state.
 - Extend the existing bearer-auth-first operator route; unauthorized requests stop before health, heartbeat, quota, cache, or database status reads.
 - Retain `Cache-Control: private, no-store`, response-size bounds, existing performance health, and generic failures.
@@ -1389,7 +1408,9 @@ describe("hybrid deployment runbook", () => {
 
     for (const required of [
       "Vercel Hobby", "Neon Free", "Upstash Redis Free", "QStash Free",
-      "Tailscale Free", "Finnhub Free", "900 messages/day", "100 jobs/day",
+      "Tailscale Free", "Finnhub Free", "Docker Desktop Personal",
+      "gustavo-codex-auth-v1", "@openai/codex@0.146.0",
+      "900 messages/day", "100 jobs/day",
       "96 calls/window", "95 results/window", "SIMULATION ONLY — NOT A REAL TRADE",
       "GUSTAVO_HYBRID_BRIDGE_ENABLED=false", "GUSTAVO_MARKET_POLLER_ENABLED=false",
       "tailscale funnel reset", "a0c90dc15390e5accbb42869965e5347f7576b3f",
@@ -1406,11 +1427,11 @@ Expected initial state: `readFileSync("docs/VERCEL_DEPLOYMENT.md")` fails with `
 
 #### Green — minimum implementation
 
-- Write one command-ordered runbook: create Free resources, link the existing Vercel team/project, set Node 24/Corepack, set secrets through dashboards/CLI stdin, migrate, bootstrap, install local worker, start Funnel, configure two QStash schedules, deploy Preview, smoke, promote, and verify domains.
+- Write one command-ordered runbook: create Free resources, link the existing Vercel team/project, set Node 24/Corepack, set secrets through dashboards/CLI stdin, migrate, bootstrap, install Docker Desktop/local worker, build and record the pinned local Codex image digest, create/sign into the exact auth volume, start Funnel, configure two QStash schedules, deploy Preview, smoke, promote, and verify domains.
 - Document daily/provider dashboard checks and application caps: QStash 900/day, Codex 100/day/one active, Finnhub 96/window/exactly 95 results, Redis TTL/key bounds, latest quote and seven-day poll bounds.
 - Document PC-offline behavior: public/history hosted, messages durable/queued, market stale, local health offline; document reconnect recovery.
 - Document backup-before-cutover, flags-first rollback, exact schedule/task/Funnel cleanup, previous Ready promotion or exact safe-shell commit, and additive migration retention.
-- Add only blank secret names and deployment-profile examples to `infra/env.example`; state that standalone Codex uses interactive ChatGPT sign-in and is an unsupported application backend.
+- Add only blank secret names and deployment-profile examples to `infra/env.example`; state that the containerized standalone Codex uses interactive ChatGPT sign-in through the dedicated volume and remains an unsupported application backend. Document image rebuild/re-auth, exact-label reconciliation, and termination-failure shutdown without printing volume/image/container identifiers in application health.
 
 #### Refactor
 
@@ -1472,16 +1493,16 @@ Expected initial state: the message remains queued because no local hybrid E2E c
 
 #### Green — minimum implementation
 
-- In the spec's isolated test process, start the production hybrid runtime with an injected fake Codex executable that emits strict NODE/MAIN/EVALUATOR JSON and a fake Finnhub transport that returns 95 deterministic personal-use fixtures.
+- In the spec's isolated test process, start the production hybrid runtime with an injected fake container transport that emits strict NODE/MAIN/EVALUATOR JSON and a fake Finnhub transport that returns 95 deterministic personal-use fixtures. The fake implements the production run/wait/kill/inspect state machine but never bypasses its argument/label/output validation.
 - Use the existing disposable PostgreSQL/Next fixture; do not add a production fixture endpoint, fake production provider, or test-mode bypass.
-- Run one market wake, then verify 95 rows, timestamps/freshness, exact chat attribution, Main/Evaluator priority fixture, one active Codex child, and no local data copied at bootstrap.
+- Run one market wake, then verify 95 rows, timestamps/freshness, exact chat attribution, Main/Evaluator priority fixture, one active Codex container, and no local data copied at bootstrap.
 - Stop the local controller to verify hosted public/history plus queued/offline status; restart it and verify exactly-once drain/recovery.
 - Capture public request URLs, post bodies, HTML, RSC, and feed payloads and assert absence of the canary, live quote fixture, ciphertext markers, tokens, and tunnel data.
-- Reuse the existing cross-process owned-resource registry for deterministic cleanup of every child/temp resource.
+- Reuse the existing cross-process owned-resource registry for deterministic cleanup of every child/temp resource. An opt-in real-Docker fixture proves one exact labeled descendant container is removed and no repository/application-secret mount is present.
 
 #### Refactor
 
-- Keep fake executable/provider implementations inside the test file and inject them only through production interfaces.
+- Keep fake container/provider implementations inside the test file and inject them only through production interfaces.
 
 #### Verify
 
@@ -1541,8 +1562,8 @@ Expected initial state: with live verification enabled before cutover, the curre
 - Confirm the selected plans are Vercel Hobby, Neon Free, Upstash Redis Free, QStash Free, Tailscale Free personal, and Finnhub Free personal; record plan names and nonsecret resource IDs in the runbook.
 - Create a fresh Neon database in the selected US East region, create empty Upstash Redis/QStash resources, and set only secret-store environment values. Never upload local PostgreSQL, Valkey, backups, accounts, memories, or market data.
 - Link the existing Vercel team/project, set Node 24.x and `ENABLE_EXPERIMENTAL_COREPACK=1`, push the reviewed mission branch, deploy Preview, run migrations/bootstrap, and redeem the single invitation.
-- Install/sign in the isolated local worker account, Codex, Tailscale, and Finnhub key; start the exact loopback/Funnel controller; create only the 15-minute maintenance and five-minute market QStash schedules.
-- Run Preview smoke, public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, and quota boundary checks before production promotion.
+- Install/sign in the isolated local worker account, Docker Desktop, the pinned local Codex image/auth volume, Tailscale, and Finnhub key; verify the recorded image digest and internal timeout, start the exact loopback/Funnel controller, and create only the 15-minute maintenance and five-minute market QStash schedules.
+- Run Preview smoke, public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, container kill/wait and startup-reconciliation rehearsal, and quota boundary checks before production promotion.
 - Promote that exact Ready deployment, verify apex TLS and `www` redirect, then rehearse flags-first local/schedule rollback while confirming the hosted public/history surfaces remain available; restore the verified production state afterward.
 - Run the live test with the Vercel token supplied through the process environment; never write tokens or resource URLs containing credentials to disk or command arguments.
 
@@ -1578,12 +1599,13 @@ Yes. All code is already green before this task; this unit contains named extern
 - [x] Each task isolates one subsystem or one explicit integration boundary and is reviewable before the next task.
 - [x] File paths match the approved design's expected new/modified/test files.
 - [x] Repeated files are edited in ordered layers: schema before lifecycle, lifecycle before runtime, runtime before UI/E2E, and runbook before cutover.
-- [x] Historical migrations 0001–0021, local Compose/Docker runtime, verified backup scripts, public feed route/component, static validator, and unrelated files remain off-limits.
+- [x] Historical migrations 0001–0021, root local Compose/Docker runtime, verified backup scripts, public feed route/component, static validator, and unrelated files remain off-limits; only the design-approved nested Codex image is added.
 - [x] `AGENTS.md` remains explicitly untouched.
 - [x] Verify commands name exact files/tests and expected exit behavior.
-- [x] Quota boundaries cover QStash 901, Codex job 101, one active child, Finnhub call 97 prevention, and exactly 95 results.
+- [x] Quota boundaries cover QStash 901, Codex job 101, one active container, Finnhub call 97 prevention, and exactly 95 results.
 - [x] Security boundaries cover auth-before-read, signature/replay/age/URL binding, encrypted bodies, body-free queues, no secret argv/log/browser output, and public redaction.
 - [x] Failure behavior covers offline local worker, lost wake, expired lease, malformed model output, provider 429, unsupported symbol, Redis loss, SSE reconnect, quota exhaustion, and rollback.
 - [x] The final task verifies the full suite, typecheck, build, validator, browser story, live Preview/production state, diff hygiene, and resource cleanup.
+- [x] Prompt-update impact is resolved: T7 is fully regenerated and T8/T15/T19/T21/T22/T23 explicitly use the container authority without weakening unchanged T1–T6 behavior.
 
 Plan approved. Next: `mcax-execute`.

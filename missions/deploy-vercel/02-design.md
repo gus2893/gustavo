@@ -19,6 +19,7 @@
    - Atomically enqueue Node for each completed operator message, Main for each durable generation cycle, and Evaluator for each Main candidate before a broadcast may commit.
    - Run one Codex subprocess at a time in priority order: Node, Evaluator, Main.
    - Use standalone `codex exec` authenticated by ChatGPT sign-in. Never use an OpenAI API key, paid fallback, Ollama, or provider substitution.
+   - Run that CLI only inside a pinned, ephemeral Docker container with a read-only image, a fresh tmpfs workspace, a dedicated Codex-auth volume, no repository or application-secret mounts, and container-level process/resource deadlines.
    - Persist prompt/output only through existing encrypted event bodies; queue rows contain identifiers, digests, leases, bounded status, and safe error codes.
 
 4. **R4 — Check the fixed 95-symbol personal-use universe every five minutes** → Story 4 / AC1–AC5.
@@ -86,7 +87,7 @@
 - Personal, non-commercial, single-operator use remains eligible for every selected free tier.
 - The operator controls Vercel/domains/GitHub/Windows and can interactively create/sign into Neon, Upstash, Tailscale, Finnhub, and Codex.
 - Marketplace resources start empty and remain explicitly Free with no automatic plan escalation.
-- Windows 11 can run Node 24, standalone Codex, Tailscale, and Task Scheduler.
+- Windows 11 can run Node 24, Docker Desktop Personal, Tailscale, and Task Scheduler; Docker Desktop starts before the hybrid worker.
 - Initial model is `gpt-5.6-sol` for all roles; startup fails if unavailable—there is no fallback.
 - Finnhub continues personal-use US data at 60 calls/minute; unsupported symbols remain visible as unavailable.
 - R4's exact catalog is the launch universe. Expansion requires a prompt/design update.
@@ -100,7 +101,7 @@
 ```text
 Browser -> Vercel Next.js -> Neon (events + durable jobs)
                         \-> QStash signed opaque wake
-QStash -> Tailscale Funnel -> local hybrid worker -> Codex CLI / Finnhub
+QStash -> Tailscale Funnel -> local hybrid worker -> ephemeral Codex container / Finnhub
 local worker -> Neon encrypted result/heartbeat -> DB replay/Upstash -> browser
 QStash -> Vercel internal maintenance -> bounded cache/privacy/stream/schedule work
 ```
@@ -113,7 +114,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 2. **QStash one-shot maintenance.** Bounded signed calls replace always-on cloud/home DB polling, preserving Neon auto-suspend. Vercel Hobby Cron is too infrequent.
 3. **Signed wake, not signed execution.** Funnel verifies QStash signature, canonical URL/body, age, and unique message ID, records the receipt, then merely wakes a DB scan. Claims independently re-authorize source events.
 4. **Bounded latest-market projection.** Ninety-five encrypted mutable latest rows avoid roughly 7,500 permanent quote events/trading day. Existing append-only observations remain authoritative when actually consumed.
-5. **Isolated unsupported Codex runner.** A dedicated Windows account owns an empty randomized workspace and dedicated `CODEX_HOME`, with no ACL access to the repo/operator files. It runs `codex exec --ephemeral --ignore-user-config --skip-git-repo-check --sandbox read-only --ask-for-approval never --json --output-schema <role-schema> -C <empty-workspace> -`, takes prompt on stdin, and kills the process tree on bounds. No browser session, MCP, plugins, connectors, or extra directories are configured. This limits host impact; it does not turn Codex CLI into a supported application API.
+5. **Container-isolated unsupported Codex runner.** The Windows worker never spawns Codex directly. It invokes Docker with a fixed argument vector against a locally built, digest-recorded image whose Node and Codex CLI versions are pinned. Each job gets a uniquely named, labeled, read-only container with `--init`, `--rm`, `--cap-drop ALL`, `no-new-privileges`, fixed PID/memory/CPU limits, a fresh bounded tmpfs mounted at `/workspace`, fixed read-only role schemas baked into `/schemas`, and only the dedicated Codex-auth volume mounted at `/codex-home`. The repository, Windows workspace, database/Valkey/QStash/Finnhub/Tailscale secrets, Docker socket, and arbitrary host paths are never mounted or passed. The container runs an internal wall-time supervisor and the exact noninteractive `codex exec --ephemeral --ignore-user-config --skip-git-repo-check --sandbox read-only --ask-for-approval never --json --output-schema /schemas/<role>.schema.json -C /workspace -` command with prompt bytes on stdin. Host abort also performs bounded `docker kill` plus `docker wait`; startup reconciles only exact labeled containers. Failure to prove container termination disables further Codex claims and reports a safe unavailable state. This limits host impact and gives the container runtime—not ad-hoc Windows process enumeration—process-tree authority; it does not turn Codex CLI into a supported application API.
 6. **Two-phase release.** Preview, resources, migration, bootstrap, local bridge/market, health, leakage scan, and rollback rehearsal must pass before production promotion.
 
 ### Data model
@@ -157,16 +158,17 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `lib/server/bridge/{jobs,qstash,health}.ts`: durable queue, signed delivery, safe health.
 - `lib/server/models/codex-cli.ts`: local-only provider adapter.
 - `lib/server/market-data/{finnhub,latest,session}.ts`: mapping, encrypted projection, window policy.
-- `worker/hybrid/{runtime,wake-server,codex-runner,market-poller}.ts`: serialized, idle-disconnected local runtime.
+- `worker/hybrid/{runtime,wake-server,codex-runner,market-poller}.ts`: serialized, idle-disconnected local runtime and fixed Docker invocation boundary.
+- `worker/hybrid/codex-container/{Dockerfile,node.schema.json,main.schema.json,evaluator.schema.json}`: pinned read-only Codex image and exact role schemas.
 - `app/api/internal/maintenance/route.ts`: signed maintenance.
 - `app/(account)/market/page.tsx`, `components/market/MarketStatus.tsx`: account-only dashboard.
 - `scripts/{migrate-production,bootstrap-production}.ts`: schema/bootstrap.
-- `scripts/{setup-hybrid-worker,start-hybrid-worker}.ps1`: dedicated-user prerequisites, startup task, Funnel.
+- `scripts/{setup-hybrid-worker,start-hybrid-worker}.ps1`: dedicated-user prerequisites, pinned Codex image build/auth-volume setup, Docker readiness, startup task, Funnel.
 - `infra/vercel.env.example`, `docs/VERCEL_DEPLOYMENT.md`: env contract and runbook.
 
 ### Modified files
 
-- `package.json`, `pnpm-lock.yaml`: add `@vercel/functions`, `@upstash/qstash`, and commands.
+- `package.json`, `pnpm-lock.yaml`: add `@vercel/functions`, `@upstash/qstash`, and bounded deployment/container commands.
 - `lib/server/db/postgres.ts`: bounded Vercel pool/Fluid Compute attachment and bounded local pool.
 - `lib/server/history/messages.ts`: return exact job/source binding without weakening authority.
 - `app/api/conversations/[conversationId]/messages/route.ts`: best-effort opaque wake after durable commit.
@@ -180,7 +182,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 
 - `AGENTS.md`: unrelated user-owned changes; byte-for-byte untouched.
 - `db/migrations/0001_events.sql` through `0021_broadcast_schedules.sql`: append-only history; use 0022.
-- `infra/compose.yaml`, `Dockerfile`, `.dockerignore`, `worker/runtime.ts`: preserve verified local MVP; hybrid is separate.
+- `infra/compose.yaml`, root `Dockerfile`, root `.dockerignore`, `worker/runtime.ts`: preserve verified local MVP; the new nested Codex image is hybrid-only.
 - `infra/backup/*.ps1`: verified backup authority is not redesigned.
 - `app/api/public/feed/route.ts`, `components/feed/PublicFeed.tsx`: public DTO never gains live quotes/bridge state.
 - `scripts/validate.ps1`: no weakening/allowlisting; new files must pass it.
@@ -194,14 +196,15 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - QStash Free: two schedules plus direct wakes, verified with current/next signing keys, app cap 900/day.
 - Tailscale Funnel: background HTTPS proxy to a loopback-only wake server.
 - Finnhub Free: local-only personal-use key.
-- Standalone Codex CLI: official noninteractive Windows-capable CLI, explicitly unsupported as app backend.
+- Docker Desktop Personal: local container/process isolation; no remote registry or paid service is required.
+- Standalone Codex CLI: pinned inside the local image, authenticated through a dedicated volume, explicitly unsupported as app backend.
 
 ### Errors and edges
 
 - Duplicate QStash delivery uses a unique receipt; duplicate claims replay the same job/cycle/message.
 - Wake-before-visibility triggers a scan; startup/reconnect recovery finds durable jobs.
 - Offline/auth/quota/malformed output/timeouts/429/unsupported symbol/Neon pause/Redis loss become bounded safe states without deleting history.
-- Codex timeout kills the full child tree; partial output never commits.
+- The in-container supervisor bounds Codex independently; host abort kills and waits for the exact labeled container. Unproven termination disables further claims, and partial output never commits.
 - Redis loss recovers from PostgreSQL; SSE reconnects through DB replay.
 - Secrets enter only environment/secret stores, never argv URLs, logs, browser artifacts, or repository files.
 
@@ -221,7 +224,8 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `lib/server/history/messages.ts` → source-job binding.
 - `lib/server/dal/account-surfaces.ts` → bridge status projection.
 - `lib/server/observability/metrics.ts` → safe hybrid/quota health.
-- `worker/hybrid/{runtime,wake-server,codex-runner,market-poller}.ts` → local hybrid runtime.
+- `worker/hybrid/{runtime,wake-server,codex-runner,market-poller}.ts` → local hybrid runtime and Docker controller.
+- `worker/hybrid/codex-container/{Dockerfile,node.schema.json,main.schema.json,evaluator.schema.json}` → pinned isolated Codex execution image.
 - `app/api/internal/maintenance/route.ts` → signed bounded maintenance.
 - `app/api/conversations/[conversationId]/messages/route.ts` → opaque wake.
 - `app/api/operator/health/route.ts`, `app/api/feed/stream/route.ts` → health and bounded SSE.
@@ -293,6 +297,11 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
   - Previous intent: `vercel.json`: bounded Vercel runtime configuration, with both the SSE and future maintenance route entries created in T1.
   - Revised intent: T1 configures only the already-existing SSE route; the maintenance entry is committed atomically with the new maintenance route in T16. Final production behavior and the 60-second bounds are unchanged.
 - 2026-08-13 prompt-update approved by the user; execution may resume after T1/T16 plan regeneration.
+- 2026-08-13 prompt-update: replace direct Windows Codex spawning with an ephemeral Docker isolation boundary after `debug-t7-process-isolation.md` exhausted three evidence-led fixes without proving process-tree termination or private cleanup.
+  - Previous intent: “A dedicated Windows account owns an empty randomized workspace and dedicated `CODEX_HOME` ... runs `codex exec ... -C <empty-workspace> -` ... and kills the process tree on bounds.”
+  - Revised intent: the worker invokes a pinned, resource-bounded, read-only container with a fresh tmpfs workspace, baked role schemas, and a dedicated auth volume; container-level timeout plus exact `docker kill`/`wait` owns process-tree termination, and unproven termination disables further claims.
+  - Previous intent retained: prompt is stdin-only; exact noninteractive Codex flags, one active job, no API key/paid fallback, no repository/application-secret access, bounded output, and unsupported-backend disclosure remain unchanged.
+- 2026-08-13 containerized-Codex prompt update approved by the user; affected-plan regeneration and execution may resume.
 
 ## Self-review checklist
 
