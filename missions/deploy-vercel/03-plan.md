@@ -8,11 +8,11 @@
 
 - R1 → T1, T2, T17, T20B, T21, T22, T23
 - R2 → T3, T20, T21, T22, T23
-- R3 → T4, T5, T7, T8, T9, T10, T15, T18, T19, T20C, T21, T23
+- R3 → T4, T5, T7, T8, T9, T10, T15, T18, T19, T20C, T20D, T21, T23
 - R4 → T11, T12, T13, T14, T18, T21, T23
-- R5 → T6, T9, T14, T15, T16, T17, T19, T20B, T21, T23
+- R5 → T6, T9, T14, T15, T16, T17, T19, T20B, T20D, T21, T23
 - R6 → T1, T5, T6, T7, T11, T12, T13, T14, T19, T20, T22, T23
-- R7 → T3, T15, T20, T20B, T20C, T21, T22, T23
+- R7 → T3, T15, T20, T20B, T20C, T20D, T21, T22, T23
 
 ## Task list
 
@@ -1682,6 +1682,77 @@ Yes. It adds one explicit local maintenance authority while preserving the exist
 
 ---
 
+### T20D — Expose a proven operator-owned worker stop
+
+**Maps to:** R3, R5, R7
+**Files touched:** `scripts/start-hybrid-worker.ps1` (modify), `tests/infra/hybrid-worker.test.ts` (modify)
+
+#### Red — failing test
+
+File: `tests/infra/hybrid-worker.test.ts`
+
+```ts
+it("stops the exact worker through a protected local proof instead of task termination", () => {
+  const start = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+
+  for (const marker of [
+    "[switch]$StopForMaintenance",
+    "gustavo-hybrid-maintenance-v1",
+    "HYBRID_MAINTENANCE_STOP_UNPROVEN",
+    "HYBRID_WORKER_MAINTENANCE_STOPPED",
+    "PipeSecurity",
+  ]) expect(start).toContain(marker);
+  expect(start).toMatch(/StopForMaintenance[\s\S]+NamedPipeClientStream/);
+  expect(start).toMatch(/NamedPipeServerStream[\s\S]+WaitForConnectionAsync/);
+  expect(start).toMatch(/accepting[\s\S]+requestStop|StopPath[\s\S]+containerAbsent/);
+  expect(start).toMatch(/FunnelStop[\s\S]+HYBRID_WORKER_MAINTENANCE_STOPPED/);
+  expect(start).not.toMatch(/Stop-ScheduledTask|taskkill|TerminateProcess/iu);
+});
+
+it.runIf(process.platform === "win32")(
+  "keeps the operator stop pipe owner and SYSTEM only and withholds proof until settlement",
+  () => {
+    const start = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+    expect(start).toMatch(/PipeAccessRule[\s\S]+LocalSystemSid/);
+    expect(start).toMatch(/SetAccessRuleProtection\(\$true, \$false\)/);
+    const request = start.indexOf("HYBRID_MAINTENANCE_STOP_REQUEST");
+    const runtimeProof = start.indexOf("containerAbsent", request);
+    const funnelProof = start.indexOf("FunnelStop", runtimeProof);
+    const response = start.indexOf("HYBRID_WORKER_MAINTENANCE_STOPPED", funnelProof);
+    expect(request).toBeGreaterThan(-1);
+    expect(runtimeProof).toBeGreaterThan(request);
+    expect(funnelProof).toBeGreaterThan(runtimeProof);
+    expect(response).toBeGreaterThan(funnelProof);
+  },
+);
+```
+
+Expected initial state: the script has no `StopForMaintenance` switch or maintenance-control pipe, and shutdown remains reachable only from the running launcher's private in-process `finally` path.
+
+#### Green — minimum implementation
+
+- Add `-StopForMaintenance` as a mutually exclusive operator-client mode. It validates the exact dedicated local SID, KnownFolder config path, no-reparse/owner+SYSTEM ACL authority, and exact root scheduled task before connecting to `\\.\pipe\gustavo-hybrid-maintenance-v1`; it never reads, writes, or receives the HMAC control nonce.
+- In normal launch mode, create the fixed named-pipe server with inheritance disabled and exactly one FullControl allow rule for the dedicated owner SID plus one for LocalSystem. Bind it before worker startup and retain it until the worker process and every cleanup operation settle.
+- Admit one bounded exact stop request during both STARTING recovery and READY operation. The already-running launcher uses its existing process-only nonce and HMAC request to `/_gustavo/stop`, which closes wake admission, waits the admitted snapshot, applies the shared stop deadline, and proves `containerAbsent=true`; then the launcher completes its existing bounded/retried Funnel-off path and exits normally.
+- Return only exact `HYBRID_WORKER_MAINTENANCE_STOPPED` after runtime/container/Funnel settlement. The client waits boundedly, accepts only that proof, and rechecks root task `Gustavo Hybrid Worker` is no longer Running. Timeout, malformed request/proof, natural worker failure, or cleanup failure returns `HYBRID_MAINTENANCE_STOP_UNPROVEN` and never falls back to `Stop-ScheduledTask`, process killing, raw Funnel mutation, or nonce persistence.
+- Add deterministic injected PowerShell 5.1 tests for wrong SID/ACL, competing clients, stop during STARTING, stop during READY, proof withheld until fake runtime and Funnel settlement, timeout/no proof, and exact pipe/temp cleanup. No test starts Docker, Funnel, the scheduled task, or an external provider.
+
+#### Refactor
+
+- Extract one idempotent launcher cleanup routine shared by natural exit and the maintenance request so the authenticated stop, Funnel retry, worker disposal, and proof ordering cannot drift.
+
+#### Verify
+
+Commands: trusted bundled Node/pnpm runs `vitest run tests/infra/hybrid-worker.test.ts -t "operator stop|StopForMaintenance|maintenance stop"`, then the full hybrid-worker file; parse both PowerShell scripts with Windows PowerShell 5.1; run `tsc --noEmit`.
+
+Expected: all stop regressions pass, the full file has zero failures with controlled-live tests still skipped, both parsers report zero errors, TypeScript exits 0, and no real task/Docker/Funnel/provider action occurs.
+
+#### Reviewable as a unit?
+
+Yes. It exposes one local operator channel over the already-reviewed T15 stop authority without changing cloud, database, or provider behavior.
+
+---
+
 ### T21 — Document exact free-tier setup, operation, degraded mode, and rollback
 
 **Maps to:** R1, R2, R5, R6, R7
@@ -1749,15 +1820,15 @@ Expected initial state: current T21 docs fail on bare ambient commands, mutable 
 
 #### Green — minimum implementation
 
-- Begin with trusted KnownFolder-derived absolute Git/Node/Corepack/PowerShell paths, verify Node 24/pnpm 11.16.0, and invoke every repository command through absolute Node plus Corepack's JS entry. Invoke repository-pinned Vercel CLI `58.4.0` only through `pnpm exec vercel`; never use bare `pnpm`, `npx`, `vercel`, PowerShell, or a mutable environment-derived executable.
-- Fail closed unless the working tree is clean, `HEAD` equals the reviewed pushed upstream commit, and Preview/staged deployment source metadata matches that exact SHA. Configure both Vercel Project Domains explicitly and set the `www.gustavo.lol -> gustavo.lol` redirect in Project Settings before verification.
-- Write one command-ordered runbook: create Free resources; link the existing Vercel team/project; set secrets through dashboards/interactive stdin including hosted `GUSTAVO_HYBRID_WAKE_URL`; migrate; verify the exact migrated authority-only empty inventory; create and verify the migrated-empty encrypted backup; bootstrap; install the local worker; configure two paused schedules; deploy/smoke Preview; activate Production bridge authority; create/smoke staged Production; exact-promote without rebuild; verify domains; then enable schedules.
+- Begin with trusted KnownFolder-derived absolute Git/Node/Corepack/Windows-PowerShell paths, verify Node 24/pnpm 11.16.0, and invoke every repository command through absolute Node plus Corepack's JS entry. Invoke repository-pinned Vercel CLI `58.4.0` only through `pnpm exec vercel`; never use bare `pnpm`, `npx`, `vercel`, PowerShell, or a mutable environment-derived executable.
+- Define one source-proof helper that checks the exit code of fetch, status, and both rev-parse calls independently, requires a clean tree and exact reviewed upstream SHA, and reruns immediately before Preview and again immediately before the staged-production upload. Preview/staged deployment source metadata must match that exact SHA. Configure both Vercel Project Domains explicitly and set the `www.gustavo.lol -> gustavo.lol` redirect in Project Settings before verification.
+- Write one command-ordered runbook: create Free resources; link the existing Vercel team/project; set secrets through dashboards/interactive stdin including hosted `GUSTAVO_HYBRID_WAKE_URL`; load the exact five bootstrap process variables without echoing secrets; migrate; verify the exact migrated authority-only empty inventory using an async-IIFE probe on `tsx` stdin rather than a quote-fragile `-e` argv; create and verify the migrated-empty encrypted backup; bootstrap; install the local worker; configure two paused schedules; deploy/smoke Preview; activate Production bridge authority; create/smoke staged Production; exact-promote without rebuild; verify domains; then enable schedules.
 - Document daily/provider dashboard checks and application caps: QStash Free provider ceiling 1,000/day with Gustavo capped at 900/day, Codex 100/day/one active, Finnhub 96/window/exactly 95 results, Redis TTL/key bounds, latest quote and seven-day poll bounds.
 - Document PC-offline behavior: public/history hosted, messages durable/queued, market stale, local health offline; document reconnect recovery.
 - Document that existing accepted five-minute/direct wakes refresh the DB-clock CODEX lease, two missed wake intervals make it offline at 12 minutes, current-day quota 100 is quota-limited, and there is no independent timer/poller/schedule.
 - Document that reconnect never re-polls an expired window: retained incomplete rows fail once before seven-day pruning, while already pruned rows are skipped and only the newly reserved current window may call Finnhub.
 - Configure the five-minute schedule with the exact fixed signed `MARKET_CURRENT` body. Explain that QStash does not supply a timestamp: after verification/receipt/quota, the local worker derives PostgreSQL's current bucket and T14 reservation rechecks it before provider work.
-- Document that hosted bridge disable is a staged/smoked/exact-promoted `GUSTAVO_HYBRID_BRIDGE_ENABLED=false` artifact. Recurring market disable is pausing the exact market schedule, settling already-admitted active work, then the T15 stop/Funnel/container absence proof; durable `PENDING` jobs remain queued for startup recovery and are never required to disappear.
+- Document that hosted bridge disable is a staged/smoked/exact-promoted `GUSTAVO_HYBRID_BRIDGE_ENABLED=false` artifact. Recurring market disable is pausing the exact market schedule, then calling trusted `start-hybrid-worker.ps1 -StopForMaintenance` and requiring its admitted-work/runtime/container/Funnel/task proof; durable `PENDING` jobs remain queued for startup recovery and are never required to disappear. Ban `Stop-ScheduledTask` and raw Funnel mutation as substitutes.
 - Document image rebuild/re-auth only through `scripts/setup-hybrid-worker.ps1 -MaintenanceRebuild` (and its optional auth-volume rotation switch). Do not publish manual config moves, ambient Docker calls, plaintext backup files, or undefined retirement steps. Rotation/revocation occurs after the new owner-only config and smoke succeed.
 - Document backup-before-bootstrap/cutover, exact schedule/task/Funnel cleanup, previous disabled Ready or restaged exact safe-shell commit, additive migration retention, and proven worker/container absence during rollback.
 - Document creating the local-only Neon materializer login, granting only `gustavo_market_materializer`, copying its pooled URL into the protected worker configuration, rotation/revocation, and safe degradation. Explicitly forbid setting `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL` in Vercel or forwarding it to Codex/Finnhub/QStash.
@@ -1847,7 +1918,7 @@ Expected initial state: the message remains queued because no local hybrid E2E c
 - The disposable fixture creates distinct ordinary and materializer login roles, grants only the migration-created permission role to the latter, passes the materializer URL only to the local test worker, and proves an ordinary-role matching-binding forgery is rejected before the browser story.
 - The five-minute QStash fixture sends the fixed `MARKET_CURRENT` body; assert the local worker derives the current window from database time after receipt/quota and that no dynamic schedule timestamp or hosted relay exists.
 - Exercise the actual hosted direct-chat publisher with hosted `GUSTAVO_HYBRID_WAKE_URL` and QStash token authority; do not replace that proof with an unrelated local one-shot.
-- Prove market disable by pausing the exact market schedule, settling the admitted poll/claimed jobs, closing worker admission, stopping the worker, and proving container absence. Preserve durable `PENDING` jobs for restart; do not reference or synthesize the removed market-poller env flag.
+- Prove market disable by pausing the exact market schedule and invoking the same production `StopForMaintenance` protocol: the fake launcher must close admission, wait the admitted snapshot, prove runtime/container settlement, complete Funnel cleanup, and return its safe proof before the exact task is non-running. Preserve durable `PENDING` jobs for restart; do not reference the removed market-poller flag or substitute forced task termination.
 - Run one market wake, then verify 95 rows, timestamps/freshness, exact chat attribution, Main/Evaluator priority fixture, one active Codex container, and no local data copied at bootstrap.
 - Stop the local controller to verify hosted public/history plus queued/offline status; restart it and verify exactly-once drain/recovery.
 - Simulate abrupt loss without the clean OFFLINE write, advance database time past the 12-minute CODEX lease, and verify chat/health become offline; separately seed current UTC `CODEX_JOBS=100/100` with a fresh heartbeat and verify quota-limited. Accepted wake refresh must not delay the 202 or create an extra schedule/timer.
@@ -1926,7 +1997,7 @@ Expected initial state: with live verification enabled before cutover, the curre
 - Verify an accepted existing wake refreshes the database-clock CODEX lease, two missed five-minute wakes age it offline at 12 minutes, quota 100 overrides fresh heartbeat, and no third schedule or persistent heartbeat timer exists.
 - Verify the live five-minute schedule body is exactly `MARKET_CURRENT`; the local worker derives the PostgreSQL window and a forced boundary crossing skips rather than polling an old window.
 - In Vercel Project Settings > Domains, explicitly configure `www.gustavo.lol` to redirect to `gustavo.lol`. Promote the exact staged Ready deployment without rebuild using pinned `vercel promote <staged-production-url> --yes`, then verify apex TLS, redirect, unchanged deployment ID/SHA, and actual hosted chat publication.
-- Rehearse rollback by exact-promoting a bridge-disabled staged artifact, pausing the exact schedules, settling active/claimed work while preserving durable `PENDING`, stopping the worker through its admission barrier, resetting Funnel, and proving container absence. Never treat the removed market-poller env variable as authority; restore through another fully smoked exact staged artifact, then resume schedules.
+- Rehearse rollback by exact-promoting a bridge-disabled staged artifact, pausing the exact schedules, and invoking trusted `start-hybrid-worker.ps1 -StopForMaintenance`. Require its admitted-work/runtime/container/Funnel/task proof while preserving durable `PENDING`; never use `Stop-ScheduledTask`, raw Funnel reset, or the removed market-poller variable as authority. Restore through another fully smoked exact staged artifact, then resume schedules.
 - Run the live test with the Vercel token supplied through the process environment; never write tokens or resource URLs containing credentials to disk or command arguments.
 
 #### Refactor
@@ -1976,5 +2047,6 @@ Yes. All code is already green before this task; this unit contains named extern
 - [x] Staged-production promotion prompt-update impact is resolved: T21 documents Preview as an early gate plus `--prod --skip-domain` staged smoke and no-rebuild promotion; T23 executes and records both deployment gates before domain assignment.
 - [x] Static market-wake prompt-update impact is resolved: T20A implements the fixed signed `MARKET_CURRENT` trigger plus PostgreSQL window derivation; T21/T22/T23 document and verify the exact schedule body and no historical polling.
 - [x] Operable-deployment-maintenance prompt-update impact is resolved: T20B pins trusted deploy tooling/removes the inert market flag, T20C adds the reviewed worker maintenance authority, and regenerated T21/T22/T23 use real source/domain/backup/shutdown controls.
+- [x] Proven-local-worker-stop prompt-update impact is resolved: T20D exposes the existing T15 stop proof through an owner/SYSTEM-only local pipe, and regenerated T21/T22/T23 never substitute forced task termination or raw Funnel mutation.
 
 Plan approved. Next: `mcax-execute`.
