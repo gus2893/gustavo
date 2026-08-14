@@ -27,6 +27,13 @@ function deferred(): {
   return { promise, resolve };
 }
 
+function powerShellFunction(source: string, name: string): string {
+  const start = source.indexOf(`function ${name}`);
+  if (start < 0) throw new Error(`Missing PowerShell function ${name}`);
+  const end = source.indexOf("\nfunction ", start + "function ".length);
+  return source.slice(start, end < 0 ? source.length : end);
+}
+
 const CONTROL_NONCE = "0123456789abcdef0123456789abcdef0123456789a";
 const CONTROL_CHALLENGE = "abcdef0123456789abcdef0123456789abcdef01234";
 const CONTROL_CHALLENGE_TWO = "bbcdef0123456789abcdef0123456789abcdef01234";
@@ -1026,9 +1033,14 @@ describe("hybrid worker host boundary", () => {
     expect(start).toContain("$RoleStartInfo.FileName = $NodeExecutable");
     expect(start).toContain('$RoleStartInfo.Arguments = ConvertTo-TrustedArguments @($TsxCli, "--eval", $RoleCheck)');
     expect(start).not.toContain("$CorepackExecutable pnpm exec tsx --eval $RoleCheck");
-    expect(start).toMatch(
-      /\$ReadyProof\.state -eq "STARTING"[\s\S]{0,300}Start-Sleep -Milliseconds \(\[Math\]::Min\(/u,
-    );
+    const startingState = start.indexOf('$ReadyProof.state -eq "STARTING"');
+    const signedStarting = start.indexOf("Test-ControlProof", startingState);
+    const maintenanceCheck = start.indexOf("$MaintenanceConnectionTask.IsCompleted", signedStarting);
+    const startingBackoff = start.indexOf("Start-Sleep -Milliseconds ([Math]::Min(", maintenanceCheck);
+    expect(startingState).toBeGreaterThan(-1);
+    expect(signedStarting).toBeGreaterThan(startingState);
+    expect(maintenanceCheck).toBeGreaterThan(signedStarting);
+    expect(startingBackoff).toBeGreaterThan(maintenanceCheck);
     const readinessLoop = start.slice(start.indexOf("$Ready = $false"), start.indexOf("if (-not $Ready)"));
     expect(readinessLoop).toContain("[Diagnostics.Stopwatch]::StartNew()");
     expect(readinessLoop).toContain("ElapsedMilliseconds -lt $ReadinessTimeoutMilliseconds");
@@ -1108,7 +1120,7 @@ describe("hybrid worker host boundary", () => {
     },
   );
 
-  it("bounds Funnel helpers and cleans the worker before retrying a failed Funnel stop", () => {
+  it("bounds Funnel helpers and proves worker stop before Funnel settlement", () => {
     const start = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
     expect(start).toContain("[int]$TimeoutMilliseconds = 0");
     expect(start).toContain("$Process.WaitForExit($TimeoutMilliseconds)");
@@ -1131,16 +1143,32 @@ describe("hybrid worker host boundary", () => {
     expect(start).toContain("$FunnelStopNeedsRetry = $FunnelStop.TimedOut -or $FunnelStop.ExitCode -ne 0");
     expect(start).toContain('Stop-Safely "TAILSCALE_FUNNEL_STOP_FAILED"');
 
-    const firstOff = start.indexOf("$FunnelStop = Invoke-FunnelOff");
-    const workerDispose = start.indexOf("$Worker.Dispose()", firstOff);
-    const retryOff = start.indexOf("$FunnelStopRetry = Invoke-FunnelOff", workerDispose);
-    expect(firstOff).toBeGreaterThan(-1);
-    expect(workerDispose).toBeGreaterThan(firstOff);
-    expect(retryOff).toBeGreaterThan(workerDispose);
-    const workerCleanup = start.slice(firstOff, retryOff);
-    expect(workerCleanup).toContain("try {");
-    expect(workerCleanup).toContain("} finally {");
-    expect(workerCleanup).toContain("$Worker.Dispose()");
+    const transaction = powerShellFunction(start, "Invoke-MaintenanceStopTransaction");
+    const runtimeValidation = powerShellFunction(start, "Assert-MaintenanceRuntimeProof");
+    const runtimeProof = transaction.indexOf("$RuntimeProof = & $RequestStop");
+    const containerProof = runtimeValidation.indexOf("$RuntimeProof.containerAbsent -ne $true");
+    const validatedRuntime = transaction.indexOf("Assert-MaintenanceRuntimeProof $RuntimeProof");
+    const funnelProof = transaction.indexOf("$FunnelProof = & $FunnelStop");
+    const response = transaction.indexOf('return "HYBRID_WORKER_MAINTENANCE_STOPPED"');
+    expect(runtimeProof).toBeGreaterThan(-1);
+    expect(containerProof).toBeGreaterThan(-1);
+    expect(validatedRuntime).toBeGreaterThan(runtimeProof);
+    expect(funnelProof).toBeGreaterThan(validatedRuntime);
+    expect(response).toBeGreaterThan(funnelProof);
+
+    const boundedFunnel = start.slice(
+      start.indexOf("function Invoke-BoundedFunnelStop"),
+      start.indexOf("function Invoke-LauncherCleanup"),
+    );
+    expect(boundedFunnel).toContain("$Attempt -lt 2");
+    expect(boundedFunnel).toContain("$FunnelStop = Invoke-FunnelOff");
+    expect(boundedFunnel).toContain("return $false");
+    const launcherCleanup = start.slice(
+      start.indexOf("function Invoke-LauncherCleanup"),
+      start.indexOf("$StartInfo = [Diagnostics.ProcessStartInfo]::new()"),
+    );
+    expect(launcherCleanup.indexOf("Invoke-MaintenanceStopTransaction"))
+      .toBeLessThan(launcherCleanup.indexOf("$Worker.Dispose()"));
   });
 
   it("derives a finite startup readiness window without weakening the stop deadline", () => {
@@ -1162,7 +1190,9 @@ describe("hybrid worker host boundary", () => {
     expect(start).toContain("$RemainingReadinessMilliseconds");
     expect(start).toContain("-TimeoutSec $ReadyRequestTimeoutSeconds");
     expect(start).toContain("[Diagnostics.Stopwatch]::StartNew()");
-    expect(start).toContain("25000 - [int]$Stopwatch.ElapsedMilliseconds");
+    expect(start).toContain("$StopDeadlineMilliseconds = 25000");
+    expect(start).toContain("$StopDeadlineMilliseconds - [int]$Stopwatch.ElapsedMilliseconds");
+    expect(start).toContain("$Worker.WaitForExit([int]$RemainingMilliseconds)");
 
     const pollMilliseconds = Number(
       /\$ReadinessPollMilliseconds = ([0-9]+)/u.exec(start)?.[1],
@@ -1828,4 +1858,797 @@ describe("hybrid worker host boundary", () => {
       expect(result.stdout).toBe("True|True");
     },
   );
+});
+
+describe("operator maintenance stop", () => {
+  it("stops the exact worker through a protected local proof instead of task termination", () => {
+    const start = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+
+    for (const marker of [
+      "[switch]$StopForMaintenance",
+      "gustavo-hybrid-maintenance-v1",
+      "HYBRID_MAINTENANCE_STOP_UNPROVEN",
+      "HYBRID_WORKER_MAINTENANCE_STOPPED",
+      "PipeSecurity",
+    ]) expect(start).toContain(marker);
+    expect(start).toMatch(/StopForMaintenance[\s\S]+NamedPipeClientStream/u);
+    expect(start).toMatch(/NamedPipeServerStream[\s\S]+WaitForConnectionAsync/u);
+    expect(start).toMatch(/accepting[\s\S]+requestStop|StopPath[\s\S]+containerAbsent/u);
+    expect(start).toMatch(/FunnelStop[\s\S]+HYBRID_WORKER_MAINTENANCE_STOPPED/u);
+    expect(start).not.toMatch(/Stop-ScheduledTask|taskkill|TerminateProcess/iu);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "keeps the operator stop pipe owner and SYSTEM only and withholds proof until settlement",
+    () => {
+      const start = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      expect(start).toMatch(/PipeAccessRule[\s\S]+LocalSystemSid/u);
+      expect(start).toMatch(/SetAccessRuleProtection\(\$true, \$false\)/u);
+      const request = start.indexOf("HYBRID_MAINTENANCE_STOP_REQUEST");
+      const runtimeProof = start.indexOf("containerAbsent", request);
+      const funnelProof = start.indexOf("FunnelStop", runtimeProof);
+      const response = start.indexOf("HYBRID_WORKER_MAINTENANCE_STOPPED", funnelProof);
+      expect(request).toBeGreaterThan(-1);
+      expect(runtimeProof).toBeGreaterThan(request);
+      expect(funnelProof).toBeGreaterThan(runtimeProof);
+      expect(response).toBeGreaterThan(funnelProof);
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "operator stop pipe permits only one concurrent owner and carries no nonce",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const helperStart = source.indexOf("function New-MaintenancePipeSecurity");
+      const helperEnd = source.indexOf("function Receive-MaintenancePipeRequest", helperStart);
+      expect(helperStart).toBeGreaterThan(-1);
+      expect(helperEnd).toBeGreaterThan(helperStart);
+      const helpers = source.slice(helperStart, helperEnd);
+      expect(helpers).not.toMatch(/ControlNonce|HMACSHA256|GUSTAVO_HYBRID_CONTROL_NONCE/u);
+      const pipeName = `gustavo-operator-stop-${process.pid}-${Date.now()}`;
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helpers,
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        `$Server = New-MaintenancePipeServer '${pipeName}' $Owner`,
+        "$Wait = $Server.WaitForConnectionAsync()",
+        `$First = [IO.Pipes.NamedPipeClientStream]::new('.', '${pipeName}', [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)`,
+        `$Second = [IO.Pipes.NamedPipeClientStream]::new('.', '${pipeName}', [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)`,
+        "try {",
+        "  $First.Connect(1000)",
+        "  [void]$Wait.GetAwaiter().GetResult()",
+        "  $SecondRejected = $false",
+        "  try { $Second.Connect(100) } catch { $SecondRejected = $true }",
+        "  $Security = $Server.GetAccessControl()",
+        "  $Rules = @($Security.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))",
+        "  $System = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)",
+        "  $Identities = @($Rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)",
+        "  $Expected = @($Owner.Value, $System.Value | Sort-Object)",
+        "  $Full = @($Rules | Where-Object { $_.PipeAccessRights -eq [IO.Pipes.PipeAccessRights]::FullControl -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow }).Count -eq 2",
+        "  $Summary = \"$($Security.AreAccessRulesProtected)|$($Rules.Count)|$($Identities -join ',')|$($Expected -join ',')|$Full|$SecondRejected\"",
+        "} finally { $Second.Dispose(); $First.Dispose(); $Server.Dispose() }",
+        `$Rebound = New-MaintenancePipeServer '${pipeName}' $Owner`,
+        "try { $ReboundCreated = $null -ne $Rebound } finally { $Rebound.Dispose() }",
+        "[Console]::Out.Write(\"$Summary|$ReboundCreated\")",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ], { encoding: "utf8", timeout: 10_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      const [protectedAcl, ruleCount, identities, expected, full, rejected, rebound] = result.stdout.split("|");
+      expect(protectedAcl).toBe("True");
+      expect(ruleCount).toBe("2");
+      expect(identities).toBe(expected);
+      expect(full).toBe("True");
+      expect(rejected).toBe("True");
+      expect(rebound).toBe("True");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "maintenance stop reads an actual message-mode proof through the production client reader",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const serverHelpers = [
+        "New-MaintenancePipeSecurity",
+        "New-MaintenancePipeServer",
+        "Receive-MaintenancePipeRequest",
+        "Write-MaintenancePipeProof",
+        "Wait-MaintenancePipeProofAcknowledgement",
+      ].map((name) => powerShellFunction(source, name)).join("\r\n");
+      const clientHelper = [
+        "Write-MaintenancePipeProofAcknowledgement",
+        "Read-MaintenancePipeProof",
+        "Assert-MaintenancePipeSecurity",
+        "Invoke-MaintenanceStopClient",
+      ].map((name) => powerShellFunction(source, name)).join("\r\n");
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        serverHelpers,
+        "$ClientSource = @'",
+        clientHelper,
+        "'@",
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        "$Server = New-MaintenancePipeServer 'gustavo-hybrid-maintenance-v1' $Owner",
+        "$Wait = $Server.WaitForConnectionAsync()",
+        "$Job = Start-Job -ArgumentList $ClientSource, $Owner.Value -ScriptBlock {",
+        "  param([string]$ClientSource, [string]$OwnerValue)",
+        "  $ErrorActionPreference = 'Stop'",
+        "  $ProgressPreference = 'SilentlyContinue'",
+        "  function Stop-Safely([string]$Code) { throw $Code }",
+        "  function Get-ExactWorkerTask { return [PSCustomObject]@{ State = 'Running' } }",
+        "  function Wait-ExactWorkerTaskNonRunning {}",
+        "  Invoke-Expression $ClientSource",
+        "  $OwnerSid = [Security.Principal.SecurityIdentifier]::new($OwnerValue)",
+        "  Invoke-MaintenanceStopClient $OwnerSid 'C:\\trusted\\powershell.exe' 'C:\\trusted\\start.ps1' 'C:\\trusted\\worker.env'",
+        "}",
+        "try {",
+        "  if (-not $Wait.Wait(5000)) { throw 'server connect timeout' }",
+        "  [void]$Wait.GetAwaiter().GetResult()",
+        "  $ValidRequest = Receive-MaintenancePipeRequest $Server 5000",
+        "  if ($ValidRequest) {",
+        "    Write-MaintenancePipeProof $Server 'HYBRID_WORKER_MAINTENANCE_STOPPED'",
+        "    [void](Wait-MaintenancePipeProofAcknowledgement $Server 'HYBRID_WORKER_MAINTENANCE_STOPPED')",
+        "  }",
+        "  [void](Wait-Job $Job -Timeout 10)",
+        "  $Output = @(Receive-Job $Job -ErrorAction SilentlyContinue)",
+        "  $Succeeded = $Job.State -eq 'Completed' -and $Output[-1] -eq 'HYBRID_WORKER_MAINTENANCE_STOPPED'",
+        "  [Console]::Out.Write(\"$Succeeded|$($Server.TransmissionMode)\")",
+        "} finally { Remove-Job $Job -Force -ErrorAction SilentlyContinue; $Server.Dispose() }",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-Command", script,
+      ], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("True|Message");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "maintenance stop rejects a hostile same-name pipe with the wrong ACL before static proof",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const clientHelper = [
+        "Write-MaintenancePipeProofAcknowledgement",
+        "Read-MaintenancePipeProof",
+        "Assert-MaintenancePipeSecurity",
+        "Invoke-MaintenanceStopClient",
+      ].map((name) => powerShellFunction(source, name)).join("\r\n");
+      const isolatedAclClientHelper = clientHelper.replace(
+        "$Pipe.Connect($ConnectTimeoutMilliseconds)",
+        "$Pipe.Connect($ConnectTimeoutMilliseconds)\r\n" +
+          "    $Pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message",
+      );
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "$ClientSource = @'",
+        isolatedAclClientHelper,
+        "'@",
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        "$Security = [IO.Pipes.PipeSecurity]::new()",
+        "$Security.SetAccessRuleProtection($true, $false)",
+        "$Security.SetOwner($Owner)",
+        "[void]$Security.AddAccessRule([IO.Pipes.PipeAccessRule]::new($Owner, [IO.Pipes.PipeAccessRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))",
+        "$Server = [IO.Pipes.NamedPipeServerStream]::new('gustavo-hybrid-maintenance-v1', [IO.Pipes.PipeDirection]::InOut, 1, [IO.Pipes.PipeTransmissionMode]::Message, [IO.Pipes.PipeOptions]::Asynchronous, 128, 128, $Security)",
+        "$Wait = $Server.WaitForConnectionAsync()",
+        "$Job = Start-Job -ArgumentList $ClientSource, $Owner.Value -ScriptBlock {",
+        "  param([string]$ClientSource, [string]$OwnerValue)",
+        "  $ErrorActionPreference = 'Stop'",
+        "  $ProgressPreference = 'SilentlyContinue'",
+        "  function Stop-Safely([string]$Code) { throw $Code }",
+        "  function Get-ExactWorkerTask { return [PSCustomObject]@{ State = 'Running' } }",
+        "  function Wait-ExactWorkerTaskNonRunning {}",
+        "  Invoke-Expression $ClientSource",
+        "  $OwnerSid = [Security.Principal.SecurityIdentifier]::new($OwnerValue)",
+        "  try {",
+        "    [void](Invoke-MaintenanceStopClient $OwnerSid 'C:\\trusted\\powershell.exe' 'C:\\trusted\\start.ps1' 'C:\\trusted\\worker.env')",
+        "    Write-Output $false",
+        "  } catch { Write-Output ($_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN') }",
+        "}",
+        "try {",
+        "  if (-not $Wait.Wait(5000)) { throw 'server connect timeout' }",
+        "  [void]$Wait.GetAwaiter().GetResult()",
+        "  try {",
+        "    $Bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes('HYBRID_WORKER_MAINTENANCE_STOPPED')",
+        "    $Server.Write($Bytes, 0, $Bytes.Length)",
+        "    $Server.Flush()",
+        "  } catch {}",
+        "  [void](Wait-Job $Job -Timeout 10)",
+        "  $Output = @(Receive-Job $Job -ErrorAction SilentlyContinue)",
+        "  [Console]::Out.Write($Output[-1])",
+        "} finally { Remove-Job $Job -Force -ErrorAction SilentlyContinue; $Server.Dispose() }",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-Command", script,
+      ], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("True");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "maintenance stop retains launcher authority after failure and releases only after safe retry",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const helpers = [
+        "New-MaintenancePipeSecurity",
+        "New-MaintenancePipeServer",
+        "Receive-MaintenancePipeRequest",
+        "Write-MaintenancePipeProof",
+        "Wait-MaintenancePipeProofAcknowledgement",
+        "Reset-MaintenancePipeConnection",
+        "Receive-PendingMaintenanceRequest",
+        "New-LauncherCleanupState",
+        "Assert-MaintenanceRuntimeProof",
+        "Invoke-MaintenanceStopTransaction",
+        "Invoke-MaintenanceConnection",
+        "Close-MaintenanceAuthority",
+      ].map((name) => powerShellFunction(source, name)).join("\r\n");
+      expect(helpers).toContain("function New-LauncherCleanupState");
+      expect(helpers).toContain("function Invoke-MaintenanceConnection");
+      expect(helpers).toContain("function Close-MaintenanceAuthority");
+      expect(helpers).toContain("HYBRID_MAINTENANCE_PROOF_RECEIVED:");
+      expect(powerShellFunction(source, "Wait-MaintenancePipeProofAcknowledgement"))
+        .toContain("[string]$Proof");
+      expect(powerShellFunction(source, "Write-MaintenancePipeProofAcknowledgement"))
+        .toContain("[string]$Proof");
+      expect(powerShellFunction(source, "Invoke-MaintenanceConnection"))
+        .toContain("$Acknowledged");
+      const pipeName = `gustavo-retained-stop-${process.pid}-${Date.now()}`;
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helpers,
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        `$Pipe = New-MaintenancePipeServer '${pipeName}' $Owner`,
+        "$Connection = $Pipe.WaitForConnectionAsync()",
+        "$Worker = [PSCustomObject]@{ HasExited = $false; DisposeCount = 0 }",
+        "$Worker | Add-Member ScriptMethod Dispose { $this.DisposeCount += 1 }",
+        "$State = New-LauncherCleanupState",
+        "$Counts = [PSCustomObject]@{ Stop = 0; Funnel = 0 }",
+        "$RequestStop = {",
+        "  $Counts.Stop += 1",
+        "  if ($Counts.Stop -eq 1) { throw 'timeout' }",
+        "  return [PSCustomObject]@{ service='gustavo-hybrid-worker-v1'; stopped=$true; containerAbsent=$true }",
+        "}.GetNewClosure()",
+        "$FunnelStop = { $Counts.Funnel += 1; return $true }.GetNewClosure()",
+        "function Start-ClientJob([string]$Name, [string]$AcknowledgementMode) {",
+        "  return Start-Job -ArgumentList $Name, $AcknowledgementMode -ScriptBlock {",
+        "    param([string]$PipeName, [string]$AckMode)",
+        "    $ErrorActionPreference = 'Stop'",
+        "    $Client = [IO.Pipes.NamedPipeClientStream]::new('.', $PipeName, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)",
+        "    try {",
+        "      $Client.Connect(1000)",
+        "      $Client.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message",
+        "      $Request = [Text.UTF8Encoding]::new($false, $true).GetBytes('HYBRID_MAINTENANCE_STOP_REQUEST')",
+        "      $Client.Write($Request, 0, $Request.Length)",
+        "      $Client.Flush()",
+        "      Start-Sleep -Milliseconds 250",
+        "      $Buffer = [byte[]]::new(128)",
+        "      $Read = $Client.Read($Buffer, 0, $Buffer.Length)",
+        "      $Proof = [Text.UTF8Encoding]::new($false, $true).GetString($Buffer, 0, $Read)",
+        "      if ($AckMode -eq 'Missing') {",
+        "        Start-Sleep -Milliseconds 2500",
+        "      } else {",
+        "        $AckText = if ($AckMode -eq 'Valid') { 'HYBRID_MAINTENANCE_PROOF_RECEIVED:' + $Proof } else { 'WRONG_ACK' }",
+        "        $Ack = [Text.UTF8Encoding]::new($false, $true).GetBytes($AckText)",
+        "        $Client.Write($Ack, 0, $Ack.Length)",
+        "        $Client.Flush()",
+        "      }",
+        "      Write-Output $Proof",
+        "    } finally { $Client.Dispose() }",
+        "  }",
+        "}",
+        `$First = Start-ClientJob '${pipeName}' 'Valid'`,
+        "if (-not $Connection.Wait(5000)) { throw 'first connect timeout' }",
+        "$FirstResult = Invoke-MaintenanceConnection $Pipe ([ref]$Connection) $State $Worker $RequestStop $FunnelStop",
+        "[void](Wait-Job $First -Timeout 10)",
+        "$FirstProof = @(Receive-Job $First -ErrorAction Stop)[-1]",
+        "Remove-Job $First -Force",
+        "$FirstDisposeCount = $Worker.DisposeCount",
+        "$EarlyCloseRejected = $false",
+        "try { Close-MaintenanceAuthority $Pipe $State } catch { $EarlyCloseRejected = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        "$Retained = -not $State.RuntimeSettled -and -not $State.FunnelSettled -and -not $State.WorkerReleased",
+        `$Second = Start-ClientJob '${pipeName}' 'Invalid'`,
+        "if (-not $Connection.Wait(5000)) { throw 'second connect timeout' }",
+        "$SettledResult = Invoke-MaintenanceConnection $Pipe ([ref]$Connection) $State $Worker $RequestStop $FunnelStop",
+        "[void](Wait-Job $Second -Timeout 10)",
+        "$SettledProof = @(Receive-Job $Second -ErrorAction Stop)[-1]",
+        "Remove-Job $Second -Force",
+        "$SettledRetained = $State.RuntimeSettled -and $State.FunnelSettled -and $State.WorkerReleased",
+        "$SettledDisposeCount = $Worker.DisposeCount",
+        "$SettledAcknowledged = $State.ProofAcknowledged",
+        "$SettledCloseRejected = $false",
+        "try { Close-MaintenanceAuthority $Pipe $State } catch { $SettledCloseRejected = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        `$Third = Start-ClientJob '${pipeName}' 'Missing'`,
+        "if (-not $Connection.Wait(5000)) { throw 'third connect timeout' }",
+        "$ThirdResult = Invoke-MaintenanceConnection $Pipe ([ref]$Connection) $State $Worker $RequestStop $FunnelStop",
+        "[void](Wait-Job $Third -Timeout 10)",
+        "$ThirdProof = @(Receive-Job $Third -ErrorAction Stop)[-1]",
+        "Remove-Job $Third -Force",
+        "$MissingRetained = $State.RuntimeSettled -and $State.FunnelSettled -and $State.WorkerReleased -and -not $State.ProofAcknowledged",
+        "$MissingDisposeCount = $Worker.DisposeCount",
+        `$Fourth = Start-ClientJob '${pipeName}' 'Valid'`,
+        "if (-not $Connection.Wait(5000)) { throw 'fourth connect timeout' }",
+        "$FourthResult = Invoke-MaintenanceConnection $Pipe ([ref]$Connection) $State $Worker $RequestStop $FunnelStop",
+        "[void](Wait-Job $Fourth -Timeout 10)",
+        "$FourthProof = @(Receive-Job $Fourth -ErrorAction Stop)[-1]",
+        "Remove-Job $Fourth -Force",
+        "$BeforeRelease = -not $Pipe.SafePipeHandle.IsClosed",
+        "Close-MaintenanceAuthority $Pipe $State",
+        `$Rebound = New-MaintenancePipeServer '${pipeName}' $Owner`,
+        "try { $ReboundCreated = $null -ne $Rebound } finally { $Rebound.Dispose() }",
+        "[Console]::Out.Write(\"$FirstResult|$FirstProof|$FirstDisposeCount|$EarlyCloseRejected|$Retained|$SettledResult|$SettledProof|$SettledRetained|$SettledDisposeCount|$SettledAcknowledged|$SettledCloseRejected|$ThirdResult|$ThirdProof|$MissingRetained|$MissingDisposeCount|$FourthResult|$FourthProof|$($State.RuntimeSettled)|$($State.FunnelSettled)|$BeforeRelease|$($State.WorkerReleased)|$($State.ProofAcknowledged)|$ReboundCreated|$($Counts.Stop)|$($Counts.Funnel)\")",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-Command", script,
+      ], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe(
+        "False|HYBRID_MAINTENANCE_STOP_UNPROVEN|0|True|True|False|HYBRID_WORKER_MAINTENANCE_STOPPED|True|1|False|True|False|HYBRID_WORKER_MAINTENANCE_STOPPED|True|1|True|HYBRID_WORKER_MAINTENANCE_STOPPED|True|True|True|True|True|True|2|1",
+      );
+    },
+    15_000,
+  );
+
+  it.runIf(process.platform === "win32")(
+    "natural STARTING and READY exits retain authority until genuine runtime and Funnel proof",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const launcherCleanupStart = source.indexOf("function Invoke-LauncherCleanup");
+      const launcherCleanupEnd = source.indexOf("$StartInfo = [Diagnostics.ProcessStartInfo]::new()", launcherCleanupStart);
+      expect(launcherCleanupStart).toBeGreaterThan(-1);
+      expect(launcherCleanupEnd).toBeGreaterThan(launcherCleanupStart);
+      const helpers = [
+        "New-MaintenancePipeSecurity",
+        "New-MaintenancePipeServer",
+        "New-LauncherCleanupState",
+        "Assert-MaintenanceRuntimeProof",
+        "Invoke-MaintenanceStopTransaction",
+        "Close-MaintenanceAuthority",
+      ].map((name) => powerShellFunction(source, name)).join("\r\n") +
+        "\r\n" + source.slice(launcherCleanupStart, launcherCleanupEnd);
+      const pipePrefix = `gustavo-natural-exit-${process.pid}-${Date.now()}`;
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helpers,
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        "function Invoke-NaturalExitProbe([string]$LifecycleState, [int]$ExitCode, [string]$PipeName) {",
+        "  $Pipe = New-MaintenancePipeServer $PipeName $Owner",
+        "  $Worker = [PSCustomObject]@{ HasExited = $true; ExitCode = $ExitCode; DisposeCount = 0 }",
+        "  $Worker | Add-Member ScriptMethod Dispose { $this.DisposeCount += 1 }",
+        "  $State = New-LauncherCleanupState",
+        "  $FirstCounts = [PSCustomObject]@{ Runtime = 0; Funnel = 0 }",
+        "  $NoRuntimeProof = { $FirstCounts.Runtime += 1; throw 'runtime proof unavailable' }.GetNewClosure()",
+        "  $UnexpectedFunnel = { $FirstCounts.Funnel += 1; return $true }.GetNewClosure()",
+        "  $FailureRejected = $false",
+        "  try { Invoke-LauncherCleanup $State $Worker $NoRuntimeProof $UnexpectedFunnel } catch { $FailureRejected = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        "  $EarlyRuntimeSettled = $State.RuntimeSettled",
+        "  $EarlyProofAcknowledged = $State.ProofAcknowledged",
+        "  $FirstDisposeCount = $Worker.DisposeCount",
+        "  $EarlyCloseRejected = $false",
+        "  try { Close-MaintenanceAuthority $Pipe $State } catch { $EarlyCloseRejected = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        "  $ExactNameHeld = $false",
+        "  try { $Collision = New-MaintenancePipeServer $PipeName $Owner; $Collision.Dispose() } catch { $ExactNameHeld = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        "  $FinalCounts = [PSCustomObject]@{ Runtime = 0; Funnel = 0 }",
+        "  $FinalRuntimeSettled = $false",
+        "  $FinalFunnelSettled = $false",
+        "  $NaturalCleanupSettled = $false",
+        "  $FinalProofAcknowledged = $false",
+        "  $FinalDisposeCount = $Worker.DisposeCount",
+        "  $ReboundCreated = $false",
+        "  if ($FailureRejected -and -not $EarlyRuntimeSettled -and -not $EarlyProofAcknowledged -and $FirstDisposeCount -eq 0 -and $EarlyCloseRejected -and $ExactNameHeld) {",
+        "    $RuntimeProof = { $FinalCounts.Runtime += 1; return [PSCustomObject]@{ service='gustavo-hybrid-worker-v1'; stopped=$true; containerAbsent=$true } }.GetNewClosure()",
+        "    $FunnelProof = { $FinalCounts.Funnel += 1; return $true }.GetNewClosure()",
+        "    Invoke-LauncherCleanup $State $Worker $RuntimeProof $FunnelProof",
+        "    $FinalRuntimeSettled = $State.RuntimeSettled",
+        "    $FinalFunnelSettled = $State.FunnelSettled",
+        "    $NaturalCleanupSettled = $State.NaturalCleanupSettled",
+        "    $FinalProofAcknowledged = $State.ProofAcknowledged",
+        "    $FinalDisposeCount = $Worker.DisposeCount",
+        "    Close-MaintenanceAuthority $Pipe $State",
+        "    $Rebound = New-MaintenancePipeServer $PipeName $Owner",
+        "    try { $ReboundCreated = $null -ne $Rebound } finally { $Rebound.Dispose() }",
+        "  }",
+        "  return \"${LifecycleState}:$ExitCode|$FailureRejected|$($FirstCounts.Runtime)|$($FirstCounts.Funnel)|$EarlyRuntimeSettled|$EarlyProofAcknowledged|$FirstDisposeCount|$EarlyCloseRejected|$ExactNameHeld|$FinalRuntimeSettled|$FinalFunnelSettled|$NaturalCleanupSettled|$FinalProofAcknowledged|$FinalDisposeCount|$($FinalCounts.Runtime)|$($FinalCounts.Funnel)|$ReboundCreated\"",
+        "}",
+        `$StartingZero = Invoke-NaturalExitProbe 'STARTING' 0 '${pipePrefix}-starting-zero'`,
+        `$StartingFailure = Invoke-NaturalExitProbe 'STARTING' 7 '${pipePrefix}-starting-failure'`,
+        `$ReadyZero = Invoke-NaturalExitProbe 'READY' 0 '${pipePrefix}-ready-zero'`,
+        `$ReadyFailure = Invoke-NaturalExitProbe 'READY' 7 '${pipePrefix}-ready-failure'`,
+        "[Console]::Out.Write(($StartingZero, $StartingFailure, $ReadyZero, $ReadyFailure) -join ';')",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-Command", script,
+      ], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      const expectedTail = "True|1|0|False|False|0|True|True|True|True|True|False|1|1|1|True";
+      expect(result.stdout).toBe([
+        `STARTING:0|${expectedTail}`,
+        `STARTING:7|${expectedTail}`,
+        `READY:0|${expectedTail}`,
+        `READY:7|${expectedTail}`,
+      ].join(";"));
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "operator stop transaction rejects wrong requests and proves STARTING and READY in order",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const helper = [
+        "New-LauncherCleanupState",
+        "Assert-MaintenanceRuntimeProof",
+        "Invoke-MaintenanceStopTransaction",
+      ].map((name) => powerShellFunction(source, name)).join("\r\n");
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helper,
+        "$Calls = [Collections.Generic.List[string]]::new()",
+        "function Invoke-Probe([string]$State, [string]$Request) {",
+        "  $Runtime = { $Calls.Add(\"$State-runtime\"); return [PSCustomObject]@{ service='gustavo-hybrid-worker-v1'; stopped=$true; containerAbsent=$true } }.GetNewClosure()",
+        "  $Funnel = { $Calls.Add(\"$State-funnel\"); return $true }.GetNewClosure()",
+        "  $CleanupState = New-LauncherCleanupState",
+        "  return Invoke-MaintenanceStopTransaction $Request $CleanupState $Runtime $Funnel",
+        "}",
+        "$WrongRejected = $false",
+        "try { [void](Invoke-Probe 'WRONG' 'HYBRID_MAINTENANCE_STOP_REQUEST-extra') } catch { $WrongRejected = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        "$AfterWrong = $Calls.Count",
+        "$Starting = Invoke-Probe 'STARTING' 'HYBRID_MAINTENANCE_STOP_REQUEST'",
+        "$Ready = Invoke-Probe 'READY' 'HYBRID_MAINTENANCE_STOP_REQUEST'",
+        "$TimeoutRejected = $false",
+        "$TimeoutState = New-LauncherCleanupState",
+        "try { [void](Invoke-MaintenanceStopTransaction 'HYBRID_MAINTENANCE_STOP_REQUEST' $TimeoutState { throw 'timeout' } { return $true }) } catch { $TimeoutRejected = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        "$MalformedRejected = $false",
+        "$MalformedState = New-LauncherCleanupState",
+        "try { [void](Invoke-MaintenanceStopTransaction 'HYBRID_MAINTENANCE_STOP_REQUEST' $MalformedState { return [PSCustomObject]@{ stopped=$true; containerAbsent=$false } } { return $true }) } catch { $MalformedRejected = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        "[Console]::Out.Write(\"$WrongRejected|$AfterWrong|$Starting|$Ready|$($Calls -join ',')|$TimeoutRejected|$MalformedRejected\")",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ], { encoding: "utf8", timeout: 10_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe(
+        "True|0|HYBRID_WORKER_MAINTENANCE_STOPPED|HYBRID_WORKER_MAINTENANCE_STOPPED|STARTING-runtime,STARTING-funnel,READY-runtime,READY-funnel|True|True",
+      );
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "launcher STARTING and READY loops withhold actual pipe proof through runtime and Funnel",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const helpers = [
+        "New-MaintenancePipeSecurity",
+        "New-MaintenancePipeServer",
+        "Receive-MaintenancePipeRequest",
+        "Write-MaintenancePipeProof",
+        "Wait-MaintenancePipeProofAcknowledgement",
+        "Reset-MaintenancePipeConnection",
+        "Receive-PendingMaintenanceRequest",
+        "New-LauncherCleanupState",
+        "Assert-MaintenanceRuntimeProof",
+        "Invoke-MaintenanceStopTransaction",
+        "Invoke-MaintenanceConnection",
+        "Complete-PendingMaintenanceStop",
+        "Close-MaintenanceAuthority",
+      ].map((name) => powerShellFunction(source, name)).join("\r\n");
+      expect(powerShellFunction(source, "Complete-PendingMaintenanceStop"))
+        .toContain("Invoke-MaintenanceConnection");
+      const pipePrefix = `gustavo-state-loop-${process.pid}-${Date.now()}`;
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helpers,
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        "function Invoke-StateProbe([string]$LifecycleState, [string]$PipeName) {",
+        "  $Pipe = New-MaintenancePipeServer $PipeName $Owner",
+        "  $Connection = $Pipe.WaitForConnectionAsync()",
+        "  $Worker = [PSCustomObject]@{ HasExited = $false; DisposeCount = 0 }",
+        "  $Worker | Add-Member ScriptMethod Dispose { $this.DisposeCount += 1 }",
+        "  $CleanupState = New-LauncherCleanupState",
+        "  $Context = [PSCustomObject]@{ State = $LifecycleState; Calls = [Collections.Generic.List[string]]::new() }",
+        "  $Runtime = {",
+        "    [void]$Context.Calls.Add(\"$($Context.State)-runtime\")",
+        "    Start-Sleep -Milliseconds 150",
+        "    return [PSCustomObject]@{ service='gustavo-hybrid-worker-v1'; stopped=$true; containerAbsent=$true }",
+        "  }.GetNewClosure()",
+        "  $Funnel = {",
+        "    [void]$Context.Calls.Add(\"$($Context.State)-funnel\")",
+        "    Start-Sleep -Milliseconds 150",
+        "    return $true",
+        "  }.GetNewClosure()",
+        "  $ClientJob = Start-Job -ArgumentList $PipeName -ScriptBlock {",
+        "    param([string]$Name)",
+        "    $ErrorActionPreference = 'Stop'",
+        "    $Client = [IO.Pipes.NamedPipeClientStream]::new('.', $Name, [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)",
+        "    try {",
+        "      $Client.Connect(1000)",
+        "      $Client.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message",
+        "      $Request = [Text.UTF8Encoding]::new($false, $true).GetBytes('HYBRID_MAINTENANCE_STOP_REQUEST')",
+        "      $Client.Write($Request, 0, $Request.Length)",
+        "      $Client.Flush()",
+        "      $Clock = [Diagnostics.Stopwatch]::StartNew()",
+        "      $Buffer = [byte[]]::new(128)",
+        "      $Read = $Client.Read($Buffer, 0, $Buffer.Length)",
+        "      $Proof = [Text.UTF8Encoding]::new($false, $true).GetString($Buffer, 0, $Read)",
+        "      $AckText = 'HYBRID_MAINTENANCE_PROOF_RECEIVED:' + $Proof",
+        "      $Ack = [Text.UTF8Encoding]::new($false, $true).GetBytes($AckText)",
+        "      $Client.Write($Ack, 0, $Ack.Length)",
+        "      $Client.Flush()",
+        "      Write-Output \"$Proof|$($Clock.ElapsedMilliseconds)\"",
+        "    } finally { $Client.Dispose() }",
+        "  }",
+        "  if (-not $Connection.Wait(5000)) { throw 'connect timeout' }",
+        "  $Completed = Complete-PendingMaintenanceStop $Pipe ([ref]$Connection) $CleanupState $Worker $Runtime $Funnel",
+        "  [void](Wait-Job $ClientJob -Timeout 10)",
+        "  $ClientResult = @(Receive-Job $ClientJob -ErrorAction Stop)[-1]",
+        "  Remove-Job $ClientJob -Force",
+        "  $ClientParts = $ClientResult -split '\\|'",
+        "  $Summary = \"$LifecycleState|$Completed|$($ClientParts[0])|$($ClientParts[1])|$($Context.Calls -join ',')|$($Worker.DisposeCount)|$($CleanupState.RuntimeSettled)|$($CleanupState.FunnelSettled)|$($CleanupState.ProofAcknowledged)\"",
+        "  Close-MaintenanceAuthority $Pipe $CleanupState",
+        "  return $Summary",
+        "}",
+        `$Starting = Invoke-StateProbe 'STARTING' '${pipePrefix}-starting'`,
+        `$Ready = Invoke-StateProbe 'READY' '${pipePrefix}-ready'`,
+        "[Console]::Out.Write(\"$Starting;$Ready\")",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-Command", script,
+      ], { encoding: "utf8", timeout: 20_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      const probes = result.stdout.split(";").map((probe) => probe.split("|"));
+      expect(probes).toHaveLength(2);
+      for (const [index, state] of ["STARTING", "READY"].entries()) {
+        const probe = probes[index];
+        expect(probe[0]).toBe(state);
+        expect(probe[1]).toBe("True");
+        expect(probe[2]).toBe("HYBRID_WORKER_MAINTENANCE_STOPPED");
+        expect(Number(probe[3])).toBeGreaterThanOrEqual(250);
+        expect(Number(probe[3])).toBeLessThan(5_000);
+        expect(probe[4]).toBe(`${state}-runtime,${state}-funnel`);
+        expect(probe.slice(5)).toEqual(["1", "True", "True", "True"]);
+      }
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "maintenance stop request reader emits only one false decision for malformed input",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const helperStart = source.indexOf("function New-MaintenancePipeSecurity");
+      const helperEnd = source.indexOf("function Invoke-MaintenanceStopTransaction", helperStart);
+      expect(helperStart).toBeGreaterThan(-1);
+      expect(helperEnd).toBeGreaterThan(helperStart);
+      const helpers = source.slice(helperStart, helperEnd);
+      const pipeName = `gustavo-malformed-stop-${process.pid}-${Date.now()}`;
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helpers,
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        `$Server = New-MaintenancePipeServer '${pipeName}' $Owner`,
+        "$ConnectionTask = $Server.WaitForConnectionAsync()",
+        `$Client = [IO.Pipes.NamedPipeClientStream]::new('.', '${pipeName}', [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)`,
+        "try {",
+        "  $Client.Connect(1000)",
+        "  $Bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes('WRONG_REQUEST')",
+        "  $Client.Write($Bytes, 0, $Bytes.Length)",
+        "  $Client.Flush()",
+        "  $Decisions = @(Receive-PendingMaintenanceRequest $Server ([ref]$ConnectionTask))",
+        "  [Console]::Out.Write(\"$($Decisions.Count)|$($Decisions[0])\")",
+        "} finally { $Client.Dispose(); $Server.Dispose() }",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ], { encoding: "utf8", timeout: 10_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("1|False");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "maintenance stop client rejects duplicate owner-only and SYSTEM-only ACL pairs",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const helperStart = source.indexOf("function Assert-OwnerOnlyAcl");
+      const helperEnd = source.indexOf("function New-MaintenancePipeSecurity", helperStart);
+      expect(helperStart).toBeGreaterThan(-1);
+      expect(helperEnd).toBeGreaterThan(helperStart);
+      const helper = source.slice(helperStart, helperEnd);
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helper,
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        "$System = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)",
+        "$OwnerName = $Owner.Translate([Security.Principal.NTAccount]).Value",
+        "$OwnerRule = [Security.AccessControl.FileSystemAccessRule]::new($Owner, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)",
+        "$SystemRule = [Security.AccessControl.FileSystemAccessRule]::new($System, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)",
+        "function New-FakeAcl([object[]]$Rules) {",
+        "  $Acl = [PSCustomObject]@{ Owner = $OwnerName; AreAccessRulesProtected = $true; RuleSet = $Rules }",
+        "  $Acl | Add-Member -MemberType ScriptMethod -Name GetAccessRules -Value { param($Explicit, $Inherited, $TargetType) return $this.RuleSet }",
+        "  return $Acl",
+        "}",
+        "function Get-Acl { param([string]$LiteralPath) return $script:CurrentAcl }",
+        "$OwnerRejected = $false",
+        "$script:CurrentAcl = New-FakeAcl @($OwnerRule, $OwnerRule)",
+        "try { Assert-OwnerOnlyAcl 'ignored' $Owner } catch { $OwnerRejected = $_.Exception.Message -eq 'HYBRID_CONFIG_ACL_INVALID' }",
+        "$SystemRejected = $false",
+        "$script:CurrentAcl = New-FakeAcl @($SystemRule, $SystemRule)",
+        "try { Assert-OwnerOnlyAcl 'ignored' $Owner } catch { $SystemRejected = $_.Exception.Message -eq 'HYBRID_CONFIG_ACL_INVALID' }",
+        "[Console]::Out.Write(\"$OwnerRejected|$SystemRejected\")",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ], { encoding: "utf8", timeout: 10_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("True|True");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "maintenance stop client rejects the wrong task SID and waits for the exact task to settle",
+    () => {
+      const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+      const helperStart = source.indexOf("function Get-ExactWorkerTask");
+      const helperEnd = source.indexOf("function Invoke-MaintenanceStopClient", helperStart);
+      expect(helperStart).toBeGreaterThan(-1);
+      expect(helperEnd).toBeGreaterThan(helperStart);
+      const helpers = source.slice(helperStart, helperEnd);
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        "$ExactTaskName = 'Gustavo Hybrid Worker'",
+        "$ExactTaskPath = '\\'",
+        "$DedicatedSid = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        "$DedicatedName = $DedicatedSid.Translate([Security.Principal.NTAccount]).Value",
+        "$SystemSid = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)",
+        "$SystemName = $SystemSid.Translate([Security.Principal.NTAccount]).Value",
+        "$ExpectedPowerShell = 'C:\\trusted\\powershell.exe'",
+        "$ExpectedStartScript = 'C:\\trusted\\start-hybrid-worker.ps1'",
+        "$ExpectedConfigPath = 'C:\\trusted\\hybrid-worker.env'",
+        "$ExpectedArguments = '-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File \"' + $ExpectedStartScript + '\" -ConfigPath \"' + $ExpectedConfigPath + '\"'",
+        "$script:WrongSid = $true",
+        "$script:Calls = 0",
+        "function Get-ScheduledTask {",
+        "  param([string]$TaskName, [string]$TaskPath, $ErrorAction)",
+        "  if ($TaskName -ne $ExactTaskName -or $TaskPath -ne $ExactTaskPath) { throw 'wrong task' }",
+        "  $script:Calls += 1",
+        "  $Identity = if ($script:WrongSid) { $SystemName } else { $DedicatedName }",
+        "  $State = if (-not $script:WrongSid -and $script:Calls -gt 1) { 'Ready' } else { 'Running' }",
+        "  return [PSCustomObject]@{",
+        "    TaskName=$ExactTaskName; TaskPath=$ExactTaskPath; State=$State;",
+        "    Principal=[PSCustomObject]@{ UserId=$Identity };",
+        "    Actions=@([PSCustomObject]@{ Execute=$ExpectedPowerShell; Arguments=$ExpectedArguments })",
+        "  }",
+        "}",
+        helpers,
+        "$WrongRejected = $false",
+        "try { [void](Get-ExactWorkerTask $DedicatedSid $ExpectedPowerShell $ExpectedStartScript $ExpectedConfigPath) } catch { $WrongRejected = $_.Exception.Message -eq 'HYBRID_MAINTENANCE_STOP_UNPROVEN' }",
+        "$script:WrongSid = $false",
+        "$script:Calls = 0",
+        "Wait-ExactWorkerTaskNonRunning $DedicatedSid $ExpectedPowerShell $ExpectedStartScript $ExpectedConfigPath 1000",
+        "[Console]::Out.Write(\"$WrongRejected|$script:Calls\")",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ], { encoding: "utf8", timeout: 10_000, windowsHide: true });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("True|2");
+    },
+  );
+
+  it("keeps StopForMaintenance bounded, exact-task scoped, and fail closed", () => {
+    const source = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");
+    const clientStart = source.indexOf("function Invoke-MaintenanceStopClient");
+    const clientEnd = source.indexOf("function ", clientStart + "function ".length);
+    expect(clientStart).toBeGreaterThan(-1);
+    expect(clientEnd).toBeGreaterThan(clientStart);
+    const client = source.slice(clientStart, clientEnd);
+    expect(client).toContain("NamedPipeClientStream");
+    expect(client).toContain("HYBRID_MAINTENANCE_STOP_REQUEST");
+    expect(client).toContain("HYBRID_WORKER_MAINTENANCE_STOPPED");
+    expect(client).toContain("HYBRID_MAINTENANCE_STOP_UNPROVEN");
+    expect(client).toMatch(/\.Connect\(\$ConnectTimeoutMilliseconds\)/u);
+    expect(client).toContain("Read-MaintenancePipeProof $Pipe $ProofTimeoutMilliseconds");
+    expect(powerShellFunction(source, "Read-MaintenancePipeProof"))
+      .toMatch(/\.Wait\(\$TimeoutMilliseconds\)/u);
+    expect(client).toMatch(/finally[\s\S]+\.Dispose\(\)/u);
+    expect(client).not.toMatch(/ControlNonce|HMACSHA256|GUSTAVO_HYBRID_CONTROL_NONCE/u);
+
+    const readinessPoll = Number(/\$ReadinessPollMilliseconds = ([0-9]+)/u.exec(source)?.[1]);
+    const runtimeStop = Number(/\$StopDeadlineMilliseconds = ([0-9]+)/u.exec(source)?.[1]);
+    const funnelCommand = Number(/\$FunnelCommandTimeoutMilliseconds = ([0-9]+)/u.exec(source)?.[1]);
+    const helperSettle = Number(/\$Process\.WaitForExit\(([0-9]+)\)/u.exec(source)?.[1]);
+    const funnelAttempts = Number(/\$Attempt -lt ([0-9]+)/u.exec(source)?.[1]);
+    const proofTimeout = Number(/\$ProofTimeoutMilliseconds = ([0-9]+)/u.exec(client)?.[1]);
+    const taskStateTimeout = Number(/\[int\]\$TimeoutMilliseconds = ([0-9]+)/u.exec(
+      source.slice(
+        source.indexOf("function Wait-ExactWorkerTaskNonRunning"),
+        source.indexOf("function Invoke-MaintenanceStopClient"),
+      ),
+    )?.[1]);
+    const validWorstCase = readinessPoll + runtimeStop
+      + funnelAttempts * (funnelCommand + helperSettle);
+    expect(validWorstCase).toBe(44_000);
+    expect(proofTimeout).toBeGreaterThanOrEqual(validWorstCase + 1_000);
+    expect(proofTimeout).toBeLessThan(60_000);
+    expect(taskStateTimeout).toBe(5_000);
+
+    expect(source).toContain('$ExactTaskName = "Gustavo Hybrid Worker"');
+    expect(source).toContain('$ExactTaskPath = "\\"');
+    expect(source).toMatch(/Get-ScheduledTask -TaskName \$ExactTaskName -TaskPath \$ExactTaskPath -ErrorAction Stop/u);
+    expect(source).toMatch(/HYBRID_WORKER_MAINTENANCE_STOPPED[\s\S]+Wait-ExactWorkerTaskNonRunning/u);
+    expect(source).not.toMatch(/Stop-ScheduledTask|Unregister-ScheduledTask|Disable-ScheduledTask/iu);
+  });
 });

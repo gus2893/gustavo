@@ -1,11 +1,16 @@
 [CmdletBinding()]
 param(
   [string]$ConfigPath = "$env:LOCALAPPDATA\Gustavo\hybrid-worker.env",
-  [switch]$ValidateOnly
+  [switch]$ValidateOnly,
+  [switch]$StopForMaintenance
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+$ExactTaskName = "Gustavo Hybrid Worker"
+$ExactTaskPath = "\"
+$MaintenancePipeName = "gustavo-hybrid-maintenance-v1"
 
 function Stop-Safely([string]$Code) {
   throw $Code
@@ -40,7 +45,7 @@ function Assert-OwnerOnlyAcl(
   [string]$Path,
   [Security.Principal.SecurityIdentifier]$Owner
 ) {
-  $SystemSid = [Security.Principal.SecurityIdentifier]::new(
+  $System = [Security.Principal.SecurityIdentifier]::new(
     [Security.Principal.WellKnownSidType]::LocalSystemSid,
     $null
   )
@@ -49,17 +54,494 @@ function Assert-OwnerOnlyAcl(
     [Security.Principal.SecurityIdentifier]
   )
   $Rules = @($Acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
-  $AllowedSids = @($Owner.Value, $SystemSid.Value)
   if (-not $Acl.AreAccessRulesProtected -or $OwnerSid.Value -ne $Owner.Value -or $Rules.Count -ne 2) {
     Stop-Safely "HYBRID_CONFIG_ACL_INVALID"
   }
+  $OwnerRuleCount = 0
+  $SystemRuleCount = 0
   foreach ($Rule in $Rules) {
-    if ($AllowedSids -notcontains $Rule.IdentityReference.Value -or
-        $Rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
-        ($Rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl) {
+    if ($Rule.IdentityReference.Value -eq $Owner.Value) {
+      $OwnerRuleCount += 1
+    } elseif ($Rule.IdentityReference.Value -eq $System.Value) {
+      $SystemRuleCount += 1
+    } else {
+      Stop-Safely "HYBRID_CONFIG_ACL_INVALID"
+    }
+    if ($Rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        $Rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) {
       Stop-Safely "HYBRID_CONFIG_ACL_INVALID"
     }
   }
+  if ($OwnerRuleCount -ne 1 -or $SystemRuleCount -ne 1) {
+    Stop-Safely "HYBRID_CONFIG_ACL_INVALID"
+  }
+}
+
+function New-MaintenancePipeSecurity(
+  [Security.Principal.SecurityIdentifier]$Owner
+) {
+  $PipeSecurity = [IO.Pipes.PipeSecurity]::new()
+  $PipeSecurity.SetAccessRuleProtection($true, $false)
+  $PipeSecurity.SetOwner($Owner)
+  [void]$PipeSecurity.AddAccessRule([IO.Pipes.PipeAccessRule]::new(
+    $Owner,
+    [IO.Pipes.PipeAccessRights]::FullControl,
+    [Security.AccessControl.AccessControlType]::Allow
+  ))
+  $SystemSid = [Security.Principal.SecurityIdentifier]::new(
+    [Security.Principal.WellKnownSidType]::LocalSystemSid,
+    $null
+  )
+  [void]$PipeSecurity.AddAccessRule([IO.Pipes.PipeAccessRule]::new(
+    $SystemSid,
+    [IO.Pipes.PipeAccessRights]::FullControl,
+    [Security.AccessControl.AccessControlType]::Allow
+  ))
+  return $PipeSecurity
+}
+
+function New-MaintenancePipeServer(
+  [string]$PipeName,
+  [Security.Principal.SecurityIdentifier]$Owner
+) {
+  try {
+    return [IO.Pipes.NamedPipeServerStream]::new(
+      $PipeName,
+      [IO.Pipes.PipeDirection]::InOut,
+      1,
+      [IO.Pipes.PipeTransmissionMode]::Message,
+      [IO.Pipes.PipeOptions]::Asynchronous,
+      128,
+      128,
+      (New-MaintenancePipeSecurity $Owner)
+    )
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+}
+
+function Receive-MaintenancePipeRequest(
+  [IO.Pipes.NamedPipeServerStream]$Pipe,
+  [int]$TimeoutMilliseconds = 2000
+) {
+  $Buffer = [byte[]]::new(128)
+  $Read = $Pipe.ReadAsync($Buffer, 0, $Buffer.Length)
+  if (-not $Read.Wait($TimeoutMilliseconds)) { return $false }
+  $Count = $Read.GetAwaiter().GetResult()
+  if ($Count -lt 1 -or -not $Pipe.IsMessageComplete) { return $false }
+  $Request = [Text.UTF8Encoding]::new($false, $true).GetString($Buffer, 0, $Count)
+  return $Request.Equals("HYBRID_MAINTENANCE_STOP_REQUEST", [StringComparison]::Ordinal)
+}
+
+function Write-MaintenancePipeProof(
+  [IO.Pipes.PipeStream]$Pipe,
+  [string]$Proof
+) {
+  $Bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($Proof)
+  $Pipe.Write($Bytes, 0, $Bytes.Length)
+  $Pipe.Flush()
+}
+
+function Wait-MaintenancePipeProofAcknowledgement(
+  [IO.Pipes.NamedPipeServerStream]$Pipe,
+  [string]$Proof,
+  [int]$TimeoutMilliseconds = 2000
+) {
+  try {
+    $Buffer = [byte[]]::new(128)
+    $Read = $Pipe.ReadAsync($Buffer, 0, $Buffer.Length)
+    if (-not $Read.Wait($TimeoutMilliseconds)) { return $false }
+    $Count = $Read.GetAwaiter().GetResult()
+    if ($Count -lt 1 -or -not $Pipe.IsMessageComplete) { return $false }
+    $Acknowledgement = [Text.UTF8Encoding]::new($false, $true).GetString(
+      $Buffer,
+      0,
+      $Count
+    )
+    return $Acknowledgement.Equals(
+      "HYBRID_MAINTENANCE_PROOF_RECEIVED:$Proof",
+      [StringComparison]::Ordinal
+    )
+  } catch {
+    return $false
+  }
+}
+
+function Write-MaintenancePipeProofAcknowledgement(
+  [IO.Pipes.NamedPipeClientStream]$Pipe,
+  [string]$Proof
+) {
+  $Bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
+    "HYBRID_MAINTENANCE_PROOF_RECEIVED:$Proof"
+  )
+  $Pipe.Write($Bytes, 0, $Bytes.Length)
+  $Pipe.Flush()
+}
+
+function Read-MaintenancePipeProof(
+  [IO.Pipes.NamedPipeClientStream]$Pipe,
+  [int]$TimeoutMilliseconds
+) {
+  try {
+    $Pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
+    $Buffer = [byte[]]::new(128)
+    $Read = $Pipe.ReadAsync($Buffer, 0, $Buffer.Length)
+    if (-not $Read.Wait($TimeoutMilliseconds)) {
+      throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+    }
+    $Count = $Read.GetAwaiter().GetResult()
+    if ($Count -lt 1 -or -not $Pipe.IsMessageComplete) {
+      throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+    }
+    return [Text.UTF8Encoding]::new($false, $true).GetString($Buffer, 0, $Count)
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+}
+
+function Assert-MaintenancePipeSecurity(
+  [IO.Pipes.NamedPipeClientStream]$Pipe,
+  [Security.Principal.SecurityIdentifier]$Owner
+) {
+  try {
+    $System = [Security.Principal.SecurityIdentifier]::new(
+      [Security.Principal.WellKnownSidType]::LocalSystemSid,
+      $null
+    )
+    $Acl = $Pipe.GetAccessControl()
+    $OwnerSid = $Acl.GetOwner([Security.Principal.SecurityIdentifier])
+    $Rules = @($Acl.GetAccessRules(
+      $true,
+      $false,
+      [Security.Principal.SecurityIdentifier]
+    ))
+    if (-not $Acl.AreAccessRulesProtected -or
+        $OwnerSid.Value -ne $Owner.Value -or
+        $Rules.Count -ne 2) {
+      throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+    }
+    $OwnerRuleCount = 0
+    $SystemRuleCount = 0
+    foreach ($Rule in $Rules) {
+      if ($Rule.IdentityReference.Value -eq $Owner.Value) {
+        $OwnerRuleCount += 1
+      } elseif ($Rule.IdentityReference.Value -eq $System.Value) {
+        $SystemRuleCount += 1
+      } else {
+        throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+      }
+      if ($Rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+          $Rule.PipeAccessRights -ne [IO.Pipes.PipeAccessRights]::FullControl) {
+        throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+      }
+    }
+    if ($OwnerRuleCount -ne 1 -or $SystemRuleCount -ne 1) {
+      throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+    }
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+}
+
+function Reset-MaintenancePipeConnection(
+  [IO.Pipes.NamedPipeServerStream]$Pipe,
+  [ref]$ConnectionTask
+) {
+  try {
+    if ($Pipe.IsConnected) { $Pipe.Disconnect() }
+  } catch {}
+  $ConnectionTask.Value = $Pipe.WaitForConnectionAsync()
+}
+
+function Receive-PendingMaintenanceRequest(
+  [IO.Pipes.NamedPipeServerStream]$Pipe,
+  [ref]$ConnectionTask
+) {
+  if (-not $ConnectionTask.Value.IsCompleted) { return $false }
+  $Valid = $false
+  try {
+    [void]$ConnectionTask.Value.GetAwaiter().GetResult()
+    $Valid = Receive-MaintenancePipeRequest $Pipe
+  } catch {
+    $Valid = $false
+  }
+  if ($Valid) { return $true }
+  try {
+    if ($Pipe.IsConnected) {
+      Write-MaintenancePipeProof $Pipe "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+      [void](Wait-MaintenancePipeProofAcknowledgement `
+        $Pipe "HYBRID_MAINTENANCE_STOP_UNPROVEN")
+    }
+  } catch {}
+  Reset-MaintenancePipeConnection $Pipe $ConnectionTask
+  return $false
+}
+
+function New-LauncherCleanupState {
+  return [PSCustomObject]@{
+    StopAttempted = $false
+    RuntimeSettled = $false
+    FunnelSettled = $false
+    WorkerReleased = $false
+    ProofAcknowledged = $false
+    NaturalCleanupSettled = $false
+  }
+}
+
+function Assert-MaintenanceRuntimeProof([object]$RuntimeProof) {
+  $RuntimeProperties = @($RuntimeProof.PSObject.Properties.Name)
+  if ($RuntimeProperties.Count -ne 3 -or
+      $RuntimeProof.service -ne "gustavo-hybrid-worker-v1" -or
+      $RuntimeProof.stopped -ne $true -or
+      $RuntimeProof.containerAbsent -ne $true) {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+}
+
+function Invoke-MaintenanceStopTransaction(
+  [string]$Request,
+  [object]$State,
+  [scriptblock]$RequestStop,
+  [scriptblock]$FunnelStop
+) {
+  try {
+    if (-not $Request.Equals(
+      "HYBRID_MAINTENANCE_STOP_REQUEST",
+      [StringComparison]::Ordinal
+    )) {
+      throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+    }
+    $State.StopAttempted = $true
+    if (-not $State.RuntimeSettled) {
+      $RuntimeProof = & $RequestStop
+      Assert-MaintenanceRuntimeProof $RuntimeProof
+      $State.RuntimeSettled = $true
+    }
+    if (-not $State.FunnelSettled) {
+      $FunnelProof = & $FunnelStop
+      if ($FunnelProof -ne $true) {
+        throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+      }
+      $State.FunnelSettled = $true
+    }
+    return "HYBRID_WORKER_MAINTENANCE_STOPPED"
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+}
+
+function Invoke-MaintenanceConnection(
+  [IO.Pipes.NamedPipeServerStream]$Pipe,
+  [ref]$ConnectionTask,
+  [object]$State,
+  [object]$Worker,
+  [scriptblock]$RequestStop,
+  [scriptblock]$FunnelStop
+) {
+  if (-not (Receive-PendingMaintenanceRequest $Pipe $ConnectionTask)) {
+    return $false
+  }
+  $State.StopAttempted = $true
+  try {
+    $Proof = Invoke-MaintenanceStopTransaction `
+      "HYBRID_MAINTENANCE_STOP_REQUEST" $State $RequestStop $FunnelStop
+  } catch {
+    try {
+      if ($Pipe.IsConnected) {
+        Write-MaintenancePipeProof $Pipe "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+        [void](Wait-MaintenancePipeProofAcknowledgement `
+          $Pipe "HYBRID_MAINTENANCE_STOP_UNPROVEN")
+      }
+    } catch {}
+    Reset-MaintenancePipeConnection $Pipe $ConnectionTask
+    return $false
+  }
+  try {
+    if (-not $State.WorkerReleased) {
+      $Worker.Dispose()
+      $State.WorkerReleased = $true
+    }
+  } catch {
+    Reset-MaintenancePipeConnection $Pipe $ConnectionTask
+    return $false
+  }
+  $Acknowledged = $false
+  try {
+    Write-MaintenancePipeProof $Pipe $Proof
+    $Acknowledged = Wait-MaintenancePipeProofAcknowledgement $Pipe $Proof
+  } catch {
+    $Acknowledged = $false
+  }
+  if (-not $Acknowledged) {
+    Reset-MaintenancePipeConnection $Pipe $ConnectionTask
+    return $false
+  }
+  $State.ProofAcknowledged = $true
+  return $true
+}
+
+function Wait-ForMaintenanceSettlement(
+  [IO.Pipes.NamedPipeServerStream]$Pipe,
+  [ref]$ConnectionTask,
+  [object]$State,
+  [object]$Worker,
+  [scriptblock]$RequestStop,
+  [scriptblock]$FunnelStop
+) {
+  while ($true) {
+    if ($ConnectionTask.Value.IsCompleted -and
+        (Invoke-MaintenanceConnection $Pipe $ConnectionTask $State $Worker `
+          $RequestStop $FunnelStop)) {
+      return
+    }
+    [void]$ConnectionTask.Value.Wait(250)
+  }
+}
+
+function Complete-PendingMaintenanceStop(
+  [IO.Pipes.NamedPipeServerStream]$Pipe,
+  [ref]$ConnectionTask,
+  [object]$State,
+  [object]$Worker,
+  [scriptblock]$RequestStop,
+  [scriptblock]$FunnelStop
+) {
+  if (-not $ConnectionTask.Value.IsCompleted) { return $false }
+  if (Invoke-MaintenanceConnection $Pipe $ConnectionTask $State $Worker `
+      $RequestStop $FunnelStop) {
+    return $true
+  }
+  if ($State.StopAttempted) {
+    Wait-ForMaintenanceSettlement $Pipe $ConnectionTask $State $Worker `
+      $RequestStop $FunnelStop
+    return $true
+  }
+  return $false
+}
+
+function Close-MaintenanceAuthority(
+  [IO.Pipes.NamedPipeServerStream]$Pipe,
+  [object]$State
+) {
+  $ReleaseProven = $State.ProofAcknowledged -or $State.NaturalCleanupSettled
+  if (-not $State.RuntimeSettled -or
+      -not $State.FunnelSettled -or
+      -not $State.WorkerReleased -or
+      -not $ReleaseProven) {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+  try {
+    if ($Pipe.IsConnected) { $Pipe.Disconnect() }
+  } catch {
+  } finally {
+    $Pipe.Dispose()
+  }
+}
+
+function Get-ExactWorkerTask(
+  [Security.Principal.SecurityIdentifier]$DedicatedSid,
+  [string]$ExpectedPowerShell,
+  [string]$ExpectedStartScript,
+  [string]$ExpectedConfigPath
+) {
+  try {
+    $Task = Get-ScheduledTask -TaskName $ExactTaskName -TaskPath $ExactTaskPath -ErrorAction Stop
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+  $Actions = @($Task.Actions)
+  $ExpectedArguments = "-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File `"$ExpectedStartScript`" -ConfigPath `"$ExpectedConfigPath`""
+  try {
+    $TaskSid = ([Security.Principal.NTAccount]$Task.Principal.UserId).Translate(
+      [Security.Principal.SecurityIdentifier]
+    )
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+  if ($null -eq $Task -or
+      -not $Task.TaskName.Equals($ExactTaskName, [StringComparison]::Ordinal) -or
+      -not $Task.TaskPath.Equals($ExactTaskPath, [StringComparison]::Ordinal) -or
+      $TaskSid.Value -ne $DedicatedSid.Value -or
+      $Actions.Count -ne 1 -or
+      -not ([IO.Path]::GetFullPath([string]$Actions[0].Execute)).Equals(
+        $ExpectedPowerShell,
+        [StringComparison]::OrdinalIgnoreCase
+      ) -or
+      -not ([string]$Actions[0].Arguments).Equals(
+        $ExpectedArguments,
+        [StringComparison]::Ordinal
+      ) -or
+      @("Ready", "Running", "Queued", "Disabled") -notcontains [string]$Task.State) {
+    Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+  }
+  return $Task
+}
+
+function Wait-ExactWorkerTaskNonRunning(
+  [Security.Principal.SecurityIdentifier]$DedicatedSid,
+  [string]$ExpectedPowerShell,
+  [string]$ExpectedStartScript,
+  [string]$ExpectedConfigPath,
+  [int]$TimeoutMilliseconds = 5000
+) {
+  $TaskStopwatch = [Diagnostics.Stopwatch]::StartNew()
+  while ($TaskStopwatch.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+    $Task = Get-ExactWorkerTask $DedicatedSid $ExpectedPowerShell `
+      $ExpectedStartScript $ExpectedConfigPath
+    if ([string]$Task.State -notin @("Running", "Queued")) { return }
+    Start-Sleep -Milliseconds 100
+  }
+  Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+}
+
+function Invoke-MaintenanceStopClient(
+  [Security.Principal.SecurityIdentifier]$DedicatedSid,
+  [string]$ExpectedPowerShell,
+  [string]$ExpectedStartScript,
+  [string]$ExpectedConfigPath
+) {
+  $ConnectTimeoutMilliseconds = 5000
+  $ProofTimeoutMilliseconds = 50000
+  $Pipe = $null
+  $Succeeded = $false
+  try {
+    $Task = Get-ExactWorkerTask $DedicatedSid $ExpectedPowerShell `
+      $ExpectedStartScript $ExpectedConfigPath
+    if ([string]$Task.State -ne "Running") {
+      throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+    }
+    $Pipe = [IO.Pipes.NamedPipeClientStream]::new(
+      ".",
+      "gustavo-hybrid-maintenance-v1",
+      [IO.Pipes.PipeDirection]::InOut,
+      [IO.Pipes.PipeOptions]::Asynchronous
+    )
+    $Pipe.Connect($ConnectTimeoutMilliseconds)
+    $Pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
+    Assert-MaintenancePipeSecurity $Pipe $DedicatedSid
+    $RequestBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
+      "HYBRID_MAINTENANCE_STOP_REQUEST"
+    )
+    $Pipe.Write($RequestBytes, 0, $RequestBytes.Length)
+    $Pipe.Flush()
+    $Proof = Read-MaintenancePipeProof $Pipe $ProofTimeoutMilliseconds
+    Write-MaintenancePipeProofAcknowledgement $Pipe $Proof
+    if (-not $Proof.Equals(
+      "HYBRID_WORKER_MAINTENANCE_STOPPED",
+      [StringComparison]::Ordinal
+    )) {
+      throw "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+    }
+    Wait-ExactWorkerTaskNonRunning $DedicatedSid $ExpectedPowerShell `
+      $ExpectedStartScript $ExpectedConfigPath
+    $Succeeded = $true
+  } catch {
+    $Succeeded = $false
+  } finally {
+    if ($null -ne $Pipe) { $Pipe.Dispose() }
+  }
+  if (-not $Succeeded) { Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN" }
+  Write-Output "HYBRID_WORKER_MAINTENANCE_STOPPED"
 }
 
 function Assert-TrustedExecutable([string]$ActualPath, [string]$ExpectedPath) {
@@ -185,6 +667,9 @@ function Invoke-TrustedProcess(
 }
 
 $CurrentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+if ($ValidateOnly -and $StopForMaintenance) {
+  Stop-Safely "HYBRID_MAINTENANCE_STOP_UNPROVEN"
+}
 $KnownLocalAppData = [Environment]::GetFolderPath(
   [Environment+SpecialFolder]::LocalApplicationData
 )
@@ -222,6 +707,19 @@ if (-not (Test-Path -LiteralPath $ConfigFullPath -PathType Leaf)) {
 }
 Assert-OwnerOnlyAcl $ConfigDirectory $CurrentSid
 Assert-OwnerOnlyAcl $ConfigFullPath $CurrentSid
+
+if ($StopForMaintenance) {
+  $ExpectedPowerShell = [IO.Path]::GetFullPath(
+    (Join-Path $KnownWindows "System32\WindowsPowerShell\v1.0\powershell.exe")
+  )
+  $ExpectedStartScript = [IO.Path]::GetFullPath($PSCommandPath)
+  [void](Assert-NoReparsePath $ExpectedPowerShell $true)
+  [void](Assert-NoReparsePath $ExpectedStartScript $true)
+  Invoke-MaintenanceStopClient $CurrentSid $ExpectedPowerShell `
+    $ExpectedStartScript $ConfigFullPath
+  exit 0
+}
+
 $AllowedNames = @(
   "DATABASE_URL",
   "GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL",
@@ -524,6 +1022,98 @@ function Test-ControlProof([object]$Actual, [string]$Expected) {
   }
   return $Difference -eq 0
 }
+
+function Invoke-WorkerStopProof(
+  [Diagnostics.Process]$Worker,
+  [string]$StopUri,
+  [string]$StopPath
+) {
+  $StopDeadlineMilliseconds = 25000
+  $Stopwatch = [Diagnostics.Stopwatch]::StartNew()
+  while ($Stopwatch.ElapsedMilliseconds -lt $StopDeadlineMilliseconds) {
+    if ($Worker.HasExited) { Stop-Safely "HYBRID_WORKER_STOP_UNPROVEN" }
+    $RemainingMilliseconds = [Math]::Max(
+      0,
+      $StopDeadlineMilliseconds - [int]$Stopwatch.ElapsedMilliseconds
+    )
+    if ($RemainingMilliseconds -lt 1) { break }
+    $RequestTimeoutSeconds = [int][Math]::Max(
+      1,
+      [Math]::Min(2, [Math]::Ceiling($RemainingMilliseconds / 1000))
+    )
+    try {
+      $StopControl = New-ControlRequest "POST" $StopPath
+      $StopProof = Invoke-RestMethod -Method Post -Uri $StopUri `
+        -Headers $StopControl.Headers -Body "" -TimeoutSec $RequestTimeoutSeconds
+      $StopProperties = @($StopProof.PSObject.Properties.Name)
+      if ($StopProperties.Count -ne 4 -or
+          $StopProof.service -ne "gustavo-hybrid-worker-v1" -or
+          $StopProof.stopped -ne $true -or
+          $StopProof.containerAbsent -ne $true -or
+          -not (Test-ControlProof $StopProof.proof $StopControl.ExpectedProof)) {
+        throw "HYBRID_WORKER_STOP_UNPROVEN"
+      }
+      $RemainingMilliseconds = [Math]::Max(
+        0,
+        $StopDeadlineMilliseconds - [int]$Stopwatch.ElapsedMilliseconds
+      )
+      if (-not $Worker.WaitForExit([int]$RemainingMilliseconds) -or
+          $Worker.ExitCode -ne 0) {
+        throw "HYBRID_WORKER_STOP_UNPROVEN"
+      }
+      return [PSCustomObject]@{
+        service = "gustavo-hybrid-worker-v1"
+        stopped = $true
+        containerAbsent = $true
+      }
+    } catch {}
+    $RemainingMilliseconds = [Math]::Max(
+      0,
+      $StopDeadlineMilliseconds - [int]$Stopwatch.ElapsedMilliseconds
+    )
+    if ($RemainingMilliseconds -gt 0) {
+      Start-Sleep -Milliseconds ([Math]::Min(100, $RemainingMilliseconds))
+    }
+  }
+  Stop-Safely "HYBRID_WORKER_STOP_UNPROVEN"
+}
+
+function Invoke-BoundedFunnelStop {
+  for ($Attempt = 0; $Attempt -lt 2; $Attempt += 1) {
+    $FunnelStopNeedsRetry = $true
+    try {
+      $FunnelStop = Invoke-FunnelOff
+      $FunnelStopNeedsRetry = $FunnelStop.TimedOut -or $FunnelStop.ExitCode -ne 0
+    } catch {
+      $FunnelStopNeedsRetry = $true
+    }
+    if (-not $FunnelStopNeedsRetry) { return $true }
+  }
+  return $false
+}
+
+function Invoke-LauncherCleanup(
+  [object]$State,
+  [object]$Worker,
+  [scriptblock]$RequestStop,
+  [scriptblock]$FunnelStop
+) {
+  try {
+    [void](Invoke-MaintenanceStopTransaction `
+      "HYBRID_MAINTENANCE_STOP_REQUEST" $State $RequestStop $FunnelStop)
+  } catch {
+    if ($State.RuntimeSettled -and -not $State.FunnelSettled) {
+      Stop-Safely "TAILSCALE_FUNNEL_STOP_FAILED"
+    }
+    throw
+  }
+  if (-not $State.WorkerReleased) {
+    $Worker.Dispose()
+    $State.WorkerReleased = $true
+  }
+  $State.NaturalCleanupSettled = $true
+}
+
 $StartInfo = [Diagnostics.ProcessStartInfo]::new()
 $StartInfo.FileName = $NodeExecutable
 $StartInfo.Arguments = "`"$TsxCli`" `"$WakeServerScript`""
@@ -549,14 +1139,27 @@ $StartInfo.EnvironmentVariables["PATH"] = @(
   (Split-Path -Parent $DockerExecutable),
   (Join-Path $KnownWindows "System32")
 ) -join ";"
+$MaintenancePipe = New-MaintenancePipeServer $MaintenancePipeName $CurrentSid
+$MaintenanceConnectionTask = $MaintenancePipe.WaitForConnectionAsync()
 $Worker = [Diagnostics.Process]::new()
 $Worker.StartInfo = $StartInfo
-if (-not $Worker.Start()) { Stop-Safely "HYBRID_WORKER_START_FAILED" }
 $ReadyPath = "/_gustavo/ready"
 $StopPath = "/_gustavo/stop"
 $ReadyUri = "http://127.0.0.1:$Port$ReadyPath"
 $StopUri = "http://127.0.0.1:$Port$StopPath"
+$WorkerStarted = $false
+$CleanupCompleted = $false
+$MaintenanceRequested = $false
+$CleanupState = New-LauncherCleanupState
+$RequestStop = {
+  return Invoke-WorkerStopProof $Worker $StopUri $StopPath
+}.GetNewClosure()
+$FunnelStop = {
+  return Invoke-BoundedFunnelStop
+}.GetNewClosure()
 try {
+  if (-not $Worker.Start()) { Stop-Safely "HYBRID_WORKER_START_FAILED" }
+  $WorkerStarted = $true
   $Ready = $false
   # Frozen startup caps: 100 * 300s model execution, 2016 * 12 * 5s
   # market-recovery DB statements, 100 * 100 * 5s model DB statements,
@@ -581,6 +1184,13 @@ try {
   $ReadinessPollMilliseconds = 5000
   $ReadyStopwatch = [Diagnostics.Stopwatch]::StartNew()
   while ($ReadyStopwatch.ElapsedMilliseconds -lt $ReadinessTimeoutMilliseconds) {
+    if ($MaintenanceConnectionTask.IsCompleted -and
+        (Complete-PendingMaintenanceStop $MaintenancePipe `
+          ([ref]$MaintenanceConnectionTask) $CleanupState $Worker `
+          $RequestStop $FunnelStop)) {
+      $MaintenanceRequested = $true
+      break
+    }
     if ($Worker.HasExited) { Stop-Safely "HYBRID_WORKER_START_FAILED" }
     $RemainingReadinessMilliseconds = [long](
       $ReadinessTimeoutMilliseconds - $ReadyStopwatch.ElapsedMilliseconds
@@ -612,6 +1222,13 @@ try {
           $ReadyProof.service -eq "gustavo-hybrid-worker-v1" -and
           $ReadyProof.state -eq "STARTING" -and
           (Test-ControlProof $ReadyProof.proof $ReadyControl.ExpectedProof)) {
+        if ($MaintenanceConnectionTask.IsCompleted -and
+            (Complete-PendingMaintenanceStop $MaintenancePipe `
+              ([ref]$MaintenanceConnectionTask) $CleanupState $Worker `
+              $RequestStop $FunnelStop)) {
+          $MaintenanceRequested = $true
+          break
+        }
         Start-Sleep -Milliseconds ([Math]::Min(
           $ReadinessPollMilliseconds,
           [int][Math]::Max(
@@ -632,6 +1249,10 @@ try {
       ))
     }
   }
+  if ($MaintenanceRequested) {
+    $CleanupCompleted = $true
+    exit 0
+  }
   if (-not $Ready) { Stop-Safely "HYBRID_WORKER_START_TIMEOUT" }
   # Trusted-absolute equivalent of: tailscale funnel --bg <loopback-url>.
   $FunnelStart = Invoke-TrustedProcess $TailscaleExecutable @(
@@ -642,55 +1263,40 @@ try {
     Stop-Safely "TAILSCALE_FUNNEL_FAILED"
   }
   Write-Output "HYBRID_WORKER_READY"
-  $Worker.WaitForExit()
+  while (-not $Worker.HasExited) {
+    if ($MaintenanceConnectionTask.IsCompleted -and
+        (Complete-PendingMaintenanceStop $MaintenancePipe `
+          ([ref]$MaintenanceConnectionTask) $CleanupState $Worker `
+          $RequestStop $FunnelStop)) {
+      $MaintenanceRequested = $true
+      break
+    }
+    [void]$Worker.WaitForExit(250)
+  }
+  if ($MaintenanceRequested) {
+    $CleanupCompleted = $true
+    exit 0
+  }
   if ($Worker.ExitCode -ne 0) { Stop-Safely "HYBRID_WORKER_EXITED" }
 } finally {
-  $FunnelStopNeedsRetry = $true
   try {
-    $FunnelStop = Invoke-FunnelOff
-    $FunnelStopNeedsRetry = $FunnelStop.TimedOut -or $FunnelStop.ExitCode -ne 0
-  } catch {
-    $FunnelStopNeedsRetry = $true
-  }
-  $WorkerStopFailed = $false
-  try {
-    if (-not $Worker.HasExited) {
-      $Stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    if ($WorkerStarted -and -not $CleanupCompleted) {
       try {
-        $StopControl = New-ControlRequest "POST" $StopPath
-        $StopProof = Invoke-RestMethod -Method Post -Uri $StopUri -Headers $StopControl.Headers -Body "" -TimeoutSec 25
-        $StopProperties = @($StopProof.PSObject.Properties.Name)
-        if ($StopProperties.Count -ne 4 -or
-            $StopProof.service -ne "gustavo-hybrid-worker-v1" -or
-            $StopProof.stopped -ne $true -or
-            $StopProof.containerAbsent -ne $true -or
-            -not (Test-ControlProof $StopProof.proof $StopControl.ExpectedProof)) {
-          throw "HYBRID_WORKER_STOP_UNPROVEN"
-        }
-        $RemainingMilliseconds = [Math]::Max(0, 25000 - [int]$Stopwatch.ElapsedMilliseconds)
-        if (-not $Worker.WaitForExit($RemainingMilliseconds)) {
-          throw "HYBRID_WORKER_STOP_UNPROVEN"
-        }
+        Invoke-LauncherCleanup $CleanupState $Worker $RequestStop $FunnelStop
       } catch {
-        # Never hard-kill an unproven runtime. T7 keeps claims fail-closed and the
-        # next leased startup reconciliation owns any exact Docker residue.
-        $WorkerStopFailed = $true
+        Wait-ForMaintenanceSettlement $MaintenancePipe `
+          ([ref]$MaintenanceConnectionTask) $CleanupState $Worker `
+          $RequestStop $FunnelStop
       }
+      $CleanupCompleted = $true
+    } elseif (-not $WorkerStarted) {
+      $Worker.Dispose()
     }
   } finally {
-    $Worker.Dispose()
-  }
-  if ($FunnelStopNeedsRetry) {
-    try {
-      $FunnelStopRetry = Invoke-FunnelOff
-    } catch {
-      Stop-Safely "TAILSCALE_FUNNEL_STOP_FAILED"
+    if ($WorkerStarted) {
+      Close-MaintenanceAuthority $MaintenancePipe $CleanupState
+    } else {
+      $MaintenancePipe.Dispose()
     }
-    if ($FunnelStopRetry.TimedOut -or $FunnelStopRetry.ExitCode -ne 0) {
-      Stop-Safely "TAILSCALE_FUNNEL_STOP_FAILED"
-    }
-  }
-  if ($WorkerStopFailed) {
-    Stop-Safely "HYBRID_WORKER_STOP_UNPROVEN"
   }
 }
