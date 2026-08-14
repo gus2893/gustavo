@@ -1,5 +1,21 @@
 # Working MVP smoke test
 
+For the hybrid Vercel cutover, use the ordered release gates in
+[`VERCEL_DEPLOYMENT.md`](./VERCEL_DEPLOYMENT.md). The checks below remain the
+local MVP and production-readiness foundation; they do not replace the hosted
+and local-hybrid smoke.
+
+All repository commands below use KnownFolder-derived absolute executable
+authority:
+
+```powershell
+$KnownProgramFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+$KnownWindows = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+$TrustedNode = Join-Path $KnownProgramFiles 'nodejs\node.exe'
+$TrustedCorepackScript = Join-Path $KnownProgramFiles 'nodejs\node_modules\corepack\dist\corepack.js'
+$TrustedPowerShell = Join-Path $KnownWindows 'System32\WindowsPowerShell\v1.0\powershell.exe'
+```
+
 This smoke proves the local invitation, authenticated chat, memory, Challenge,
 and public-redaction path in a real Chromium browser. It does not enable a
 production model or market-data fixture. The automated test starts a disposable
@@ -17,14 +33,14 @@ not in a standard installation directory.
 Install dependencies and Chromium once:
 
 ```powershell
-pnpm install --frozen-lockfile
-pnpm exec playwright install chromium
+& $TrustedNode $TrustedCorepackScript pnpm install --frozen-lockfile
+& $TrustedNode $TrustedCorepackScript pnpm exec playwright install chromium
 ```
 
 Run the smoke headlessly, or add `--headed` to watch the same path:
 
 ```powershell
-pnpm playwright test tests/e2e/gustavo-mvp.spec.ts
+& $TrustedNode $TrustedCorepackScript pnpm playwright test tests/e2e/gustavo-mvp.spec.ts
 ```
 
 The browser issues a single-use invitation, opens `/join`, creates Ada's
@@ -51,7 +67,7 @@ expiry is in the future:
 
 ```powershell
 $expiry = (Get-Date).ToUniversalTime().AddHours(1).ToString("o")
-pnpm invitation:issue $expiry
+& $TrustedNode $TrustedCorepackScript pnpm invitation:issue $expiry
 ```
 
 Open `http://localhost:3000/join?token=<issued-token>` and repeat these visible
@@ -67,20 +83,21 @@ checks:
 5. Clear site cookies, open `/`, and confirm the unique private sentence is not
    present in the public activity shell or browser network response bodies.
 
-The production local stack has no model or live market-data adapter yet. Do not
-turn on test fixtures to simulate one; the deterministic licensed observation is
-owned only by the automated isolated smoke.
+The local MVP Compose profile does not start the separately operated hybrid
+Codex or Finnhub adapters. Do not turn on test fixtures to simulate them; the
+deterministic licensed observation is owned only by the automated isolated
+smoke.
 
 ## Production-readiness improvement smoke
 
 Run the integrated improvement proof with Node 24, PostgreSQL 17 tools, a
 running Docker Engine, the locked dependencies, and installed Chromium. The
 harness runs the Compose-pinned `valkey/valkey:8.1.3-bookworm` image. On
-non-Windows hosts, PowerShell 7 (`pwsh`) is also required to run the production
-backup scripts:
+Windows uses the reviewed Windows PowerShell 5.1 authority above. Non-Windows
+test hosts require `pwsh` only for the cross-platform backup fixture:
 
 ```powershell
-pnpm playwright test tests/e2e/gustavo-production-readiness.spec.ts
+& $TrustedNode $TrustedCorepackScript pnpm playwright test tests/e2e/gustavo-production-readiness.spec.ts
 ```
 
 The test uses one disposable PostgreSQL cluster and a real Next server. It
@@ -101,3 +118,28 @@ projected calibration has passed; the full projected-million benchmark remains
 required before public launch. Complete every item in
 `docs/PRODUCTION_CHECKLIST.md` before changing Squarespace DNS or enabling public
 ingress.
+
+## Hybrid hosted and local smoke
+
+Run these static/focused gates before any external cutover:
+
+```powershell
+& $TrustedNode $TrustedCorepackScript pnpm vitest run tests/deployment/vercel-hybrid.test.ts
+& $TrustedNode $TrustedCorepackScript pnpm vitest run tests/stream/sse-authorization.test.ts
+& $TrustedNode $TrustedCorepackScript pnpm test
+& $TrustedNode $TrustedCorepackScript pnpm exec tsc --noEmit
+& $TrustedNode $TrustedCorepackScript pnpm build
+& $TrustedPowerShell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1
+```
+
+For both the early hosted deployment and the staged production URL, verify the
+exact simulation label, public redaction, authentication-before-read, durable
+message queuing, private 95-symbol market page, bounded health DTO, ordered SSE
+reconnect, and no populated secret in HTML, RSC, API, stream, URL, log, or
+deployment artifact. For the staged URL also stop/restart the local worker,
+exercise one fixed `MARKET_CURRENT` delivery, confirm database-window boundary
+skip, prove retained-window no-repoll recovery, and rehearse bounded container
+abort/reconciliation. Rehearse exact-promoting a staged, smoked
+bridge-disabled artifact before schedule/task/Funnel cleanup, while preserving
+durable pending jobs. Repeat the canonical-domain checks after no-rebuild
+promotion.

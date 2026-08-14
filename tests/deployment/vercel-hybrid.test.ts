@@ -1,5 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createOperatorHealthHandler } from "../../app/api/operator/health/route";
 import {
@@ -19,6 +28,711 @@ import {
 } from "../../scripts/issue-invitation";
 import { runProductionMigrations } from "../../scripts/migrate-production";
 import { testContext } from "../helpers/postgres";
+
+describe("hybrid deployment runbook", () => {
+  it("uses executable authorities for deploy, maintenance, market shutdown, backup, and rollback", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    const operations = readFileSync("docs/OPERATIONS.md", "utf8");
+    const checklist = readFileSync("docs/PRODUCTION_CHECKLIST.md", "utf8");
+    const smoke = readFileSync("docs/SMOKE_TEST.md", "utf8");
+    const combined = [deploy, operations, checklist, smoke].join("\n");
+
+    expect(deploy).toContain("vercel: 58.4.0");
+    expect(deploy).toContain("trusted absolute Corepack");
+    expect(deploy).toContain("[Environment]::GetFolderPath");
+    expect(deploy).toContain("Invoke-TrustedVercel");
+    expect(deploy).not.toContain("pnpm exec vercel");
+    expect(combined).not.toMatch(/^\s*(?:pnpm|npx|vercel|powershell)(?:\.exe)?\s/mu);
+    expect(combined).not.toMatch(/^\s*(?:docker|tailscale)(?:\.exe)?\s/mu);
+    expect(deploy).not.toMatch(/\$env:(?:LOCALAPPDATA|ProgramFiles)[\s\S]{0,240}(?:Move-Item|volume\s+rm)/u);
+    expect(deploy).not.toMatch(/(?:Move-Item|\bvolume\s+rm\b)/u);
+    expect(deploy).toContain("scripts/setup-hybrid-worker.ps1 -MaintenanceRebuild");
+    expect(deploy).toContain("-MaintenanceRebuild -RotateCodexAuthVolume");
+    expect(deploy).toContain("GUSTAVO_HYBRID_WAKE_URL");
+    expect(deploy).toContain("GUSTAVO_HYBRID_PUBLIC_WAKE_URL");
+    expect(combined).not.toContain("GUSTAVO_MARKET_POLLER_ENABLED");
+
+    const migrate = deploy.indexOf("production:migrate");
+    const empty = deploy.indexOf("migrated authority-only empty inventory");
+    const backup = deploy.indexOf("create.ps1");
+    const bootstrap = deploy.indexOf("production:bootstrap");
+    expect(migrate).toBeGreaterThan(-1);
+    expect(empty).toBeGreaterThan(migrate);
+    expect(backup).toBeGreaterThan(empty);
+    expect(bootstrap).toBeGreaterThan(backup);
+
+    expect(deploy).toContain("git status --porcelain");
+    expect(deploy).toContain("reviewed pushed HEAD");
+    expect(deploy).toContain("deployment source metadata");
+    expect(deploy).toContain("Project Settings > Domains");
+    expect(deploy).toContain("www.gustavo.lol -> gustavo.lol");
+    expect(deploy).toContain("--prod --skip-domain");
+    expect(deploy).toContain("Invoke-TrustedVercel promote $StagedProductionUrl --yes");
+    expect(deploy).toContain("same deployment ID and git SHA");
+
+    const rollback = deploy.indexOf("## 11. Bridge disable, market shutdown, and rollback");
+    expect(rollback).toBeGreaterThan(-1);
+    const bridgeDisabled = deploy.indexOf("GUSTAVO_HYBRID_BRIDGE_ENABLED=false", rollback);
+    const pauseMarket = deploy.indexOf("pause the exact five-minute market schedule", bridgeDisabled);
+    const stopWorker = deploy.indexOf("$StopProof = Stop-ReviewedHybridWorker", pauseMarket);
+    const settleActive = deploy.indexOf("settles admitted and claimed work", stopWorker);
+    const pendingDurable = deploy.indexOf("durable PENDING jobs remain queued for reconnect recovery", settleActive);
+    expect(pauseMarket).toBeGreaterThan(bridgeDisabled);
+    expect(stopWorker).toBeGreaterThan(pauseMarket);
+    expect(settleActive).toBeGreaterThan(stopWorker);
+    expect(pendingDurable).toBeGreaterThan(settleActive);
+    expect(deploy.slice(pauseMarket, stopWorker)).not.toMatch(/Close local admission|zero CLAIMED/iu);
+    expect(deploy).toContain('{"kind":"MARKET_CURRENT"}');
+    expect(deploy).toContain("PostgreSQL current five-minute bucket");
+    expect(deploy).toContain("no independent timer, poller, or schedule");
+
+    expect(deploy).toContain("GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL");
+    expect(deploy).toContain("must never be set in Vercel");
+    expect(deploy).toContain("must never be forwarded to Codex, Finnhub, or QStash");
+    expect(deploy).toContain("1,000 messages/day provider ceiling");
+    expect(deploy).toContain("900 messages/day application cap");
+    expect(deploy).toContain("SIMULATION ONLY — NOT A REAL TRADE");
+    expect(combined).not.toMatch(/^(?:OPENAI_API_KEY|FINNHUB_API_KEY|DATABASE_URL|GUSTAVO_EVENT_ROOT_KEY_V1|QSTASH_(?:TOKEN|CURRENT_SIGNING_KEY|NEXT_SIGNING_KEY))\s*=\s*\S+/mu);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "executes the documented inventory probe as a stdin async IIFE",
+    () => {
+      const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+      const match = deploy.match(/\$InventoryProbe = @'\r?\n([\s\S]*?)\r?\n'@/u);
+      expect(match).not.toBeNull();
+      const probe = match![1]!;
+      expect(probe).toContain("void (async () => {");
+      expect(probe).toMatch(/\}\)\(\)\.catch\(\(error: unknown\) => \{/u);
+      expect(deploy).toMatch(/\$InventoryProbe\s*\|\s*& \$TrustedNode \$TrustedCorepackScript pnpm exec tsx -/u);
+      expect(deploy).not.toContain("tsx -e $InventoryProbe");
+
+      const harness = probe
+        .replace(
+          /import \{ bootstrapProduction, readProductionBootstrapEnvironment \} from "\.\/scripts\/bootstrap-production";/u,
+          `const readProductionBootstrapEnvironment = () => ({
+            databaseUrl: "postgresql://fixture.invalid/gustavo",
+            canonicalOrigin: "https://gustavo.lol",
+            deploymentProfile: "public-production-v1",
+          });
+          const bootstrapProduction = async (options: any) => {
+            await options.query("preflight");
+            await options.issueInvitation();
+          };`,
+        )
+        .replace(
+          /import \{ closeDatabase, getDatabase \} from "\.\/lib\/server\/db\/postgres";/u,
+          `const closeDatabase = async () => undefined;
+          const getDatabase = () => ({
+            transaction: async (work: (transaction: any) => Promise<void>) =>
+              work({ query: async () => [{ safe_code: null }] }),
+          });`,
+        );
+      const tsxCli = resolve("node_modules/tsx/dist/cli.mjs");
+      const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+      const powerShell = resolve(
+        windowsRoot,
+        "System32/WindowsPowerShell/v1.0/powershell.exe",
+      );
+      const quotePowerShell = (value: string): string => value.replaceAll("'", "''");
+      const powerShellProgram = `$Probe = @'\r\n${harness}\r\n'@\r\n`
+        + `$Probe | & '${quotePowerShell(process.execPath)}' '${quotePowerShell(tsxCli)}' -\r\n`
+        + "exit $LASTEXITCODE\r\n";
+      const result = spawnSync(
+        powerShell,
+        [
+          "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+          "-Command", powerShellProgram,
+        ],
+        {
+          encoding: "utf8",
+          env: { ...process.env, FORCE_COLOR: "0" },
+        },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("MIGRATED_AUTHORITY_ONLY_EMPTY\n");
+      expect(result.stderr).toBe("");
+      expect(deploy).toMatch(/\$InventoryOutput = @\(\$InventoryProbe\s*\|\s*& \$TrustedNode \$TrustedCorepackScript pnpm exec tsx -\)\r?\n\$InventoryExitCode = \$LASTEXITCODE\r?\nif \(\$InventoryExitCode -ne 0 -or \$InventoryOutput\.Count -ne 1 -or\r?\n\s*\[string\]\$InventoryOutput\[0\] -cne 'MIGRATED_AUTHORITY_ONLY_EMPTY'\)/u);
+    },
+  );
+
+  it("loads exact production authority without printing it before inventory and bootstrap", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    for (const name of [
+      "DATABASE_URL",
+      "GUSTAVO_APP_ORIGIN",
+      "GUSTAVO_DEPLOYMENT_PROFILE",
+      "GUSTAVO_EVENT_ROOT_KEY_VERSION",
+      "GUSTAVO_EVENT_ROOT_KEY_V1",
+    ]) expect(deploy).toContain(`Read-ProtectedProcessValue '${name}'`);
+    expect(deploy).toContain("Read-Host -AsSecureString");
+    expect(deploy).toContain("ZeroFreeBSTR");
+    expect(deploy).toContain("PROTECTED_PRODUCTION_AUTHORITY_LOADED");
+    expect(deploy).toContain("GUSTAVO_DEPLOYMENT_PROFILE', 'Process') -cne 'public-production-v1'");
+    expect(deploy).not.toMatch(/Write-(?:Host|Output)[^\n]*(?:DATABASE_URL|GUSTAVO_APP_ORIGIN|GUSTAVO_DEPLOYMENT_PROFILE|GUSTAVO_EVENT_ROOT_KEY)/iu);
+    expect(deploy.indexOf("PROTECTED_PRODUCTION_AUTHORITY_LOADED"))
+      .toBeLessThan(deploy.indexOf("$InventoryProbe = @'"));
+    expect(deploy.indexOf("$InventoryProbe = @'"))
+      .toBeLessThan(deploy.indexOf("pnpm production:bootstrap"));
+  });
+
+  it("reproves exact reviewed source before each upload and inspects source metadata", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    const helper = deploy.match(/function Assert-ReviewedPushedHead[\s\S]*?^\}/mu)?.[0];
+    expect(helper).toBeDefined();
+    expect(helper).toMatch(/fetch --prune origin[\s\S]*\$LASTEXITCODE[\s\S]*status --porcelain[\s\S]*\$LASTEXITCODE[\s\S]*rev-parse HEAD[\s\S]*\$LASTEXITCODE[\s\S]*rev-parse '@\{upstream\}'[\s\S]*\$LASTEXITCODE/u);
+    expect(helper).toContain("REVIEWED_PUSHED_HEAD_REQUIRED");
+    expect(deploy).toMatch(/\$PreviewHead = Assert-ReviewedPushedHead\r?\nif \(\$PreviewHead -cne \$ReviewedHead\) \{ throw 'REVIEWED_HEAD_CHANGED' \}\r?\n\$PreviewDeployOutput = @\(Invoke-TrustedVercel deploy\)/u);
+    expect(deploy).toMatch(/\$StagedHead = Assert-ReviewedPushedHead\r?\nif \(\$StagedHead -cne \$ReviewedHead\) \{ throw 'REVIEWED_HEAD_CHANGED' \}\r?\n\$StagedProductionDeployOutput = @\(Invoke-TrustedVercel --prod --skip-domain\)/u);
+    expect(deploy).toContain("deployment source metadata");
+    expect(deploy).toContain("exactly matches $PreviewHead");
+    expect(deploy).toContain("exactly matches $StagedHead");
+  });
+
+  it("sanitizes PATH with trusted Git for pinned Vercel source metadata", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    const pinnedVercelSource = readFileSync(
+      "node_modules/vercel/dist/chunks/chunk-PVWXPWLQ.js",
+      "utf8",
+    );
+    expect(pinnedVercelSource).toContain('"git --no-optional-locks status -s"');
+    const pathLine = deploy.match(/^\$env:PATH = .*$/mu)?.[0];
+    expect(pathLine).toBe(
+      '$env:PATH = "$(Split-Path -Parent $TrustedNode);$(Split-Path -Parent $TrustedGit);$TrustedSystem32"',
+    );
+    expect(pathLine).not.toContain("$env:PATH;");
+  });
+
+  it("validates and imports the exact pinned Vercel CLI behind a trusted boundary", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    expect(deploy).toContain("$VercelLink = Get-Item -LiteralPath $VercelLinkPath -Force");
+    expect(deploy).toContain("$VercelLink.LinkType -cne 'SymbolicLink'");
+    expect(deploy).toContain("vercel@58\\.4\\.0_[^\\\\]+\\\\node_modules\\\\vercel$");
+    expect(deploy).toContain("$TrustedVercelPackage.version -cne '58.4.0'");
+    expect(deploy).toContain("$TrustedVercelCli = Join-Path $CanonicalVercelRoot 'dist\\index.js'");
+    expect(deploy).toContain("$TrustedVercelCliItem.PSIsContainer");
+    expect(deploy).toContain("function Invoke-TrustedVercel");
+    expect(deploy).toContain("pnpm exec -- $TrustedNode --input-type=module --eval $TrustedVercelBootstrap --");
+    expect(deploy).not.toContain("pnpm exec vercel");
+    for (const operation of [
+      "--version",
+      "link",
+      "project inspect",
+      "env add GUSTAVO_HYBRID_WAKE_URL preview",
+      "env add GUSTAVO_HYBRID_WAKE_URL production",
+      "deploy",
+      "--prod --skip-domain",
+      "inspect $PreviewUrl --json",
+      "api \"/v13/deployments/$($PreviewInspection.id)\" --raw",
+      "promote $StagedProductionUrl --yes",
+    ]) expect(deploy).toContain(`Invoke-TrustedVercel ${operation}`);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "resets the effective inner Vercel PATH before CLI import",
+    () => {
+      const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+      const match = deploy.match(/\$TrustedVercelBootstrap = @'\r?\n([\s\S]*?)\r?\n'@/u);
+      expect(match).not.toBeNull();
+      const bootstrap = match?.[1] ?? "";
+      expect(bootstrap).toContain("if (key.toUpperCase() === 'PATH') delete process.env[key];");
+      expect(bootstrap).toContain("process.env.PATH = trustedChildPath;");
+      expect(bootstrap).toContain("await import(pathToFileURL(cliPath).href);");
+      const harness = bootstrap.replace(
+        "await import(pathToFileURL(cliPath).href);",
+        'const { execFileSync } = await import("node:child_process"); const matches = execFileSync("where.exe", ["git.exe"], { encoding: "utf8" }).trim().split(/\\r?\\n/u); process.stdout.write(JSON.stringify({ path: process.env.PATH, git: matches[0] }));',
+      );
+      expect(harness).not.toBe(bootstrap);
+
+      const pnpmCli = resolve(
+        process.execPath,
+        "..", "..", "node_modules/pnpm/bin/pnpm.cjs",
+      );
+      const trustedGit = "C:\\Program Files\\Git\\cmd\\git.exe";
+      const trustedChildPath = [
+        resolve(trustedGit, ".."),
+        resolve(process.execPath, ".."),
+        "C:\\Windows\\System32",
+      ].join(";");
+      const result = spawnSync(
+        process.execPath,
+        [
+          pnpmCli, "exec", "--", process.execPath,
+          "--input-type=module", "--eval", harness, "--",
+          trustedChildPath, "C:\\fixture\\vercel\\dist\\index.js", "--version",
+        ],
+        { cwd: resolve("."), encoding: "utf8", env: { ...process.env, FORCE_COLOR: "0" } },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      const observed = JSON.parse(result.stdout) as { path: string; git: string };
+      expect(observed.path).toBe(trustedChildPath);
+      expect(observed.path).not.toMatch(/(?:^|[\\/;])node_modules[\\/]\.bin(?:[\\/;]|$)/iu);
+      expect(observed.git.toLowerCase()).toBe(trustedGit.toLowerCase());
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "executes the documented trusted Vercel function through PowerShell 5.1",
+    () => {
+      const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+      const bootstrapMatch = deploy.match(
+        /\$TrustedVercelBootstrap = @'\r?\n([\s\S]*?)\r?\n'@/u,
+      );
+      const functionMatch = deploy.match(/function Invoke-TrustedVercel \{[\s\S]*?^\}/mu);
+      expect(bootstrapMatch).not.toBeNull();
+      expect(functionMatch).not.toBeNull();
+      const bootstrap = bootstrapMatch?.[1] ?? "";
+      const harness = bootstrap.replace(
+        "await import(pathToFileURL(cliPath).href);",
+        "const { execFileSync } = await import('node:child_process'); const matches = execFileSync('where.exe', ['git.exe'], { encoding: 'utf8' }).trim().split(/\\r?\\n/u); process.stdout.write(JSON.stringify({ path: process.env.PATH, git: matches[0] }));",
+      );
+      expect(harness).not.toBe(bootstrap);
+
+      const pnpmCli = resolve(
+        process.execPath,
+        "..", "..", "node_modules/pnpm/bin/pnpm.cjs",
+      );
+      const trustedGit = "C:\\Program Files\\Git\\cmd\\git.exe";
+      const trustedChildPath = [
+        resolve(trustedGit, ".."),
+        resolve(process.execPath, ".."),
+        "C:\\Windows\\System32",
+      ].join(";");
+      const quotePowerShell = (value: string): string => value.replaceAll("'", "''");
+      const program = [
+        `$TrustedNode = '${quotePowerShell(process.execPath)}'`,
+        `$TrustedCorepackScript = '${quotePowerShell(pnpmCli)}'`,
+        `$TrustedChildPath = '${quotePowerShell(trustedChildPath)}'`,
+        "$TrustedVercelCli = 'C:\\fixture\\vercel\\dist\\index.js'",
+        "$TrustedVercelBootstrap = @'",
+        harness,
+        "'@",
+        functionMatch?.[0] ?? "",
+        "$Proof = @(Invoke-TrustedVercel --version)",
+        "$ProofExitCode = $LASTEXITCODE",
+        "if ($ProofExitCode -ne 0 -or $Proof.Count -ne 1) { throw 'TRUSTED_VERCEL_PS51_FAILED' }",
+        "[Console]::Out.Write([string]$Proof[0])",
+        "exit 0",
+      ].join("\r\n");
+      const powerShell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+      const result = spawnSync(
+        powerShell,
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", program],
+        { cwd: resolve("."), encoding: "utf8", env: { ...process.env, FORCE_COLOR: "0" } },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      const observed = JSON.parse(result.stdout) as { path: string; git: string };
+      expect(observed.path).toBe(trustedChildPath);
+      expect(observed.path).not.toMatch(/(?:^|[\\/;])node_modules[\\/]\.bin(?:[\\/;]|$)/iu);
+      expect(observed.git.toLowerCase()).toBe(trustedGit.toLowerCase());
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "clears hostile Node execution authority before the first Node process",
+    () => {
+      const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+      const functionMatch = deploy.match(/function Reset-NodeEnvironmentAuthority \{[\s\S]*?^\}/mu);
+      expect(functionMatch).not.toBeNull();
+      for (const name of [
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "NODE_REPL_EXTERNAL_MODULE",
+        "NODE_EXTRA_CA_CERTS",
+        "OPENSSL_CONF",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "COREPACK_HOME",
+        "COREPACK_NPM_REGISTRY",
+        "COREPACK_INTEGRITY_KEYS",
+        "npm_config_userconfig",
+      ]) expect(functionMatch?.[0]).toContain(`'${name}'`);
+      const reset = deploy.indexOf("\nReset-NodeEnvironmentAuthority\n");
+      const runtimeGate = deploy.indexOf("\nAssert-TrustedRuntimeVersions\n", reset);
+      expect(reset).toBeGreaterThan(-1);
+      expect(runtimeGate).toBeGreaterThan(reset);
+      expect(deploy.slice(reset, runtimeGate)).not.toContain("& $TrustedNode");
+
+      const injectedModule = Buffer.from(
+        'process.stdout.write("NODE_OPTIONS_INJECTED\\n")',
+      ).toString("base64");
+      const program = [
+        functionMatch?.[0] ?? "",
+        "Reset-NodeEnvironmentAuthority",
+        "if ([Environment]::GetEnvironmentVariable('npm_config_userconfig', 'Process') -cne 'NUL' -or [Environment]::GetEnvironmentVariable('NPM_CONFIG_GLOBALCONFIG', 'Process') -cne 'NUL') { throw 'AMBIENT_NPM_CONFIG_NOT_REJECTED' }",
+        `$NodeVersionOutput = @(& '${process.execPath.replaceAll("'", "''")}' --version)`,
+        "$NodeExitCode = $LASTEXITCODE",
+        "if ($NodeExitCode -ne 0 -or $NodeVersionOutput.Count -ne 1) { throw 'NODE_AUTHORITY_TEST_FAILED' }",
+        "[Console]::Out.Write([string]$NodeVersionOutput[0])",
+        "exit 0",
+      ].join("\r\n");
+      const result = spawnSync(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", program],
+        {
+          cwd: resolve("."),
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            NODE_OPTIONS: `--import=data:text/javascript;base64,${injectedModule}`,
+            NODE_PATH: "C:\\hostile-node-path",
+            COREPACK_HOME: "C:\\hostile-corepack-home",
+            npm_config_userconfig: "C:\\hostile-npmrc",
+          },
+        },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(process.version);
+      expect(result.stdout).not.toContain("NODE_OPTIONS_INJECTED");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "rejects alternate Git repository and config environment injection",
+    () => {
+      const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+      const functionMatch = deploy.match(/function Reset-GitEnvironmentAuthority \{[\s\S]*?^\}/mu);
+      expect(functionMatch).not.toBeNull();
+      expect(functionMatch?.[0]).toContain("-like 'GIT_*'");
+      expect(functionMatch?.[0]).toContain("GIT_CONFIG_NOSYSTEM");
+      expect(functionMatch?.[0]).toContain("GIT_CONFIG_GLOBAL");
+      expect(functionMatch?.[0]).toContain("GIT_TERMINAL_PROMPT");
+      const reset = deploy.indexOf("\nReset-GitEnvironmentAuthority\n");
+      expect(reset).toBeGreaterThan(-1);
+      expect(deploy.indexOf("$ReviewedHead = Assert-ReviewedPushedHead")).toBeGreaterThan(reset);
+      expect(deploy.indexOf("Invoke-TrustedVercel --version")).toBeGreaterThan(reset);
+
+      const alternate = mkdtempSync(resolve(tmpdir(), "gustavo-git-env-"));
+      const trustedGit = "C:\\Program Files\\Git\\cmd\\git.exe";
+      try {
+        const initialized = spawnSync(trustedGit, ["init", "--quiet", alternate], {
+          encoding: "utf8",
+        });
+        expect(initialized.status, initialized.stderr).toBe(0);
+        const quotePowerShell = (value: string): string => value.replaceAll("'", "''");
+        const program = [
+          functionMatch?.[0] ?? "",
+          "Reset-GitEnvironmentAuthority",
+          `$Root = (& '${quotePowerShell(trustedGit)}' rev-parse --show-toplevel).Trim()`,
+          "$RootExitCode = $LASTEXITCODE",
+          "if ($RootExitCode -ne 0) { throw 'GIT_ROOT_AUTHORITY_TEST_FAILED' }",
+          `$InjectedConfig = @(& '${quotePowerShell(trustedGit)}' config --get test.stageBInjected)`,
+          "$InjectedConfigExitCode = $LASTEXITCODE",
+          "if ($InjectedConfigExitCode -eq 0 -or $InjectedConfig.Count -ne 0) { throw 'GIT_CONFIG_AUTHORITY_TEST_FAILED' }",
+          "[Console]::Out.Write($Root)",
+          "exit 0",
+        ].join("\r\n");
+        const result = spawnSync(
+          "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+          ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", program],
+          {
+            cwd: resolve("."),
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              GIT_DIR: resolve(alternate, ".git"),
+              GIT_WORK_TREE: alternate,
+              GIT_CONFIG_COUNT: "1",
+              GIT_CONFIG_KEY_0: "test.stageBInjected",
+              GIT_CONFIG_VALUE_0: "yes",
+            },
+          },
+        );
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout.replaceAll("/", "\\").toLowerCase())
+          .toBe(resolve(".").replaceAll("/", "\\").toLowerCase());
+      } finally {
+        expect(alternate.toLowerCase().startsWith(resolve(tmpdir()).toLowerCase())).toBe(true);
+        rmSync(alternate, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "clears every ambient pnpm and npm config variable before trusted pnpm",
+    () => {
+      const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+      const functionMatch = deploy.match(/function Reset-NodeEnvironmentAuthority \{[\s\S]*?^\}/mu);
+      expect(functionMatch).not.toBeNull();
+      const pnpmCli = resolve(
+        process.execPath,
+        "..", "..", "node_modules/pnpm/bin/pnpm.cjs",
+      );
+      const quotePowerShell = (value: string): string => value.replaceAll("'", "''");
+      const program = [
+        `$TrustedNode = '${quotePowerShell(process.execPath)}'`,
+        `$TrustedPnpmCli = '${quotePowerShell(pnpmCli)}'`,
+        functionMatch?.[0] ?? "",
+        "Reset-NodeEnvironmentAuthority",
+        "$ScriptShellOutput = @(& $TrustedNode $TrustedPnpmCli config get script-shell)",
+        "$ScriptShellExitCode = $LASTEXITCODE",
+        "if ($ScriptShellExitCode -ne 0 -or $ScriptShellOutput.Count -ne 1 -or [string]$ScriptShellOutput[0] -cne 'undefined') { throw 'PNPM_SCRIPT_SHELL_INJECTION_SURVIVED' }",
+        "$PnpmfileOutput = @(& $TrustedNode $TrustedPnpmCli config get pnpmfile)",
+        "$PnpmfileExitCode = $LASTEXITCODE",
+        "if ($PnpmfileExitCode -ne 0 -or $PnpmfileOutput.Count -ne 1 -or [string]$PnpmfileOutput[0] -cne 'undefined') { throw 'PNPMFILE_INJECTION_SURVIVED' }",
+        "[Console]::Out.Write('PACKAGE_CONFIG_AUTHORITY_OK')",
+        "exit 0",
+      ].join("\r\n");
+      const result = spawnSync(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", program],
+        {
+          cwd: resolve("."),
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PNPM_CONFIG_PNPMFILE: "C:\\hostile-pnpmfile.cjs",
+            PNPM_CONFIG_SCRIPT_SHELL: "C:\\hostile-pnpm-shell.exe",
+            NPM_CONFIG_SCRIPT_SHELL: "C:\\hostile-npm-shell.exe",
+          },
+        },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("PACKAGE_CONFIG_AUTHORITY_OK");
+
+      const resetFunction = functionMatch?.[0] ?? "";
+      const pnpmReset = resetFunction.indexOf("-ilike 'PNPM_CONFIG_*'");
+      const npmReset = resetFunction.indexOf("-ilike 'NPM_CONFIG_*'");
+      const controlled = resetFunction.indexOf("$ControlledPackageConfig");
+      expect(pnpmReset).toBeGreaterThan(-1);
+      expect(npmReset).toBeGreaterThan(-1);
+      expect(controlled).toBeGreaterThan(pnpmReset);
+      expect(controlled).toBeGreaterThan(npmReset);
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "fails closed when pnpm store content integrity is not clean",
+    () => {
+      const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+      const functionMatch = deploy.match(/function Assert-TrustedPnpmStoreIntegrity \{[\s\S]*?^\}/mu);
+      expect(functionMatch).not.toBeNull();
+      expect(functionMatch?.[0]).toContain("pnpm store status");
+      expect(functionMatch?.[0]).toContain("PNPM_STORE_INTEGRITY_FAILED");
+      const install = deploy.indexOf("pnpm install --frozen-lockfile");
+      const reviewed = deploy.indexOf("$ReviewedHead = Assert-ReviewedPushedHead");
+      const store = deploy.indexOf("Assert-TrustedPnpmStoreIntegrity", install);
+      const cli = deploy.indexOf("$VercelLinkPath =", store);
+      expect(reviewed).toBeGreaterThan(-1);
+      expect(install).toBeGreaterThan(reviewed);
+      expect(store).toBeGreaterThan(install);
+      expect(cli).toBeGreaterThan(store);
+
+      const fixture = mkdtempSync(resolve(tmpdir(), "gustavo-store-status-"));
+      try {
+        const failingCorepack = resolve(fixture, "corepack-failure.cjs");
+        writeFileSync(failingCorepack, "process.exitCode = 23;\n", "utf8");
+        const quotePowerShell = (value: string): string => value.replaceAll("'", "''");
+        const program = [
+          `$TrustedNode = '${quotePowerShell(process.execPath)}'`,
+          `$TrustedCorepackScript = '${quotePowerShell(failingCorepack)}'`,
+          functionMatch?.[0] ?? "",
+          "Assert-TrustedPnpmStoreIntegrity",
+          "[Console]::Out.Write('UNEXPECTED_STORE_ACCEPTANCE')",
+          "exit 0",
+        ].join("\r\n");
+        const result = spawnSync(
+          "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+          ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", program],
+          { cwd: resolve("."), encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" } },
+        );
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain("PNPM_STORE_INTEGRITY_FAILED");
+        expect(result.stdout).not.toContain("UNEXPECTED_STORE_ACCEPTANCE");
+      } finally {
+        expect(fixture.toLowerCase().startsWith(resolve(tmpdir()).toLowerCase())).toBe(true);
+        rmSync(fixture, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "enforces exact approved Node and pnpm runtime versions through PowerShell 5.1",
+    () => {
+      const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+      const functionMatch = deploy.match(/function Assert-TrustedRuntimeVersions \{[\s\S]*?^\}/mu);
+      expect(functionMatch).not.toBeNull();
+      expect(functionMatch?.[0]).toContain("-cne 'v24.19.0'");
+      expect(functionMatch?.[0]).toContain("-cne '11.16.0'");
+      expect(deploy).toContain("The current Program Files Node 22 installation is not authority");
+      const pnpmCli = resolve(
+        process.execPath,
+        "..", "..", "node_modules/pnpm/bin/pnpm.cjs",
+      );
+      const quotePowerShell = (value: string): string => value.replaceAll("'", "''");
+      const program = [
+        `$TrustedNode = '${quotePowerShell(process.execPath)}'`,
+        `$TrustedCorepackScript = '${quotePowerShell(pnpmCli)}'`,
+        functionMatch?.[0] ?? "",
+        "Assert-TrustedRuntimeVersions",
+        "[Console]::Out.Write('TRUSTED_RUNTIME_VERSIONS_OK')",
+        "exit 0",
+      ].join("\r\n");
+      const result = spawnSync(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", program],
+        { cwd: resolve("."), encoding: "utf8", env: { ...process.env, NODE_OPTIONS: "" } },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("TRUSTED_RUNTIME_VERSIONS_OK");
+    },
+  );
+
+  it("requires fail-closed scheduled-task and worker proof after start", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    const start = deploy.indexOf(
+      "Start-ScheduledTask -TaskPath '\\' -TaskName 'Gustavo Hybrid Worker' -ErrorAction Stop",
+    );
+    const task = deploy.indexOf(
+      "Get-ScheduledTask -TaskPath '\\' -TaskName 'Gustavo Hybrid Worker' -ErrorAction Stop",
+      start,
+    );
+    const taskInfo = deploy.indexOf(
+      "Get-ScheduledTaskInfo -TaskPath '\\' -TaskName 'Gustavo Hybrid Worker' -ErrorAction Stop",
+      task,
+    );
+    const validation = deploy.indexOf(
+      "scripts/start-hybrid-worker.ps1 -ValidateOnly",
+      taskInfo,
+    );
+    const marker = deploy.indexOf("HYBRID_WORKER_VALIDATION_COMPLETE", validation);
+    const readiness = deploy.indexOf("authenticated operator health proves", marker);
+    expect(start).toBeGreaterThan(-1);
+    expect(task).toBeGreaterThan(start);
+    expect(taskInfo).toBeGreaterThan(task);
+    expect(validation).toBeGreaterThan(taskInfo);
+    expect(marker).toBeGreaterThan(validation);
+    expect(readiness).toBeGreaterThan(marker);
+    expect(deploy.slice(start, readiness)).toContain("$StartedTask.State -cne 'Running'");
+    expect(deploy.slice(start, readiness)).toContain("POST_START_WORKER_PROOF_FAILED");
+  });
+
+  it("keeps the reviewed head immutable across uploads and rollback review", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    for (const [head, output] of [
+      ["PreviewHead", "PreviewDeployOutput"],
+      ["StagedHead", "StagedProductionDeployOutput"],
+      ["BridgeDisabledHead", "BridgeDisabledDeployOutput"],
+    ]) {
+      expect(deploy).toMatch(new RegExp(
+        `\\$${head} = Assert-ReviewedPushedHead\\r?\\n`
+        + `if \\(\\$${head} -cne \\$ReviewedHead\\) \\{ throw 'REVIEWED_HEAD_CHANGED' \\}\\r?\\n`
+        + `\\$${output} =`,
+      ));
+    }
+
+    const priorCheckout = deploy.indexOf("Otherwise check out the exact reviewed previous");
+    expect(priorCheckout).toBeGreaterThan(-1);
+    const priorAuthority = deploy.slice(priorCheckout);
+    const approved = priorAuthority.indexOf("$ApprovedRollbackHead = Read-Host");
+    const validated = priorAuthority.indexOf("$ApprovedRollbackHead -cnotmatch '^[a-f0-9]{40}$'", approved);
+    const observed = priorAuthority.indexOf("$ObservedRollbackHead = Assert-ReviewedPushedHead", validated);
+    const equality = priorAuthority.indexOf("$ObservedRollbackHead -cne $ApprovedRollbackHead", observed);
+    const immutable = priorAuthority.indexOf("$ReviewedHead = $ApprovedRollbackHead", equality);
+    expect(approved).toBeGreaterThan(-1);
+    expect(validated).toBeGreaterThan(approved);
+    expect(observed).toBeGreaterThan(validated);
+    expect(equality).toBeGreaterThan(observed);
+    expect(immutable).toBeGreaterThan(equality);
+    expect(priorAuthority).not.toContain("$ReviewedHead = Assert-ReviewedPushedHead");
+  });
+
+  it("uses the reviewed PowerShell 5.1 maintenance stop and bans forceful operator cleanup", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    const operations = readFileSync("docs/OPERATIONS.md", "utf8");
+    const smoke = readFileSync("docs/SMOKE_TEST.md", "utf8");
+    const combined = [deploy, operations, smoke].join("\n");
+    expect(combined).toContain("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(combined).not.toContain("PowerShell\\7\\pwsh.exe");
+    expect(deploy).toContain("scripts/start-hybrid-worker.ps1 -StopForMaintenance");
+    expect(deploy).toContain("HYBRID_WORKER_MAINTENANCE_STOPPED");
+    expect(deploy).not.toMatch(/Stop-ScheduledTask|taskkill|TerminateProcess/iu);
+    expect(deploy).not.toMatch(/&\s*\$TrustedTailscale\s+funnel|^\s*docker\s+(?:kill|rm)\b/imu);
+  });
+
+  it("checks each Vercel deployment authority and canonicalizes one URL", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    expect(deploy).toMatch(/function Assert-SingleCanonicalDeploymentUrl[\s\S]*?Count -ne 1[\s\S]*?^\}/mu);
+    for (const prefix of ["Preview", "StagedProduction", "BridgeDisabled"]) {
+      expect(deploy).toContain(`$${prefix}DeployExitCode = $LASTEXITCODE`);
+      expect(deploy).toContain(`$${prefix}Url = Assert-SingleCanonicalDeploymentUrl`);
+      expect(deploy).toContain(`$${prefix}InspectExitCode = $LASTEXITCODE`);
+    }
+    for (const prefix of ["StagedProduction", "BridgeDisabled"]) {
+      expect(deploy).toContain(`$${prefix}PromoteExitCode = $LASTEXITCODE`);
+    }
+    expect(deploy).toMatch(/\$PreviewHead = Assert-ReviewedPushedHead\r?\nif \(\$PreviewHead -cne \$ReviewedHead\) \{ throw 'REVIEWED_HEAD_CHANGED' \}\r?\n\$PreviewDeployOutput = @\(Invoke-TrustedVercel deploy\)/u);
+    expect(deploy).toMatch(/\$StagedHead = Assert-ReviewedPushedHead\r?\nif \(\$StagedHead -cne \$ReviewedHead\) \{ throw 'REVIEWED_HEAD_CHANGED' \}\r?\n\$StagedProductionDeployOutput = @\(Invoke-TrustedVercel --prod --skip-domain\)/u);
+    expect(deploy).toMatch(/\$BridgeDisabledHead = Assert-ReviewedPushedHead\r?\nif \(\$BridgeDisabledHead -cne \$ReviewedHead\) \{ throw 'REVIEWED_HEAD_CHANGED' \}\r?\n\$BridgeDisabledDeployOutput = @\(Invoke-TrustedVercel --prod --skip-domain\)/u);
+  });
+
+  it("proves inspected deployment source and preserves it across promotion", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    expect(deploy).toContain("Vercel CLI 58.4.0 omits `meta` from `inspect --json`");
+    expect(deploy).toMatch(/function ConvertFrom-StrictJsonObject[\s\S]*?ConvertFrom-Json -InputObject \$JsonText -ErrorAction Stop[\s\S]*?^\}/mu);
+    const inspectionHelper = deploy.match(/function Assert-DeploymentInspection[\s\S]*?^\}/mu)?.[0];
+    expect(inspectionHelper).toBeDefined();
+    expect(inspectionHelper).toContain("$Inspection.readyState -cne 'READY'");
+    expect(inspectionHelper).toContain("$Inspection.id -cnotmatch '^dpl_[A-Za-z0-9]+$'");
+    expect(inspectionHelper).toContain("$Inspection.url -cne $ExpectedHost");
+    const sourceHelper = deploy.match(/function Assert-DeploymentSource[\s\S]*?^\}/mu)?.[0];
+    expect(sourceHelper).toBeDefined();
+    expect(sourceHelper).toContain("projectId");
+    expect(sourceHelper).toContain("prj_HoIxQexO64tsgXrNI6m89g3P87TB");
+    expect(sourceHelper).toContain("ownerId");
+    expect(sourceHelper).toContain("team_2ZsWunVLuTIHx2h2zmWEAvAH");
+    expect(sourceHelper).toContain("meta.githubCommitSha");
+    expect(sourceHelper).toContain("-cne $ExpectedHead");
+
+    for (const prefix of ["Preview", "StagedProduction", "BridgeDisabled"]) {
+      expect(deploy).toContain(`Invoke-TrustedVercel inspect $${prefix}Url --json`);
+      expect(deploy).toContain(`$${prefix}Inspection = Assert-DeploymentInspection`);
+      expect(deploy).toContain(`Invoke-TrustedVercel api "/v13/deployments/$($${prefix}Inspection.id)" --raw`);
+      expect(deploy).toContain(`$${prefix}Source = Assert-DeploymentSource`);
+      const head = prefix === "Preview" ? "PreviewHead"
+        : prefix === "StagedProduction" ? "StagedHead" : "BridgeDisabledHead";
+      expect(deploy).toContain(`$${prefix}Inspection $${head}`);
+    }
+    expect(deploy).toContain("$PromotedStagedProductionInspection.id -cne $StagedProductionInspection.id");
+    expect(deploy).toContain("$PromotedStagedProductionSource.meta.githubCommitSha -cne $StagedProductionSource.meta.githubCommitSha");
+    expect(deploy).toContain("$PromotedBridgeDisabledInspection.id -cne $BridgeDisabledInspection.id");
+    expect(deploy).toContain("$PromotedBridgeDisabledSource.meta.githubCommitSha -cne $BridgeDisabledSource.meta.githubCommitSha");
+  });
+
+  it("fails closed on every critical native child before the next mutation", () => {
+    const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
+    for (const exitVariable of [
+      "NodeVersionExitCode",
+      "PnpmVersionExitCode",
+      "InstallExitCode",
+      "StoreStatusExitCode",
+      "VercelVersionExitCode",
+      "LinkExitCode",
+      "ProjectInspectExitCode",
+      "PreviewWakeEnvExitCode",
+      "ProductionWakeEnvExitCode",
+      "PreviewSourceExitCode",
+      "StagedProductionSourceExitCode",
+      "PromotedStagedProductionInspectExitCode",
+      "PromotedStagedProductionSourceExitCode",
+      "BridgeDisabledSourceExitCode",
+      "PromotedBridgeDisabledInspectExitCode",
+      "PromotedBridgeDisabledSourceExitCode",
+      "MigrationExitCode",
+      "BackupCreateExitCode",
+      "BackupVerifyExitCode",
+      "BootstrapExitCode",
+      "SetupExitCode",
+      "ValidateStartExitCode",
+      "PostStartValidationExitCode",
+      "MaintenanceRebuildExitCode",
+      "MaintenanceRotateExitCode",
+    ]) {
+      expect(deploy).toContain(`$${exitVariable} = $LASTEXITCODE`);
+      expect(deploy).toMatch(new RegExp(`if \\\(\\$${exitVariable} -ne 0[^)]*\\\) \\\{`));
+    }
+  });
+});
 
 describe("hybrid operator health", () => {
   it("separates hosted and local components with durable bounded quota state", async () => {

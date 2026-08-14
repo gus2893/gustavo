@@ -4,12 +4,34 @@ This is the final operator gate for exposing Gustavo at `https://gustavo.lol`.
 Check every item with dated evidence from the deployed revision. A green local
 MVP or production-readiness E2E does not by itself authorize public launch.
 
+## Hybrid Vercel release authority
+
+- [ ] Follow the command order in
+  [`VERCEL_DEPLOYMENT.md`](./VERCEL_DEPLOYMENT.md); record both the early hosted
+  gate and the separate staged-production deployment ID/git SHA.
+- [ ] Prove the staged production artifact passes public leakage,
+  authenticated chat/market/health, local-offline/reconnect, quota, and rollback
+  smoke before its exact no-rebuild domain promotion.
+- [ ] Confirm all selected plans remain Free, exactly two QStash schedules
+  exist, and hosted environment names contain no local-only materializer URL.
+- [ ] Confirm the fixed five-minute body is `{"kind":"MARKET_CURRENT"}` and
+  PostgreSQL—not QStash or the PC clock—owns the derived market window.
+- [ ] Rehearse exact-promoting a staged, smoked bridge-disabled artifact before
+  pausing the market schedule; settle claimed/active work while preserving
+  durable pending jobs, then prove task/Funnel/container absence.
+- [ ] Confirm any previous Ready rollback artifact is already bridge-disabled,
+  leak-free, SHA-identified, and schema-compatible; otherwise restage and smoke
+  the exact reviewed prior or safe-shell commit. Retain additive migration 0022.
+
 ## Application and local health
 
 - [ ] Node 24, pnpm 11, PostgreSQL, Valkey, web, and worker use the reviewed
-  locked versions; `pnpm test`, `pnpm exec tsc --noEmit`, and `pnpm build` pass.
-- [ ] `pnpm mvp:start` reports healthy `web`, `worker`, `postgres`, and `valkey`
-  services; PostgreSQL and Valkey have no public host ports.
+  locked versions; the trusted test, TypeScript, and build commands in
+  [`SMOKE_TEST.md`](./SMOKE_TEST.md) pass.
+- [ ] The trusted local-MVP start command in
+  [`OPERATIONS.md`](./OPERATIONS.md) reports healthy `web`, `worker`,
+  `postgres`, and `valkey` services; PostgreSQL and Valkey have no public host
+  ports.
 - [ ] An authenticated `GET /api/operator/health` returns `200`,
   `private, no-store`, bounded aggregate metrics, and no identifiers, symbols,
   source text, ciphertext, or secrets. An unauthenticated request returns `401`.
