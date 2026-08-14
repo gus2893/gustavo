@@ -505,6 +505,11 @@ create trigger hybrid_worker_heartbeats_truncate_is_immutable
 before truncate on hybrid_worker_heartbeats
 for each statement execute function reject_deployment_authority_truncate();
 
+create function market_poll_reservation_now() returns timestamptz
+language sql volatile as $$
+  select clock_timestamp();
+$$;
+
 create table market_poll_windows (
   window_id text primary key check (
     window_id ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$'
@@ -545,12 +550,20 @@ create table market_poll_windows (
       (provider_status='CLOSED' and calls_used=1 and safe_code='MARKET_CLOSED')
       or (provider_status='OPEN' and calls_used=96 and safe_code is null)
     ))
-    or (status='FAILED' and safe_code is not null and completed_at is not null)
+    or (status='FAILED' and provider_status='ERROR'
+      and safe_code is not null and safe_code in (
+        'PROVIDER_ERROR','RATE_LIMITED','RESULT_COUNT_INVALID',
+        'CALL_LIMIT_EXCEEDED','WINDOW_CONFLICT'
+      )
+      and completed_at is not null)
   ),
   check (
     completed_at is null
-    or (completed_at>=window_started_at
-      and completed_at<window_started_at+interval '5 minutes')
+    or (completed_at>=window_started_at and (
+      (status='COMPLETED'
+        and completed_at<window_started_at+interval '5 minutes')
+      or (status='FAILED' and completed_at<prune_after)
+    ))
   ),
   check (updated_at>=created_at)
 );
@@ -595,6 +608,9 @@ begin
   end if;
 
   transitioned_at:=clock_timestamp();
+  if new.status='FAILED' and transitioned_at>=old.prune_after then
+    return null;
+  end if;
   new.updated_at:=transitioned_at;
   if new.status='PENDING' then
     new.completed_at:=null;
@@ -608,7 +624,13 @@ begin
         or (new.provider_status='OPEN' and new.calls_used=96
           and new.safe_code is null)
       )
-    )) or (new.status='FAILED' and new.safe_code is null)
+    )) or (new.status='FAILED' and not (
+      new.provider_status='ERROR' and new.safe_code is not null
+      and new.safe_code in (
+        'PROVIDER_ERROR','RATE_LIMITED','RESULT_COUNT_INVALID',
+        'CALL_LIMIT_EXCEEDED','WINDOW_CONFLICT'
+      )
+    ))
   then
     raise exception 'MARKET_POLL_WINDOW_TRANSITION_INVALID';
   end if;

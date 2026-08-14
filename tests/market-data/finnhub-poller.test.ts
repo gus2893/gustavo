@@ -14,7 +14,17 @@ import {
   materializeMarketObservation,
   storeLatestMarketWindow,
 } from "../../lib/server/market-data/latest";
-import { createMarketWindowPlan } from "../../lib/server/market-data/session";
+import {
+  createMarketWindowPlan,
+  marketWindowId,
+  type PersistableMarketPollWindow,
+} from "../../lib/server/market-data/session";
+import {
+  persistMarketPollWindow,
+  reserveMarketPollWindow,
+  runMarketPollWindow,
+  writeMarketHeartbeat,
+} from "../../worker/hybrid/market-poller";
 import { createConversationFixture } from "../helpers/postgres";
 
 const EXPECTED_STOCKS = "AAPL, MSFT, NVDA, AMZN, GOOGL, GOOG, META, TSLA, BRK.B, AVGO, JPM, LLY, V, XOM, MA, UNH, COST, WMT, NFLX, ORCL, HD, PG, JNJ, BAC, ABBV, KO, CRM, CVX, MRK, AMD, PLTR, CSCO, ACN, MCD, IBM, GE, CAT, GS, MS, AXP, BX, TMO, ISRG, LIN, ABT, DIS, NOW, QCOM, TXN, AMGN, DHR, PEP, PM, INTU, BKNG, RTX, AMAT, SPGI, NEE, LOW, UPS, HON, PFE, C, MU, SBUX, COP, SCHW, GILD, ADP, DE, BLK, PANW, LRCX, KLAC".split(", ");
@@ -36,6 +46,30 @@ const AAPL_SUCCESS = Object.freeze({
   sourceObservedAt: "2026-08-13T13:30:00.000Z",
   safeCode: null,
 });
+
+async function databaseMarketWindowIds(database: EventDatabase): Promise<{
+  readonly current: string;
+  readonly past: string;
+  readonly future: string;
+}> {
+  return database.one(
+    `with database_clock as (
+       select clock_timestamp() database_now
+     ), current_window as (
+       select date_bin(
+         interval '5 minutes',database_now,timestamptz '1970-01-01 00:00:00+00'
+       ) window_started_at
+       from database_clock
+     )
+     select
+       to_char(window_started_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI"Z"') current,
+       to_char((window_started_at-interval '5 minutes') at time zone 'UTC',
+               'YYYY-MM-DD"T"HH24:MI"Z"') past,
+       to_char((window_started_at+interval '5 minutes') at time zone 'UTC',
+               'YYYY-MM-DD"T"HH24:MI"Z"') future
+     from current_window`,
+  );
+}
 
 function observedDatabase(
   database: EventDatabase,
@@ -2040,4 +2074,932 @@ describe("Finnhub adapter", () => {
     expect(Reflect.set(result.items[0]!, "symbol", "BTCUSD")).toBe(false);
     expect(fetchQuote).toHaveBeenCalledTimes(95);
   });
+});
+
+describe("local market poller", () => {
+  it("opens Neon only after all provider calls and persists one complete bounded window", async () => {
+    const order: string[] = [];
+    let databaseOpen = false;
+    let databaseCycles = 0;
+    let persisted: PersistableMarketPollWindow | undefined;
+    const poll = vi.fn(async (windowId: string) => {
+      expect(databaseOpen).toBe(false);
+      order.push("provider:start", "provider:finish");
+      return {
+        windowId,
+        callsUsed: 96,
+        items: MARKET_UNIVERSE.map(({ symbol, kind }) => ({
+          symbol,
+          kind,
+          status: "PROVIDER_ERROR" as const,
+          price: null,
+          sourceObservedAt: null,
+          safeCode: "PROVIDER_ERROR" as const,
+        })),
+      };
+    });
+    const withDatabase = async <Result>(
+      work: (database: { readonly marker: "db" }) => Promise<Result>,
+    ): Promise<Result> => {
+      databaseCycles += 1;
+      expect(databaseOpen).toBe(false);
+      databaseOpen = true;
+      order.push("db:open");
+      try {
+        return await work({ marker: "db" });
+      } finally {
+        databaseOpen = false;
+        order.push("db:close");
+      }
+    };
+    const reserve = vi.fn(async () => {
+      order.push("db:reserve");
+      return {
+        disposition: "POLL" as const,
+        windowId: "2026-08-13T13:30Z",
+      };
+    });
+    const store = vi.fn(async (
+      _database: { readonly marker: "db" },
+      window: PersistableMarketPollWindow,
+    ) => {
+      persisted = window;
+      order.push("db:store");
+    });
+    const heartbeat = vi.fn(async () => { order.push("db:heartbeat"); });
+
+    await runMarketPollWindow({ poll, withDatabase, reserve, store, heartbeat });
+
+    expect(order).toEqual([
+      "db:open", "db:reserve", "db:close",
+      "provider:start", "provider:finish",
+      "db:open", "db:store", "db:heartbeat", "db:close",
+    ]);
+    expect(databaseCycles).toBe(2);
+    expect(store).toHaveBeenCalledWith(
+      { marker: "db" },
+      expect.objectContaining({
+        callsUsed: 96,
+        windowId: "2026-08-13T13:30Z",
+      }),
+    );
+    expect(persisted).toBeDefined();
+    expect(persisted!.items).toHaveLength(95);
+  });
+
+  it("recovers an incomplete reservation without polling the same window twice", async () => {
+    const poll = vi.fn();
+    let persisted: PersistableMarketPollWindow | undefined;
+    const store = vi.fn(async (
+      _database: { readonly marker: "db" },
+      window: PersistableMarketPollWindow,
+    ) => { persisted = window; });
+    const heartbeat = vi.fn(async () => undefined);
+    const withDatabase = async <Result>(
+      work: (database: { readonly marker: "db" }) => Promise<Result>,
+    ): Promise<Result> => work({ marker: "db" });
+
+    await runMarketPollWindow({
+      withDatabase,
+      reserve: vi.fn(async () => ({
+        disposition: "RECOVER" as const,
+        windowId: "2026-08-13T13:30Z",
+        callsUsed: 12,
+      })),
+      poll,
+      store,
+      heartbeat,
+    });
+
+    expect(poll).not.toHaveBeenCalled();
+    expect(store).toHaveBeenCalledWith(
+      { marker: "db" },
+      expect.objectContaining({
+        callsUsed: 12,
+        mutateLatest: false,
+        resultCount: 0,
+        safeCode: "PROVIDER_ERROR",
+        status: "FAILED",
+      }),
+    );
+    expect(persisted).toBeDefined();
+    expect(persisted!.items).toHaveLength(95);
+    expect(persisted!.items.map(({ symbol }) => symbol)).toEqual(
+      MARKET_UNIVERSE.map(({ symbol }) => symbol),
+    );
+    expect(heartbeat).toHaveBeenCalledWith(
+      { marker: "db" },
+      { status: "DEGRADED", safeCode: "PROVIDER_UNAVAILABLE" },
+    );
+  });
+
+  it("fills missing catalog results but fails the summary without mutating latest rows", async () => {
+    let persisted: PersistableMarketPollWindow | undefined;
+    const store = vi.fn(async (
+      _database: { readonly marker: "db" },
+      window: PersistableMarketPollWindow,
+    ) => { persisted = window; });
+    const heartbeat = vi.fn(async () => undefined);
+    const pollItems = MARKET_UNIVERSE.slice(0, 94).map(({ symbol, kind }) => ({
+      symbol,
+      kind,
+      status: "PROVIDER_ERROR" as const,
+      price: null,
+      sourceObservedAt: null,
+      safeCode: "PROVIDER_ERROR" as const,
+    }));
+
+    await runMarketPollWindow({
+      withDatabase: async (work) => work({ marker: "db" }),
+      reserve: async () => ({
+        disposition: "POLL" as const,
+        windowId: "2026-08-13T13:30Z",
+      }),
+      poll: async (windowId) => ({ windowId, callsUsed: 96, items: pollItems }),
+      store,
+      heartbeat,
+    });
+
+    expect(persisted).toMatchObject({
+      callsUsed: 96,
+      mutateLatest: false,
+      resultCount: 94,
+      safeCode: "RESULT_COUNT_INVALID",
+      status: "FAILED",
+    });
+    expect(persisted).toBeDefined();
+    expect(persisted!.items).toHaveLength(95);
+    expect(persisted!.items[94]).toEqual({
+      ...MARKET_UNIVERSE[94],
+      status: "PROVIDER_ERROR",
+      price: null,
+      sourceObservedAt: null,
+      safeCode: "PROVIDER_ERROR",
+    });
+    expect(heartbeat).toHaveBeenCalledWith(
+      { marker: "db" },
+      { status: "DEGRADED", safeCode: "PROVIDER_UNAVAILABLE" },
+    );
+  });
+
+  it("contains a call-limit breach as a failed body-free window", async () => {
+    const store = vi.fn(async () => undefined);
+    const items = MARKET_UNIVERSE.map(({ symbol, kind }) => ({
+      symbol,
+      kind,
+      status: "PROVIDER_ERROR" as const,
+      price: null,
+      sourceObservedAt: null,
+      safeCode: "PROVIDER_ERROR" as const,
+    }));
+
+    await runMarketPollWindow({
+      withDatabase: async (work) => work({ marker: "db" }),
+      reserve: async () => ({
+        disposition: "POLL" as const,
+        windowId: "2026-08-13T13:30Z",
+      }),
+      poll: async (windowId) => ({ windowId, callsUsed: 97, items }),
+      store,
+      heartbeat: async () => undefined,
+    });
+
+    expect(store).toHaveBeenCalledWith(
+      { marker: "db" },
+      expect.objectContaining({
+        callsUsed: 96,
+        mutateLatest: false,
+        safeCode: "CALL_LIMIT_EXCEEDED",
+        status: "FAILED",
+      }),
+    );
+  });
+
+  it("rejects invalid status and safe-code pairs before latest-row mutation", async () => {
+    const store = vi.fn(async (
+      _database: { readonly marker: "db" },
+      _window: PersistableMarketPollWindow,
+    ) => undefined);
+    const invalidItems = MARKET_UNIVERSE.map(({ symbol, kind }) => ({
+      symbol,
+      kind,
+      status: "UNAVAILABLE" as const,
+      price: null,
+      sourceObservedAt: null,
+      safeCode: "PROVIDER_ERROR" as const,
+    }));
+
+    await runMarketPollWindow({
+      withDatabase: async (work) => work({ marker: "db" }),
+      reserve: async () => ({
+        disposition: "POLL" as const,
+        windowId: "2026-08-13T13:30Z",
+      }),
+      poll: async (windowId) => ({ windowId, callsUsed: 96, items: invalidItems }),
+      store,
+      heartbeat: async () => undefined,
+    });
+
+    expect(store).toHaveBeenCalledWith(
+      { marker: "db" },
+      expect.objectContaining({
+        mutateLatest: false,
+        safeCode: "RESULT_COUNT_INVALID",
+        status: "FAILED",
+      }),
+    );
+  });
+
+  it("defers rate-limit recovery to the next five-minute window", async () => {
+    const poll = vi.fn(async (windowId: string) => ({
+      windowId,
+      callsUsed: 1,
+      items: MARKET_UNIVERSE.map(({ symbol, kind }) => ({
+        symbol,
+        kind,
+        status: "RATE_LIMITED" as const,
+        price: null,
+        sourceObservedAt: null,
+        safeCode: "RATE_LIMITED" as const,
+      })),
+    }));
+    const store = vi.fn(async () => undefined);
+
+    await runMarketPollWindow({
+      withDatabase: async (work) => work({ marker: "db" }),
+      reserve: async () => ({
+        disposition: "POLL" as const,
+        windowId: "2026-08-13T13:30Z",
+      }),
+      poll,
+      store,
+      heartbeat: async () => undefined,
+    });
+
+    expect(poll).toHaveBeenCalledOnce();
+    expect(store).toHaveBeenCalledWith(
+      { marker: "db" },
+      expect.objectContaining({
+        mutateLatest: false,
+        nextWindowPending: true,
+        safeCode: "RATE_LIMITED",
+        status: "FAILED",
+      }),
+    );
+  });
+
+  it("contains provider exceptions without exposing raw errors or retaining a database handle", async () => {
+    const order: string[] = [];
+    const store = vi.fn(async () => undefined);
+    const withDatabase = async <Result>(
+      work: (database: { readonly marker: "db" }) => Promise<Result>,
+    ): Promise<Result> => {
+      order.push("open");
+      try {
+        return await work({ marker: "db" });
+      } finally {
+        order.push("close");
+      }
+    };
+
+    await expect(runMarketPollWindow({
+      withDatabase,
+      reserve: async () => ({
+        disposition: "POLL" as const,
+        windowId: "2026-08-13T13:30Z",
+      }),
+      poll: async () => {
+        throw new Error("FINNHUB_API_KEY=private-provider-secret raw response");
+      },
+      store,
+      heartbeat: async () => undefined,
+    })).resolves.toMatchObject({ status: "FAILED", safeCode: "PROVIDER_ERROR" });
+
+    expect(order).toEqual(["open", "close", "open", "close"]);
+    expect(JSON.stringify(store.mock.calls)).not.toMatch(/private-provider-secret|FINNHUB_API_KEY/iu);
+  });
+
+  it("skips terminal replays and fails closed before provider work when quota is unavailable", async () => {
+    const poll = vi.fn();
+    const store = vi.fn();
+    const heartbeat = vi.fn(async () => undefined);
+    const withDatabase = async <Result>(
+      work: (database: { readonly marker: "db" }) => Promise<Result>,
+    ): Promise<Result> => work({ marker: "db" });
+
+    await expect(runMarketPollWindow({
+      withDatabase,
+      reserve: async () => ({
+        disposition: "SKIP" as const,
+        windowId: "2026-08-13T13:30Z",
+      }),
+      poll,
+      store,
+      heartbeat,
+    })).resolves.toEqual({ disposition: "SKIPPED", windowId: "2026-08-13T13:30Z" });
+    await expect(runMarketPollWindow({
+      withDatabase,
+      reserve: async () => ({
+        disposition: "REJECT" as const,
+        windowId: "2026-08-13T13:35Z",
+        safeCode: "QUOTA_EXHAUSTED" as const,
+      }),
+      poll,
+      store,
+      heartbeat,
+    })).resolves.toEqual({
+      disposition: "REJECTED",
+      safeCode: "QUOTA_EXHAUSTED",
+      windowId: "2026-08-13T13:35Z",
+    });
+
+    expect(poll).not.toHaveBeenCalled();
+    expect(store).not.toHaveBeenCalled();
+    expect(heartbeat).toHaveBeenCalledOnce();
+    expect(heartbeat).toHaveBeenCalledWith(
+      { marker: "db" },
+      { status: "DEGRADED", safeCode: "QUOTA_EXHAUSTED" },
+    );
+  });
+
+  it("accepts only the exact database-clock window without charging adjacent buckets", async () => {
+    const fixture = await createConversationFixture("market-poller-database-bucket");
+    const initialIds = await databaseMarketWindowIds(fixture.db);
+    const poll = vi.fn(async (windowId: string) => ({
+      windowId,
+      callsUsed: 96,
+      items: MARKET_UNIVERSE.map(({ symbol, kind }) => ({
+        symbol,
+        kind,
+        status: "PROVIDER_ERROR" as const,
+        price: null,
+        sourceObservedAt: null,
+        safeCode: "PROVIDER_ERROR" as const,
+      })),
+    }));
+    const store = vi.fn((database: EventDatabase, window: PersistableMarketPollWindow) => (
+      persistMarketPollWindow(database, fixture.accountId, window)
+    ));
+    const run = (windowId: string) => runMarketPollWindow({
+      withDatabase: <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+        fixture.db.transaction(work)
+      ),
+      reserve: (database: EventDatabase) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store,
+      heartbeat: writeMarketHeartbeat,
+    });
+
+    await expect(run(initialIds.past)).resolves.toEqual({
+      disposition: "SKIPPED",
+      windowId: initialIds.past,
+    });
+    await expect(run(initialIds.future)).resolves.toEqual({
+      disposition: "SKIPPED",
+      windowId: initialIds.future,
+    });
+    expect(poll).not.toHaveBeenCalled();
+    expect(store).not.toHaveBeenCalled();
+    expect(await fixture.db.query(
+      "select bucket_date,used_count from deployment_quota_counters where quota_name='FINNHUB_CALLS'",
+    )).toEqual([]);
+    expect(await fixture.db.query(
+      "select symbol from market_latest_quotes where account_id=$1",
+      [fixture.accountId],
+    )).toEqual([]);
+
+    const currentId = (await databaseMarketWindowIds(fixture.db)).current;
+    await expect(run(currentId)).resolves.toMatchObject({
+      status: "COMPLETED",
+      windowId: currentId,
+    });
+    expect(poll).toHaveBeenCalledOnce();
+    expect(store).toHaveBeenCalledOnce();
+    expect(await fixture.db.one<{ readonly used_count: number }>(
+      "select used_count from deployment_quota_counters where quota_name='FINNHUB_CALLS'",
+    )).toEqual({ used_count: 96 });
+    expect(await fixture.db.query(
+      "select symbol from market_latest_quotes where account_id=$1",
+      [fixture.accountId],
+    )).toHaveLength(95);
+  }, 30_000);
+
+  it("rolls back an old bucket when database time advances across a blocked quota reservation", async () => {
+    const fixture = await createConversationFixture("market-poller-quota-boundary");
+    const windowId = (await databaseMarketWindowIds(fixture.db)).current;
+    const windowStartedAt = new Date(`${windowId.slice(0, -1)}:00.000Z`);
+    const bucketDate = windowId.slice(0, 10);
+    await fixture.db.query("create sequence market_poll_test_clock_sequence");
+    await fixture.db.query(
+      `create table market_poll_test_clock_values (
+         ordinal integer primary key,
+         observed_at timestamptz not null
+       )`,
+    );
+    await fixture.db.query(
+      `insert into market_poll_test_clock_values (ordinal,observed_at)
+       values (1,$1),(2,$2)`,
+      [
+        new Date(windowStartedAt.getTime() + 60_000),
+        new Date(windowStartedAt.getTime() + 6 * 60_000),
+      ],
+    );
+    await fixture.db.query(
+      `create or replace function market_poll_reservation_now() returns timestamptz
+       language sql volatile as $$
+         select observed_at
+           from market_poll_test_clock_values
+          where ordinal=least(nextval('market_poll_test_clock_sequence')::integer,2)
+       $$`,
+    );
+
+    let quotaLocked!: () => void;
+    let releaseQuota!: () => void;
+    const lockHeld = new Promise<void>((resolve) => { quotaLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseQuota = resolve; });
+    const blocker = fixture.db.transaction(async (database) => {
+      await database.query(
+        `insert into deployment_quota_counters (
+           quota_name,bucket_date,used_count,limit_count
+         ) values ('FINNHUB_CALLS',$1,0,27648)`,
+        [bucketDate],
+      );
+      quotaLocked();
+      await release;
+    });
+    await lockHeld;
+
+    let quotaAttempted!: () => void;
+    const atQuota = new Promise<void>((resolve) => { quotaAttempted = resolve; });
+    const poll = vi.fn(async () => ({
+      windowId,
+      callsUsed: 96,
+      items: MARKET_UNIVERSE.slice(0, 94).map(({ symbol, kind }) => ({
+        symbol,
+        kind,
+        status: "PROVIDER_ERROR" as const,
+        price: null,
+        sourceObservedAt: null,
+        safeCode: "PROVIDER_ERROR" as const,
+      })),
+    }));
+    const store = vi.fn((database: EventDatabase, window: PersistableMarketPollWindow) => (
+      persistMarketPollWindow(database, fixture.accountId, window)
+    ));
+    const heartbeat = vi.fn(writeMarketHeartbeat);
+    const run = runMarketPollWindow({
+      withDatabase: <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+        fixture.db.transaction((database) => work({
+          query: async <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            parameters: readonly unknown[] = [],
+          ): Promise<Row[]> => {
+            if (sql.includes("insert into deployment_quota_counters")) quotaAttempted();
+            return database.query<Row>(sql, parameters);
+          },
+          one: <Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            parameters: readonly unknown[] = [],
+          ) => database.one<Row>(sql, parameters),
+          transaction: database.transaction,
+        }))
+      ),
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store,
+      heartbeat,
+    });
+    await atQuota;
+    releaseQuota();
+    await blocker;
+
+    await expect(run).resolves.toEqual({ disposition: "SKIPPED", windowId });
+    expect(poll).not.toHaveBeenCalled();
+    expect(store).not.toHaveBeenCalled();
+    expect(heartbeat).not.toHaveBeenCalled();
+    expect(await fixture.db.one<{ readonly used_count: number }>(
+      `select used_count from deployment_quota_counters
+        where quota_name='FINNHUB_CALLS' and bucket_date=$1`,
+      [bucketDate],
+    )).toEqual({ used_count: 0 });
+    expect(await fixture.db.query(
+      "select window_id from market_poll_windows where window_id=$1",
+      [windowId],
+    )).toEqual([]);
+    expect(await fixture.db.query(
+      "select symbol from market_latest_quotes where account_id=$1",
+      [fixture.accountId],
+    )).toEqual([]);
+  }, 30_000);
+
+  it("enforces the canonical failed-window matrix in direct SQL", async () => {
+    const fixture = await createConversationFixture("market-poller-failed-matrix");
+    const currentId = (await databaseMarketWindowIds(fixture.db)).current;
+    const currentStart = new Date(`${currentId.slice(0, -1)}:00.000Z`);
+    let offset = 1;
+    const insertPending = async (): Promise<string> => {
+      const windowStartedAt = new Date(currentStart.getTime() - offset++ * 5 * 60_000);
+      const windowId = marketWindowId(windowStartedAt);
+      await fixture.db.query(
+        `insert into market_poll_windows (window_id,window_started_at)
+         values ($1,$2)`,
+        [windowId, windowStartedAt],
+      );
+      return windowId;
+    };
+    const terminalize = (
+      windowId: string,
+      providerStatus: string,
+      callsUsed: number,
+      resultCount: number,
+      safeCode: string,
+    ) => fixture.db.query(
+      `update market_poll_windows
+          set status='FAILED',provider_status=$2,calls_used=$3,
+              result_count=$4,safe_code=$5
+        where window_id=$1`,
+      [windowId, providerStatus, callsUsed, resultCount, safeCode],
+    );
+
+    for (const [providerStatus, callsUsed, resultCount, safeCode] of [
+      ["CLOSED", 1, 95, "MARKET_CLOSED"],
+      ["OPEN", 12, 95, "PROVIDER_ERROR"],
+      ["ERROR", 12, 95, "MARKET_CLOSED"],
+    ] as const) {
+      const windowId = await insertPending();
+      await expect(terminalize(
+        windowId, providerStatus, callsUsed, resultCount, safeCode,
+      ))
+        .rejects.toThrow(/MARKET_POLL_WINDOW_TRANSITION_INVALID/u);
+    }
+
+    for (const [providerStatus, callsUsed, resultCount, safeCode] of [
+      ["ERROR", 0, 0, "PROVIDER_ERROR"],
+      ["ERROR", 12, 95, "PROVIDER_ERROR"],
+      ["ERROR", 1, 95, "RATE_LIMITED"],
+      ["ERROR", 96, 95, "CALL_LIMIT_EXCEEDED"],
+      ["ERROR", 96, 94, "RESULT_COUNT_INVALID"],
+      ["ERROR", 0, 95, "WINDOW_CONFLICT"],
+    ] as const) {
+      const windowId = await insertPending();
+      await expect(terminalize(
+        windowId, providerStatus, callsUsed, resultCount, safeCode,
+      )).resolves.toHaveLength(0);
+    }
+  }, 30_000);
+
+  it("reserves one durable quota window and commits all results with its heartbeat atomically", async () => {
+    const fixture = await createConversationFixture("market-poller-durable-window");
+    const windowId = (await databaseMarketWindowIds(fixture.db)).current;
+    const poll = vi.fn(async () => ({
+      windowId,
+      callsUsed: 96,
+      items: MARKET_UNIVERSE.map(({ symbol, kind }) => ({
+        symbol,
+        kind,
+        status: "PROVIDER_ERROR" as const,
+        price: null,
+        sourceObservedAt: null,
+        safeCode: "PROVIDER_ERROR" as const,
+      })),
+    }));
+    const options = {
+      withDatabase: <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+        fixture.db.transaction(work)
+      ),
+      reserve: (database: EventDatabase) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store: (database: EventDatabase, window: PersistableMarketPollWindow) => (
+        persistMarketPollWindow(database, fixture.accountId, window)
+      ),
+      heartbeat: writeMarketHeartbeat,
+    };
+
+    await expect(runMarketPollWindow(options)).resolves.toMatchObject({
+      status: "COMPLETED",
+      callsUsed: 96,
+      resultCount: 95,
+    });
+    await expect(runMarketPollWindow(options)).resolves.toEqual({
+      disposition: "SKIPPED",
+      windowId,
+    });
+
+    const summary = await fixture.db.one<{
+      readonly status: string;
+      readonly calls_used: number;
+      readonly result_count: number;
+    }>("select status,calls_used,result_count from market_poll_windows where window_id=$1", [windowId]);
+    const quota = await fixture.db.one<{ readonly used_count: number }>(
+      `select used_count from deployment_quota_counters
+        where quota_name='FINNHUB_CALLS' and bucket_date=$1`,
+      [windowId.slice(0, 10)],
+    );
+    const latest = await fixture.db.query(
+      "select symbol from market_latest_quotes where account_id=$1",
+      [fixture.accountId],
+    );
+    const heartbeat = await fixture.db.one<{ readonly status: string; readonly safe_code: string | null }>(
+      "select status,safe_code from hybrid_worker_heartbeats where component='MARKET'",
+    );
+
+    expect(poll).toHaveBeenCalledOnce();
+    expect(summary).toEqual({ status: "COMPLETED", calls_used: 96, result_count: 95 });
+    expect(quota.used_count).toBe(96);
+    expect(latest).toHaveLength(95);
+    expect(heartbeat).toEqual({ status: "HEALTHY", safe_code: null });
+  }, 30_000);
+
+  it("keeps a duplicate wake for the active database window from terminalizing provider work", async () => {
+    const fixture = await createConversationFixture("market-poller-concurrent-wake");
+    const windowId = (await databaseMarketWindowIds(fixture.db)).current;
+    let providerStarted!: () => void;
+    let releaseProvider!: () => void;
+    const started = new Promise<void>((resolve) => { providerStarted = resolve; });
+    const released = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    const firstPoll = vi.fn(async () => {
+      providerStarted();
+      await released;
+      return {
+        windowId,
+        callsUsed: 96,
+        items: MARKET_UNIVERSE.map(({ symbol, kind }) => ({
+          symbol,
+          kind,
+          status: "PROVIDER_ERROR" as const,
+          price: null,
+          sourceObservedAt: null,
+          safeCode: "PROVIDER_ERROR" as const,
+        })),
+      };
+    });
+    const firstStore = vi.fn((database: EventDatabase, window: PersistableMarketPollWindow) => (
+      persistMarketPollWindow(database, fixture.accountId, window)
+    ));
+    const secondPoll = vi.fn();
+    const secondStore = vi.fn((database: EventDatabase, window: PersistableMarketPollWindow) => (
+      persistMarketPollWindow(database, fixture.accountId, window)
+    ));
+    const secondHeartbeat = vi.fn(writeMarketHeartbeat);
+    const withDatabase = <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+      fixture.db.transaction(work)
+    );
+    const first = runMarketPollWindow({
+      withDatabase,
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll: firstPoll,
+      store: firstStore,
+      heartbeat: writeMarketHeartbeat,
+    });
+    await started;
+
+    const second = await runMarketPollWindow({
+      withDatabase,
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll: secondPoll,
+      store: secondStore,
+      heartbeat: secondHeartbeat,
+    });
+    releaseProvider();
+    const firstResult = await Promise.allSettled([first]);
+
+    expect(second).toEqual({ disposition: "SKIPPED", windowId });
+    expect(secondPoll).not.toHaveBeenCalled();
+    expect(secondStore).not.toHaveBeenCalled();
+    expect(secondHeartbeat).not.toHaveBeenCalled();
+    expect(firstResult[0]).toMatchObject({
+      status: "fulfilled",
+      value: { status: "COMPLETED", windowId },
+    });
+    expect(firstPoll).toHaveBeenCalledOnce();
+    expect(firstStore).toHaveBeenCalledOnce();
+    expect(await fixture.db.one<{ readonly used_count: number }>(
+      "select used_count from deployment_quota_counters where quota_name='FINNHUB_CALLS'",
+    )).toEqual({ used_count: 96 });
+    expect(await fixture.db.query(
+      "select symbol from market_latest_quotes where account_id=$1",
+      [fixture.accountId],
+    )).toHaveLength(95);
+  }, 30_000);
+
+  it("skips a current pending reservation as active without recovering it", async () => {
+    const fixture = await createConversationFixture("market-poller-recovery");
+    const windowId = (await databaseMarketWindowIds(fixture.db)).current;
+    await fixture.db.transaction((database) => reserveMarketPollWindow(database, windowId));
+    const poll = vi.fn();
+    const store = vi.fn((database: EventDatabase, window: PersistableMarketPollWindow) => (
+      persistMarketPollWindow(database, fixture.accountId, window)
+    ));
+    const heartbeat = vi.fn(writeMarketHeartbeat);
+
+    await expect(runMarketPollWindow({
+      withDatabase: <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+        fixture.db.transaction(work)
+      ),
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store,
+      heartbeat,
+    })).resolves.toEqual({ disposition: "SKIPPED", windowId });
+
+    const summary = await fixture.db.one<{ readonly status: string; readonly safe_code: string | null }>(
+      "select status,safe_code from market_poll_windows where window_id=$1",
+      [windowId],
+    );
+    const latest = await fixture.db.query(
+      "select symbol from market_latest_quotes where account_id=$1",
+      [fixture.accountId],
+    );
+    expect(poll).not.toHaveBeenCalled();
+    expect(store).not.toHaveBeenCalled();
+    expect(heartbeat).not.toHaveBeenCalled();
+    expect(summary).toEqual({ status: "PENDING", safe_code: null });
+    expect(latest).toEqual([]);
+  }, 30_000);
+
+  it("finalizes a prior-window crash as failed during reconnect recovery", async () => {
+    const fixture = await createConversationFixture("market-poller-late-recovery");
+    const windowId = marketWindowId(new Date(Date.now() - 10 * 60_000));
+    const windowStartedAt = new Date(`${windowId.slice(0, -1)}:00.000Z`);
+    const bucketDate = windowStartedAt.toISOString().slice(0, 10);
+    await fixture.db.query(
+      `insert into market_poll_windows (window_id,window_started_at)
+       values ($1,$2)`,
+      [windowId, windowStartedAt],
+    );
+    await fixture.db.query(
+      `insert into deployment_quota_counters (
+         quota_name,bucket_date,used_count,limit_count
+       ) values ('FINNHUB_CALLS',$1,96,27648)`,
+      [bucketDate],
+    );
+    const poll = vi.fn();
+
+    await expect(runMarketPollWindow({
+      withDatabase: <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+        fixture.db.transaction(work)
+      ),
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store: (database, window) => persistMarketPollWindow(
+        database, fixture.accountId, window,
+      ),
+      heartbeat: writeMarketHeartbeat,
+    })).resolves.toMatchObject({
+      status: "FAILED",
+      safeCode: "PROVIDER_ERROR",
+      resultCount: 0,
+      mutateLatest: false,
+    });
+
+    expect(poll).not.toHaveBeenCalled();
+    expect(await fixture.db.one<{ readonly status: string; readonly safe_code: string }>(
+      "select status,safe_code from market_poll_windows where window_id=$1",
+      [windowId],
+    )).toEqual({ status: "FAILED", safe_code: "PROVIDER_ERROR" });
+    await expect(fixture.db.query(
+      `update market_poll_windows set calls_used=1 where window_id=$1`,
+      [windowId],
+    )).rejects.toThrow(/MARKET_POLL_WINDOW_TRANSITION_INVALID/u);
+    expect(await fixture.db.one<{ readonly used_count: number }>(
+      `select used_count from deployment_quota_counters
+        where quota_name='FINNHUB_CALLS' and bucket_date=$1`,
+      [bucketDate],
+    )).toEqual({ used_count: 96 });
+  }, 30_000);
+
+  it("cleans an expired pending window without repolling or reserving quota again", async () => {
+    const fixture = await createConversationFixture("market-poller-prune-boundary");
+    const windowId = marketWindowId(new Date(Date.now() - 8 * 24 * 60 * 60_000));
+    const windowStartedAt = new Date(`${windowId.slice(0, -1)}:00.000Z`);
+    const createdAt = new Date(Date.now() - 8 * 24 * 60 * 60_000);
+    const pruneAfter = new Date(createdAt.getTime() + 7 * 24 * 60 * 60_000);
+    const bucketDate = windowStartedAt.toISOString().slice(0, 10);
+    await fixture.db.query(
+      `insert into market_poll_windows (
+         window_id,window_started_at,created_at,updated_at,prune_after
+       ) values ($1,$2,$3,$3,$4)`,
+      [windowId, windowStartedAt, createdAt, pruneAfter],
+    );
+    await fixture.db.query(
+      `insert into deployment_quota_counters (
+         quota_name,bucket_date,used_count,limit_count
+       ) values ('FINNHUB_CALLS',$1,96,27648)`,
+      [bucketDate],
+    );
+    await expect(fixture.db.query(
+      `update market_poll_windows
+          set status='COMPLETED',provider_status='OPEN',calls_used=96,
+              result_count=95,completed_at=clock_timestamp(),updated_at=clock_timestamp()
+        where window_id=$1`,
+      [windowId],
+    )).rejects.toThrow(/market_poll_windows_check3/u);
+    const poll = vi.fn();
+    const store = vi.fn();
+
+    await expect(runMarketPollWindow({
+      withDatabase: <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+        fixture.db.transaction(work)
+      ),
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store,
+      heartbeat: writeMarketHeartbeat,
+    })).resolves.toEqual({ disposition: "SKIPPED", windowId });
+
+    expect(poll).not.toHaveBeenCalled();
+    expect(store).not.toHaveBeenCalled();
+    expect(await fixture.db.query(
+      "select window_id from market_poll_windows where window_id=$1",
+      [windowId],
+    )).toEqual([]);
+    expect(await fixture.db.one<{ readonly used_count: number }>(
+      `select used_count from deployment_quota_counters
+        where quota_name='FINNHUB_CALLS' and bucket_date=$1`,
+      [bucketDate],
+    )).toEqual({ used_count: 96 });
+  }, 30_000);
+
+  it("switches from retained recovery to cleanup when prune expires between transactions", async () => {
+    const fixture = await createConversationFixture("market-poller-prune-race");
+    const windowId = marketWindowId(new Date(Date.now() - 7 * 24 * 60 * 60_000));
+    const windowStartedAt = new Date(`${windowId.slice(0, -1)}:00.000Z`);
+    const pruneAfter = new Date(Date.now() + 2_000);
+    const createdAt = new Date(pruneAfter.getTime() - 7 * 24 * 60 * 60_000);
+    await fixture.db.query(
+      `insert into market_poll_windows (
+         window_id,window_started_at,created_at,updated_at,prune_after
+       ) values ($1,$2,$3,$3,$4)`,
+      [windowId, windowStartedAt, createdAt, pruneAfter],
+    );
+    const poll = vi.fn();
+    let databaseCycle = 0;
+
+    await expect(runMarketPollWindow({
+      withDatabase: async <Result>(
+        work: (database: EventDatabase) => Promise<Result>,
+      ): Promise<Result> => {
+        databaseCycle += 1;
+        if (databaseCycle === 2) {
+          const remaining = pruneAfter.getTime() - Date.now();
+          if (remaining >= 0) {
+            await new Promise((resolve) => setTimeout(resolve, remaining + 25));
+          }
+        }
+        return fixture.db.transaction(work);
+      },
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store: (database, window) => persistMarketPollWindow(
+        database, fixture.accountId, window,
+      ),
+      heartbeat: writeMarketHeartbeat,
+    })).resolves.toEqual({ disposition: "SKIPPED", windowId });
+
+    expect(poll).not.toHaveBeenCalled();
+    expect(await fixture.db.query(
+      "select window_id from market_poll_windows where window_id=$1",
+      [windowId],
+    )).toEqual([]);
+  }, 30_000);
+
+  it("reserves no window and starts no provider call after the daily hard ceiling", async () => {
+    const fixture = await createConversationFixture("market-poller-quota-ceiling");
+    const windowId = (await databaseMarketWindowIds(fixture.db)).current;
+    const bucketDate = windowId.slice(0, 10);
+    await fixture.db.query(
+      `insert into deployment_quota_counters (
+         quota_name,bucket_date,used_count,limit_count
+       ) values ('FINNHUB_CALLS',$1,27600,27648)`,
+      [bucketDate],
+    );
+    const poll = vi.fn();
+
+    await expect(runMarketPollWindow({
+      withDatabase: <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+        fixture.db.transaction(work)
+      ),
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store: (database, window) => persistMarketPollWindow(
+        database, fixture.accountId, window,
+      ),
+      heartbeat: writeMarketHeartbeat,
+    })).resolves.toEqual({
+      disposition: "REJECTED",
+      safeCode: "QUOTA_EXHAUSTED",
+      windowId,
+    });
+
+    expect(poll).not.toHaveBeenCalled();
+    expect(await fixture.db.query(
+      "select window_id from market_poll_windows where window_id=$1",
+      [windowId],
+    )).toEqual([]);
+    expect(await fixture.db.one<{ readonly used_count: number }>(
+      `select used_count from deployment_quota_counters
+        where quota_name='FINNHUB_CALLS' and bucket_date=$1`,
+      [bucketDate],
+    )).toEqual({ used_count: 27600 });
+  }, 30_000);
 });
