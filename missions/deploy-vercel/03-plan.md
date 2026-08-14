@@ -423,44 +423,34 @@ import { describe, expect, it, vi } from "vitest";
 import { runIsolatedCodex } from "../../worker/hybrid/codex-runner";
 
 describe("container-isolated Codex runner", () => {
-  it("uses one fixed resource-bounded container and stdin-only prompt bytes", async () => {
-    const execute = vi.fn().mockResolvedValue({
-      exitCode: 0,
-      stdout: '{"response":"bounded response"}\n',
-      stderr: "",
-      containerExitProven: true,
-    });
+  it("uses Docker-owned singleton authority across runs and reconciliation", async () => {
+    const controller = createFakeDockerController();
     const image = `gustavo-codex@sha256:${"a".repeat(64)}`;
-    const result = await runIsolatedCodex({
-      role: "NODE",
-      prompt: "private prompt",
-      image,
-      authVolume: "gustavo-codex-auth-v1",
-      timeoutMs: 30_000,
-      execute,
-    });
 
-    const invocation = execute.mock.calls[0][0];
-    expect(invocation.command).toBe("docker");
-    expect(invocation.args).toEqual(expect.arrayContaining([
-      "run", "--rm", "--read-only", "--init", "--cap-drop=ALL",
-      "--security-opt", "no-new-privileges:true", "--pids-limit", "64",
-      "--memory", "512m", "--cpus", "1.0", "--network", "bridge",
-      "--tmpfs", "/workspace:rw,noexec,nosuid,nodev,size=16777216",
-      "--mount", "type=volume,src=gustavo-codex-auth-v1,dst=/codex-home",
-      "--env", "CODEX_HOME=/codex-home", image,
-      "/usr/bin/timeout", "--signal=KILL", "--kill-after=5s", "30s",
-      "codex", "exec", "--ephemeral", "--ignore-user-config",
-      "--skip-git-repo-check", "--sandbox", "read-only",
-      "--ask-for-approval", "never", "--model", "gpt-5.6-sol", "--json",
-      "--output-schema", "/schemas/node.schema.json", "-C", "/workspace", "-",
-    ]));
-    expect(invocation.stdin).toBe("private prompt");
-    expect(invocation.env).toEqual(expect.not.objectContaining({
+    await runIsolatedCodex({ role: "NODE", prompt: "private prompt", image, controller });
+
+    expect(controller.create).toHaveBeenCalledWith(expect.objectContaining({
+      name: "gustavo-codex-singleton-v1",
+      stdin: "private prompt",
+      args: expect.arrayContaining([
+        "--read-only", "--init", "--cap-drop=ALL",
+        "--security-opt", "no-new-privileges:true", "--pids-limit", "64",
+        "--memory", "512m", "--cpus", "1.0", "--network", "bridge",
+        "--tmpfs", "/workspace:rw,noexec,nosuid,nodev,size=16777216",
+        "--mount", "type=volume,src=gustavo-codex-auth-v1,dst=/codex-home",
+        "--config", "tools.view_image=false",
+      ]),
+    }));
+    expect(controller.start).toHaveBeenCalledWith(
+      expect.objectContaining({ containerId: "a".repeat(64) }),
+    );
+    expect(controller.start).not.toHaveBeenCalledWith(
+      expect.objectContaining({ containerId: "gustavo-codex-singleton-v1" }),
+    );
+    expect(controller.environment).not.toMatchObject({
       OPENAI_API_KEY: expect.anything(), DATABASE_URL: expect.anything(),
       VALKEY_URL: expect.anything(), FINNHUB_API_KEY: expect.anything(),
-    }));
-    expect(result).toEqual({ response: "bounded response" });
+    });
   });
 });
 ```
@@ -469,13 +459,17 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 
 #### Green — minimum implementation
 
-- Replace the stale direct-Windows-spawn draft with an injected Docker controller. Accept only image references with an immutable SHA-256 digest and the exact auth volume `gustavo-codex-auth-v1`; generate cryptorandom exact-name/label values internally.
-- Use the fixed `docker run` resource/security arguments in the test. Pass no repository path, Docker socket, host workspace, bind mount, application environment, arbitrary model, or user-controlled argv. User prompt bytes go only to stdin.
+- Replace the stale direct-Windows-spawn draft with an injected Docker controller. Accept only image references with an immutable SHA-256 digest and the exact auth volume `gustavo-codex-auth-v1`; every run claims the fixed daemon-owned name `gustavo-codex-singleton-v1` with exact frozen labels.
+- Use `docker create -i` with the fixed resource/security arguments, inspect the returned immutable container ID and fixed-name/label/image authority, register wait, then start/attach with prompt bytes only on stdin. Every later wait/inspect/kill/remove call uses that immutable ID, never a mutable name lookup.
 - Pin `node:24.19.0-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03` and `@openai/codex@0.146.0` in the nested Dockerfile. Bake exact additional-properties-false role schemas under `/schemas`; create no schema or workspace on Windows.
 - Bound stdin, stdout, stderr, JSON event count/line size, final response, container name, and wall time. Use both `/usr/bin/timeout --signal=KILL --kill-after=5s` inside the container and bounded host abort that starts `docker wait` before `docker kill` for the exact labeled name.
-- Treat container exit as proven only when the attached `docker run` and exact `docker wait` authority agree. If Docker is unavailable, the image digest differs, kill/wait cannot prove exit, output arrives after the bound, or cleanup cannot prove the exact container absent, return a safe error and expose a process-level lock that prevents further Codex launches until startup reconciliation succeeds.
+- Give run and reconciliation one synchronously claimed process mutex before any await. Treat container exit as proven only when attached start and exact-ID wait authority agree. Timed-out lifecycle promises keep ownership until they actually settle.
+- Before any run/reconcile Docker action, exclusively bind fixed local pipe `\\.\pipe\gustavo-codex-runner-v1`; keep the listener open through actual lifecycle settlement and close it only after the in-process owner releases. A second process that cannot bind returns safe busy/unavailable without inspecting, killing, or removing the incumbent container. Inject the lease boundary in unit tests; the production default uses the fixed Windows pipe.
+- If `docker create` is interrupted or its daemon result is unsettled, never clear authority using time or sampled absence. Keep claims disabled; startup reconciliation may act only when the fixed name resolves to an exact-label/image container and must then bind its immutable ID. A natural, settled nonzero create response plus post-settlement absence may release normally. Fixed-name collision serializes independent worker processes and restarts.
+- If Docker is unavailable, the image digest differs, kill/wait cannot prove exit, output arrives after the bound, or cleanup cannot prove exact-ID absence, return a safe error and retain lockout until authoritative reconciliation succeeds.
 - Reject malformed/fatal-UTF-8 JSON, extra schema keys, nonzero exit, unsupported role, unavailable configured model, usage/output overflow, and partial output. Never include raw Docker/Codex stderr, paths, image names, container IDs, or prompt/output in thrown messages.
-- Add an opt-in Docker integration case using a local fixture image that spawns a descendant marker; abort must prove the labeled container is gone and the marker never appears. Unit tests inject Docker run/wait/kill/inspect and cover daemon loss, duplicate names, stale-label rejection, output bounds, and cleanup.
+- Explicitly disable every model-visible tool, including `tools.view_image=false`, shell/unified execution, web search, apps, hooks, and multi-agent tools; the mounted auth volume is for Codex client authentication only.
+- Add an opt-in Docker integration case using a local fixture image that spawns a descendant marker; abort must prove the exact-ID container is gone and the marker never appears. Preflight requires singleton absence; fixture cleanup records and validates the exact returned ID and never removes by name if its own create failed. Unit tests inject Docker create/start/wait/kill/inspect/remove and the host lease, covering cross-process lease contention (reconcile must perform zero Docker calls), crash-release then stale exact-ID reconciliation, fixed-name collision, interrupted create with no auto-unlock, exclusive run/reconcile ownership, unsettled lifecycle/lease ownership, daemon loss, stale-label rejection, output bounds, and cleanup.
 
 #### Refactor
 
@@ -483,7 +477,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 
 #### Verify
 
-Command: `pnpm vitest run tests/bridge/codex-cli.test.ts -t "uses one fixed resource-bounded container and stdin-only prompt bytes"`
+Command: `pnpm vitest run tests/bridge/codex-cli.test.ts -t "uses Docker-owned singleton authority across runs and reconciliation"`
 
 Expected: one selected test passes, zero fail, exit code 0; the full file's daemon-loss, kill/wait, schema, malformed-output, bounds, and optional fixture-container cases pass.
 
