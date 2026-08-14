@@ -572,7 +572,7 @@ Yes. It is a thin provider adapter over T7 with no queue orchestration.
 ### T9 — Execute a Node job from durable message to routed reply
 
 **Maps to:** R3, R5
-**Files touched:** `worker/hybrid/runtime.ts` (new), `lib/server/history/messages.ts` (modify), `app/api/conversations/[conversationId]/messages/route.ts` (modify), `tests/bridge/jobs.test.ts` (modify)
+**Files touched:** `worker/hybrid/runtime.ts` (new), `lib/server/history/messages.ts` (modify), `app/api/conversations/[conversationId]/messages/route.ts` (modify), `tests/bridge/jobs.test.ts` (modify), `infra/vercel.env.example` (approved adjacent), `tests/deployment/vercel-hybrid.test.ts` (approved adjacent)
 
 #### Red — failing test
 
@@ -618,6 +618,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 - Add a one-shot runtime that claims through T5, reloads and authorizes the exact account/conversation/node/source event, then calls existing `routeNodeReply`, model gateway, and routed NODE `appendMessage`.
 - Extend the message result with immutable account/conversation/node/source IDs needed for job binding; do not return plaintext to queue code.
 - After the POST route commits the USER message, publish an opaque `{ jobId }` QStash wake best-effort. Wake failure returns `202 queued` rather than rolling back the message.
+- Declare exact blank `GUSTAVO_HYBRID_WAKE_URL` deployment configuration and fail closed unless it is an HTTPS Funnel destination. The route passes only canonical `{ jobId }` to the existing T6 publisher; tests prove the token/URL are absent from responses and logs.
 - Complete the job only after the NODE response event commits; on replay, return the existing response without a second model run.
 - Abort with safe status when account authority, conversation, source event, routing authority, or encryption key is revoked.
 

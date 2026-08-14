@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import type { EventDatabase } from "../../lib/server/events/types";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BRIDGE_JOB_RETENTION_DAYS,
   BRIDGE_JOB_LEASE_MINUTES,
@@ -26,20 +27,247 @@ import {
   type HybridWorkerHeartbeatRow,
 } from "../../lib/server/bridge/jobs";
 import { appendEvent } from "../../lib/server/events/store";
-import { appendMessage } from "../../lib/server/history/messages";
+import { appendMessage, listMessages } from "../../lib/server/history/messages";
+import { forgetConversation } from "../../lib/server/memory/forget";
+import type { ModelGenerationResult } from "../../lib/server/models/types";
 import { routeNodeReply } from "../../lib/server/node-brains/router";
 import { createConversationFixture, type ConversationFixture } from "../helpers/postgres";
+
+const routeState = vi.hoisted(() => ({
+  db: undefined as EventDatabase | undefined,
+  clientConfigs: [] as unknown[],
+  publishJSON: vi.fn(),
+}));
+
+vi.mock("../../lib/server/db/postgres", () => ({
+  getDatabase(): EventDatabase {
+    if (!routeState.db) throw new Error("TEST_DATABASE_NOT_READY");
+    return routeState.db;
+  },
+}));
+
+vi.mock("@upstash/qstash", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@upstash/qstash")>();
+  return {
+    ...original,
+    Client: class {
+      constructor(config: unknown) {
+        routeState.clientConfigs.push(config);
+      }
+
+      publishJSON(input: unknown): Promise<unknown> {
+        return routeState.publishJSON(input) as Promise<unknown>;
+      }
+    },
+  };
+});
+
+import { POST } from "../../app/api/conversations/[conversationId]/messages/route";
 
 const EXPECTED_STOCKS = "AAPL, MSFT, NVDA, AMZN, GOOGL, GOOG, META, TSLA, BRK.B, AVGO, JPM, LLY, V, XOM, MA, UNH, COST, WMT, NFLX, ORCL, HD, PG, JNJ, BAC, ABBV, KO, CRM, CVX, MRK, AMD, PLTR, CSCO, ACN, MCD, IBM, GE, CAT, GS, MS, AXP, BX, TMO, ISRG, LIN, ABT, DIS, NOW, QCOM, TXN, AMGN, DHR, PEP, PM, INTU, BKNG, RTX, AMAT, SPGI, NEE, LOW, UPS, HON, PFE, C, MU, SBUX, COP, SCHW, GILD, ADP, DE, BLK, PANW, LRCX, KLAC".split(", ");
 const EXPECTED_ETFS = "SPY, QQQ, DIA, IWM, VTI, VO, VB, VOO, IVV, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XLB, XLRE, ARKK".split(", ");
 const FORBIDDEN_JOB_FIELDS = ["prompt", "body", "output", "ciphertext"] as const;
 const FORBIDDEN_MARKET_FIELDS = ["price", "quote", "body", "plaintext"] as const;
 
+afterEach(() => {
+  vi.useRealTimers();
+  routeState.db = undefined;
+  routeState.clientConfigs.length = 0;
+  routeState.publishJSON.mockReset();
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
+
 function forbiddenFieldIntersection(
   row: Readonly<Record<string, unknown>>,
   forbidden: readonly string[],
 ): readonly string[] {
   return Object.freeze(Object.keys(row).filter((key) => forbidden.includes(key)).sort());
+}
+
+function generationResult(output: string): ModelGenerationResult {
+  return {
+    runId: crypto.randomUUID(),
+    correlationId: crypto.randomUUID(),
+    output,
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      estimatedCostMicrousd: 1n,
+      providerMetering: {
+        status: "REPORTED",
+        inputTokens: 1,
+        outputTokens: 1,
+      },
+    },
+  };
+}
+
+function observeHybridTransactionScopes(
+  database: EventDatabase,
+  sourceEventId: string,
+): {
+  readonly db: EventDatabase;
+  readonly authorityScopes: Array<number | null>;
+  readonly bodyScopes: Array<number | null>;
+} {
+  const authorityScopes: Array<number | null> = [];
+  const bodyScopes: Array<number | null> = [];
+  let nextScope = 0;
+  const wrap = (current: EventDatabase, scope: number | null): EventDatabase => ({
+    async query<Row extends Record<string, unknown> = Record<string, unknown>>(
+      sql: string,
+      parameters?: readonly unknown[],
+    ): Promise<Row[]> {
+      if (sql.includes("hybrid-node-hydration-authority")) authorityScopes.push(scope);
+      if (
+        sql.includes("from events where id=any($1::uuid[])")
+        && Array.isArray(parameters?.[0])
+        && parameters[0].includes(sourceEventId)
+      ) {
+        bodyScopes.push(scope);
+      }
+      return current.query<Row>(sql, parameters);
+    },
+    one: (sql, parameters) => current.one(sql, parameters),
+    transaction: (work) => current.transaction((transaction) => {
+      const transactionScope = scope ?? ++nextScope;
+      return work(wrap(transaction, transactionScope));
+    }),
+  });
+  return { db: wrap(database, null), authorityScopes, bodyScopes };
+}
+
+function observeHybridAuthorityTransactions(database: EventDatabase): {
+  readonly db: EventDatabase;
+  readonly steps: string[];
+  readonly outputEventScopes: Array<number | null>;
+  readonly completionScopes: Array<number | null>;
+} {
+  const steps: string[] = [];
+  const outputEventScopes: Array<number | null> = [];
+  const completionScopes: Array<number | null> = [];
+  let nextScope = 0;
+  const markers = [
+    "hybrid-node-hydration-authority",
+    "hybrid-source-key-lock",
+    "hybrid-source-body-lock",
+    "hybrid-node-hydration-revalidate",
+    "hybrid-node-output-authority",
+    "hybrid-output-key-lock",
+    "hybrid-output-body-lock",
+    "hybrid-node-output-revalidate",
+  ];
+  const wrap = (current: EventDatabase, scope: number | null): EventDatabase => ({
+    async query<Row extends Record<string, unknown> = Record<string, unknown>>(
+      sql: string,
+      parameters?: readonly unknown[],
+    ): Promise<Row[]> {
+      for (const marker of markers) {
+        if (sql.includes(marker)) steps.push(marker);
+      }
+      if (
+        sql.includes("insert into transactional_outbox")
+        && parameters?.includes("brain.response.completed")
+      ) {
+        outputEventScopes.push(scope);
+      }
+      if (
+        sql.includes("update bridge_model_jobs")
+        && sql.includes("set status='COMPLETED'")
+      ) {
+        completionScopes.push(scope);
+      }
+      return current.query<Row>(sql, parameters);
+    },
+    one: (sql, parameters) => current.one(sql, parameters),
+    transaction: (work) => current.transaction((transaction) => {
+      const transactionScope = scope ?? ++nextScope;
+      return work(wrap(transaction, transactionScope));
+    }),
+  });
+  return {
+    db: wrap(database, null),
+    steps,
+    outputEventScopes,
+    completionScopes,
+  };
+}
+
+function pauseAfterStatement(database: EventDatabase, marker: string): {
+  readonly db: EventDatabase;
+  readonly reached: Promise<void>;
+  readonly release: () => void;
+} {
+  let reached!: () => void;
+  let release!: () => void;
+  let paused = false;
+  const atStatement = new Promise<void>((resolve) => { reached = resolve; });
+  const continueStatement = new Promise<void>((resolve) => { release = resolve; });
+  const wrap = (current: EventDatabase): EventDatabase => ({
+    async query<Row extends Record<string, unknown> = Record<string, unknown>>(
+      sql: string,
+      parameters?: readonly unknown[],
+    ): Promise<Row[]> {
+      const rows = await current.query<Row>(sql, parameters);
+      if (!paused && sql.includes(marker)) {
+        paused = true;
+        reached();
+        await continueStatement;
+      }
+      return rows;
+    },
+    one: (sql, parameters) => current.one(sql, parameters),
+    transaction: (work) => current.transaction((transaction) => work(wrap(transaction))),
+  });
+  return { db: wrap(database), reached: atStatement, release };
+}
+
+function signalBeforeStatement(database: EventDatabase, marker: string): {
+  readonly db: EventDatabase;
+  readonly reached: Promise<void>;
+} {
+  let reached!: () => void;
+  let signaled = false;
+  const atStatement = new Promise<void>((resolve) => { reached = resolve; });
+  const wrap = (current: EventDatabase): EventDatabase => ({
+    query: <Row extends Record<string, unknown> = Record<string, unknown>>(
+      sql: string,
+      parameters?: readonly unknown[],
+    ): Promise<Row[]> => {
+      if (!signaled && sql.includes(marker)) {
+        signaled = true;
+        reached();
+      }
+      return current.query<Row>(sql, parameters);
+    },
+    one: (sql, parameters) => current.one(sql, parameters),
+    transaction: (work) => current.transaction((transaction) => work(wrap(transaction))),
+  });
+  return { db: wrap(database), reached: atStatement };
+}
+
+async function bounded<T>(promise: Promise<T>, milliseconds = 8_000): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("BOUNDED_CONCURRENCY_TIMEOUT")), milliseconds);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function forgetOwner(fixture: ConversationFixture) {
+  return {
+    kind: "ACCOUNT_OWNER" as const,
+    accountId: fixture.accountId,
+    sessionId: fixture.sessionId,
+    capability: "FORGET_CONVERSATION" as const,
+  };
 }
 
 async function expireClaimedBridgeLease(
@@ -1156,18 +1384,34 @@ describe("bridge claiming", () => {
       mainStateVersion: "bridge-test-main-v1",
       sourceIds: [source.eventId],
     }, async () => "generated");
-    const mismatched = await appendMessage(fixture, {
-      idempotencyKey: "mismatched-correlation-output",
-      role: "NODE",
-      text: "wrong correlation",
-      routingEventId: routed.routingEventId,
+    const mismatched = await appendEvent(fixture.db, {
+      aggregateId: fixture.conversationId,
+      accountId: fixture.accountId,
+      actor: { type: "NODE_BRAIN", id: fixture.nodeBrainId },
+      type: "brain.response.completed",
+      visibility: "PRIVATE_ACCOUNT",
+      body: {
+        text: "wrong correlation",
+        role: "NODE",
+        completion: { status: "COMPLETED", reason: null },
+      },
+      idempotencyKey: "bridge-mismatched-correlation-output",
+      causationId: routed.routingEventId,
+      correlationId: crypto.randomUUID(),
     });
+    await fixture.db.query(
+      `insert into messages (
+         event_id,conversation_id,account_id,role,idempotency_key,status,
+         occurred_at,completed_at,aborted_at,abort_reason
+       ) values ($1,$2,$3,'NODE','mismatched-correlation-output','COMPLETED',$4,$4,null,null)`,
+      [mismatched.id, fixture.conversationId, fixture.accountId, mismatched.occurredAt],
+    );
 
     await expect(completeBridgeJob(fixture.db, {
       jobId: claim!.jobId,
       workerId: "local-v1",
       attemptCount: claim!.attemptCount,
-      outputEventId: mismatched.eventId,
+      outputEventId: mismatched.id,
     })).rejects.toThrow("OUTPUT_AUTHORITY_INVALID");
   }, 30_000);
 
@@ -1465,5 +1709,827 @@ describe("bridge claiming", () => {
       "select status,attempt_count,safe_code from bridge_model_jobs where job_id=$1",
       [claim!.jobId],
     )).resolves.toEqual({ status: "CLAIMED", attempt_count: 1, safe_code: null });
+  }, 30_000);
+});
+
+describe("Node bridge execution", () => {
+  it("re-authorizes the source and commits one routed Node reply after the USER message", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-run");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-source-1",
+      role: "USER",
+      text: "explain today's simulation",
+    });
+    const generate = vi.fn().mockResolvedValue(generationResult("Node private reply"));
+
+    const result = await runOneHybridJob({
+      db: fixture.db,
+      workerId: "local-worker-v1",
+      generate,
+    });
+    expect(result).toMatchObject({ role: "NODE", status: "COMPLETED" });
+
+    const history = await listMessages(fixture, { limit: 10 });
+    expect(history.items.map(({ role, text }) => ({ role, text }))).toEqual([
+      { role: "USER", text: "explain today's simulation" },
+      { role: "NODE", text: "Node private reply" },
+    ]);
+    expect(generate).toHaveBeenCalledOnce();
+    expect(JSON.stringify(result)).not.toContain("explain today's simulation");
+    expect(JSON.stringify(result)).not.toContain("Node private reply");
+  }, 30_000);
+
+  it("hydrates exact source plaintext under the same transaction as live authority locks", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-atomic-hydration");
+    const source = await appendMessage(fixture, {
+      idempotencyKey: "node-atomic-hydration-source",
+      role: "USER",
+      text: "private atomic hydration source",
+    });
+    const observed = observeHybridTransactionScopes(fixture.db, source.eventId);
+
+    await expect(runOneHybridJob({
+      db: observed.db,
+      workerId: "local-worker-v1",
+      generate: vi.fn().mockResolvedValue(generationResult("atomic reply")),
+    })).resolves.toMatchObject({ role: "NODE", status: "COMPLETED" });
+
+    expect(observed.authorityScopes[0]).toEqual(expect.any(Number));
+    expect(observed.bodyScopes[0]).toBe(observed.authorityScopes[0]);
+  }, 30_000);
+
+  it("locks conversation authority before keys and bodies, then revalidates exact source and output identity", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-lock-order");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-lock-order-source",
+      role: "USER",
+      text: "private lock order source",
+    });
+    const observed = observeHybridAuthorityTransactions(fixture.db);
+
+    await expect(runOneHybridJob({
+      db: observed.db,
+      workerId: "local-worker-v1",
+      generate: vi.fn().mockResolvedValue(generationResult("lock order reply")),
+    })).resolves.toMatchObject({ role: "NODE", status: "COMPLETED" });
+
+    expect(observed.steps).toEqual([
+      "hybrid-node-hydration-authority",
+      "hybrid-source-key-lock",
+      "hybrid-source-body-lock",
+      "hybrid-node-hydration-revalidate",
+      "hybrid-node-output-authority",
+      "hybrid-output-key-lock",
+      "hybrid-output-body-lock",
+      "hybrid-node-output-revalidate",
+    ]);
+  }, 30_000);
+
+  it("serializes production forget behind hydration authority without a lock cycle or plaintext generation after forget", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-forget-hydration-race");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-forget-hydration-source",
+      role: "USER",
+      text: "private forget hydration source",
+    });
+    const gated = pauseAfterStatement(fixture.db, "hybrid-source-body-lock");
+    let generationStarted!: () => void;
+    const started = new Promise<void>((resolve) => { generationStarted = resolve; });
+    let releaseGeneration!: (result: ModelGenerationResult) => void;
+    const generated = new Promise<ModelGenerationResult>((resolve) => {
+      releaseGeneration = resolve;
+    });
+    const generate = vi.fn().mockImplementation(() => {
+      generationStarted();
+      return generated;
+    });
+    const running = runOneHybridJob({
+      db: gated.db,
+      workerId: "local-worker-v1",
+      generate,
+    });
+    void running.catch(() => undefined);
+    await bounded(gated.reached);
+
+    const forgetSignal = signalBeforeStatement(fixture.db, "privacy-forget-key-lock");
+    const forgetting = forgetConversation({ db: forgetSignal.db }, {
+      actor: forgetOwner(fixture),
+      accountId: fixture.accountId,
+      conversationId: fixture.conversationId,
+      idempotencyKey: "forget-during-node-hydration",
+    });
+    void forgetting.catch(() => undefined);
+    const beforeRelease = await Promise.race([
+      forgetSignal.reached.then(() => "forget-reached-key" as const),
+      new Promise<"forget-blocked-on-authority">((resolve) => setTimeout(
+        () => resolve("forget-blocked-on-authority"), 250,
+      )),
+    ]);
+    gated.release();
+
+    const forgetOutcome = await bounded(forgetting.then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    ));
+    releaseGeneration(generationResult("must not commit after forget"));
+    const result = await bounded(running);
+
+    expect(beforeRelease).toBe("forget-blocked-on-authority");
+    expect(forgetOutcome).toMatchObject({ ok: true });
+    await expect(bounded(started)).resolves.toBeUndefined();
+    expect(generate).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      role: "NODE",
+      status: "FAILED",
+      outputEventId: null,
+      safeCode: "OUTPUT_AUTHORITY_INVALID",
+    });
+    await expect(fixture.db.one(
+      `select count(*) filter (where type='brain.response.completed')::int as outputs
+         from events where aggregate_id=$1::text`,
+      [fixture.conversationId],
+    )).resolves.toEqual({ outputs: 0 });
+  }, 30_000);
+
+  it("serializes production forget behind atomic output without a lock cycle or unbound completion", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-forget-output-race");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-forget-output-source",
+      role: "USER",
+      text: "private forget output source",
+    });
+    const gated = pauseAfterStatement(fixture.db, "hybrid-output-body-lock");
+    const running = runOneHybridJob({
+      db: gated.db,
+      workerId: "local-worker-v1",
+      generate: vi.fn().mockResolvedValue(generationResult("atomic output before forget")),
+    });
+    void running.catch(() => undefined);
+    await bounded(gated.reached);
+
+    const forgetSignal = signalBeforeStatement(fixture.db, "privacy-forget-key-lock");
+    const forgetting = forgetConversation({ db: forgetSignal.db }, {
+      actor: forgetOwner(fixture),
+      accountId: fixture.accountId,
+      conversationId: fixture.conversationId,
+      idempotencyKey: "forget-during-node-output",
+    });
+    void forgetting.catch(() => undefined);
+    const beforeRelease = await Promise.race([
+      forgetSignal.reached.then(() => "forget-reached-key" as const),
+      new Promise<"forget-blocked-on-authority">((resolve) => setTimeout(
+        () => resolve("forget-blocked-on-authority"), 250,
+      )),
+    ]);
+    gated.release();
+    const [runOutcome, forgetOutcome] = await bounded(Promise.all([
+      running.then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      ),
+      forgetting.then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      ),
+    ]));
+
+    expect(beforeRelease).toBe("forget-blocked-on-authority");
+    expect(runOutcome).toMatchObject({ ok: true, value: { role: "NODE", status: "COMPLETED" } });
+    expect(forgetOutcome).toMatchObject({ ok: true });
+    await expect(fixture.db.one(
+      `select job.status,job.output_event_id is not null as bound,
+              count(output.id)::int as outputs
+         from bridge_model_jobs job
+         left join events output on output.id=job.output_event_id
+        group by job.status,job.output_event_id`,
+    )).resolves.toEqual({ status: "COMPLETED", bound: true, outputs: 1 });
+  }, 30_000);
+
+  it("finishes output commit and concurrent key deletion without a lock-order deadlock", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-key-delete-concurrency");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-key-delete-concurrency-source",
+      role: "USER",
+      text: "private concurrent deletion source",
+    });
+    const gated = pauseAfterStatement(fixture.db, "hybrid-output-key-lock");
+    const running = runOneHybridJob({
+      db: gated.db,
+      workerId: "local-worker-v1",
+      generate: vi.fn().mockResolvedValue(generationResult("concurrent deletion reply")),
+    });
+    await gated.reached;
+    const deleting = fixture.db.query(
+      "delete from aggregate_data_keys where aggregate_id=$1",
+      [fixture.conversationId],
+    );
+    const deletionState = await Promise.race([
+      deleting.then(() => "completed" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
+    ]);
+    expect(deletionState).toBe("blocked");
+    gated.release();
+    const [result] = await Promise.all([running, deleting]);
+
+    expect(result).toMatchObject({ role: "NODE", status: "COMPLETED" });
+    await expect(fixture.db.one(
+      `select job.status,job.output_event_id is not null as bound,
+              count(*) filter (where body.data_key_id is null)::int as erased
+         from bridge_model_jobs job
+         join encrypted_event_bodies body
+           on body.event_id in (job.source_event_id,job.output_event_id)
+        group by job.status,job.output_event_id`,
+    )).resolves.toEqual({ status: "COMPLETED", bound: true, erased: 2 });
+  }, 30_000);
+
+  it("commits the encrypted Node output and exact job binding in one transaction", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-atomic-output-binding");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-atomic-output-source",
+      role: "USER",
+      text: "private atomic output source",
+    });
+    const observed = observeHybridAuthorityTransactions(fixture.db);
+
+    await expect(runOneHybridJob({
+      db: observed.db,
+      workerId: "local-worker-v1",
+      generate: vi.fn().mockResolvedValue(generationResult("atomic output reply")),
+    })).resolves.toMatchObject({ role: "NODE", status: "COMPLETED" });
+
+    expect(observed.outputEventScopes).toEqual([expect.any(Number)]);
+    expect(observed.completionScopes).toEqual(observed.outputEventScopes);
+  }, 30_000);
+
+  it("keeps the exact bound output terminal on retry without a second model call", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-bound-output-retry");
+    const source = await appendMessage(fixture, {
+      idempotencyKey: "node-bound-output-retry-source",
+      role: "USER",
+      text: "private bound output retry source",
+    });
+    const boundJob = await fixture.db.one<{ readonly job_id: string }>(
+      "select job_id::text from bridge_model_jobs where source_event_id=$1",
+      [source.eventId],
+    );
+    const firstGenerate = vi.fn().mockResolvedValue(generationResult("bound output reply"));
+    const first = await runOneHybridJob({
+      db: fixture.db,
+      workerId: "local-worker-v1",
+      generate: firstGenerate,
+    });
+    const retryGenerate = vi.fn().mockResolvedValue(generationResult("duplicate output reply"));
+
+    await expect(runOneHybridJob({
+      db: fixture.db,
+      workerId: "retry-worker-v1",
+      generate: retryGenerate,
+    })).resolves.toEqual({ status: "IDLE" });
+    expect(firstGenerate).toHaveBeenCalledOnce();
+    expect(retryGenerate).not.toHaveBeenCalled();
+    await expect(fixture.db.one(
+      `select job.status,job.output_event_id::text as output_event_id,
+              output.id::text as exact_output_id
+         from bridge_model_jobs job
+         join events output on output.id=job.output_event_id
+        where job.job_id=$1`,
+      [boundJob.job_id],
+    )).resolves.toEqual({
+      status: "COMPLETED",
+      output_event_id: "outputEventId" in first ? first.outputEventId : null,
+      exact_output_id: "outputEventId" in first ? first.outputEventId : null,
+    });
+  }, 30_000);
+
+  it.each([
+    ["source event", async (fixture: ConversationFixture, sourceEventId: string) => {
+      await fixture.db.query(
+        "update encrypted_event_bodies set data_key_id=null where event_id=$1",
+        [sourceEventId],
+      );
+    }],
+    ["account", async (fixture: ConversationFixture) => {
+      await fixture.db.query("update accounts set status='SUSPENDED' where id=$1", [fixture.accountId]);
+    }],
+    ["conversation", async (fixture: ConversationFixture) => {
+      await fixture.db.query("update conversations set status='ARCHIVED' where id=$1", [fixture.conversationId]);
+    }],
+    ["Node", async (fixture: ConversationFixture) => {
+      await fixture.db.query("update node_brains set status='PAUSED' where id=$1", [fixture.nodeBrainId]);
+    }],
+    ["encryption key", async (fixture: ConversationFixture) => {
+      await fixture.db.query("delete from aggregate_data_keys where aggregate_id=$1", [fixture.conversationId]);
+    }],
+  ])("fails the claimed job safely when the exact %s authority is revoked", async (_label, revoke) => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture(`bridge-node-revoked-${_label}`);
+    const source = await appendMessage(fixture, {
+      idempotencyKey: "node-revoked-source",
+      role: "USER",
+      text: "private revoked source",
+    });
+    await revoke(fixture, source.eventId);
+    const generate = vi.fn().mockResolvedValue(generationResult("must not run"));
+
+    const result = await runOneHybridJob({
+      db: fixture.db,
+      workerId: "local-worker-v1",
+      generate,
+    });
+
+    expect(result).toMatchObject({
+      role: "NODE",
+      status: "FAILED",
+      safeCode: "SOURCE_AUTHORITY_REVOKED",
+    });
+    expect(generate).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("private revoked source");
+  }, 30_000);
+
+  it("terminalizes a revoked routing boundary without starting the model", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-routing-revoked");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-routing-revoked-source",
+      role: "USER",
+      text: "private routing source",
+    });
+    await fixture.db.query(`
+      create function reject_hybrid_node_route_outbox() returns trigger language plpgsql as $$
+      begin
+        if new.topic='node.reply.routed' then
+          raise exception 'TEST_ROUTING_AUTHORITY_REVOKED';
+        end if;
+        return new;
+      end;
+      $$;
+      create trigger reject_hybrid_node_route_outbox before insert on transactional_outbox
+      for each row execute function reject_hybrid_node_route_outbox();
+    `);
+    const generate = vi.fn().mockResolvedValue(generationResult("must not run"));
+
+    await expect(runOneHybridJob({
+      db: fixture.db,
+      workerId: "local-worker-v1",
+      generate,
+    })).resolves.toMatchObject({
+      role: "NODE",
+      status: "FAILED",
+      safeCode: "ROUTING_AUTHORITY_REVOKED",
+    });
+    expect(generate).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it("rejects a canonical Node event that has no durable job output binding", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-output-replay");
+    const source = await appendMessage(fixture, {
+      idempotencyKey: "node-output-replay-source",
+      role: "USER",
+      text: "private replay source",
+    });
+    const firstClaim = await claimNextBridgeJob(fixture.db, {
+      workerId: "interrupted-worker",
+      now: new Date("2026-08-13T12:00:00.000Z"),
+    });
+    const routed = await routeNodeReply({
+      db: fixture.db,
+      accountId: fixture.accountId,
+      conversationId: fixture.conversationId,
+      nodeBrainId: fixture.nodeBrainId,
+      userMessageEventId: source.eventId,
+      coveredByMain: false,
+      contradiction: false,
+      materialEvidence: false,
+      confidence: 1,
+      mainStateVersion: "bridge-node-v1",
+      sourceIds: [source.eventId],
+    }, async () => undefined);
+    await appendMessage(fixture, {
+      idempotencyKey: `bridge-node:${firstClaim!.jobId}`,
+      role: "NODE",
+      text: "already committed reply",
+      routingEventId: routed.routingEventId,
+    });
+    await expireClaimedBridgeLease(fixture.db, firstClaim!.jobId);
+    const generate = vi.fn().mockResolvedValue(generationResult("duplicate reply"));
+
+    await expect(runOneHybridJob({
+      db: fixture.db,
+      workerId: "recovery-worker",
+      generate,
+    })).resolves.toMatchObject({
+      role: "NODE",
+      status: "FAILED",
+      safeCode: "OUTPUT_AUTHORITY_INVALID",
+    });
+    expect(generate).not.toHaveBeenCalled();
+    await expect(fixture.db.one(
+      "select status,output_event_id from bridge_model_jobs where job_id=$1",
+      [firstClaim!.jobId],
+    )).resolves.toEqual({ status: "FAILED", output_event_id: null });
+  }, 30_000);
+
+  it("classifies a conflicting replay output as output authority failure", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-conflicting-output-replay");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-conflicting-output-source",
+      role: "USER",
+      text: "private conflicting output source",
+    });
+    const claim = await claimNextBridgeJob(fixture.db, {
+      workerId: "interrupted-worker",
+      now: new Date("2026-08-13T12:00:00.000Z"),
+    });
+    await appendEvent(fixture.db, {
+      aggregateId: fixture.conversationId,
+      accountId: fixture.accountId,
+      actor: { type: "SYSTEM", id: "forged-output" },
+      type: "brain.response.completed",
+      visibility: "PRIVATE_ACCOUNT",
+      body: { text: "forged replay body" },
+      idempotencyKey: `message:${fixture.conversationId}:bridge-node:${claim!.jobId}`,
+    });
+    await expireClaimedBridgeLease(fixture.db, claim!.jobId);
+    const generate = vi.fn().mockResolvedValue(generationResult("must not run"));
+
+    await expect(runOneHybridJob({
+      db: fixture.db,
+      workerId: "recovery-worker",
+      generate,
+    })).resolves.toMatchObject({
+      role: "NODE",
+      status: "FAILED",
+      safeCode: "OUTPUT_AUTHORITY_INVALID",
+    });
+    expect(generate).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it.each([
+    ["account", async (fixture: ConversationFixture) => {
+      await fixture.db.query("update accounts set status='SUSPENDED' where id=$1", [fixture.accountId]);
+    }],
+    ["conversation", async (fixture: ConversationFixture) => {
+      await fixture.db.query("update conversations set status='ARCHIVED' where id=$1", [fixture.conversationId]);
+    }],
+    ["Node", async (fixture: ConversationFixture) => {
+      await fixture.db.query("update node_brains set status='PAUSED' where id=$1", [fixture.nodeBrainId]);
+    }],
+    ["entitlement", async (fixture: ConversationFixture) => {
+      await fixture.db.query(
+        "update entitlements set revoked_at=clock_timestamp() where account_id=$1",
+        [fixture.accountId],
+      );
+    }],
+    ["source event", async (fixture: ConversationFixture, sourceEventId: string) => {
+      await fixture.db.query(
+        "update encrypted_event_bodies set data_key_id=null where event_id=$1",
+        [sourceEventId],
+      );
+    }],
+    ["encryption key", async (fixture: ConversationFixture) => {
+      await fixture.db.query("delete from aggregate_data_keys where aggregate_id=$1", [fixture.conversationId]);
+    }],
+    ["claimed job", async (fixture: ConversationFixture, _sourceEventId: string, jobId: string) => {
+      await expireClaimedBridgeLease(fixture.db, jobId);
+    }],
+  ])("revalidates deferred output against current %s authority before any Node event", async (
+    label,
+    revoke,
+  ) => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture(`bridge-node-deferred-${label}`);
+    const source = await appendMessage(fixture, {
+      idempotencyKey: "node-deferred-source",
+      role: "USER",
+      text: "private deferred source",
+    });
+    const sourceJob = await fixture.db.one<{ readonly job_id: string }>(
+      "select job_id::text from bridge_model_jobs where source_event_id=$1",
+      [source.eventId],
+    );
+    let generationStarted!: () => void;
+    let releaseGeneration!: () => void;
+    const atGeneration = new Promise<void>((resolve) => { generationStarted = resolve; });
+    const heldGeneration = new Promise<void>((resolve) => { releaseGeneration = resolve; });
+    const generate = vi.fn(async () => {
+      generationStarted();
+      await heldGeneration;
+      return generationResult("deferred private reply");
+    });
+    const running = runOneHybridJob({
+      db: fixture.db,
+      workerId: "local-worker-v1",
+      generate,
+    });
+    await atGeneration;
+    await revoke(fixture, source.eventId, sourceJob.job_id);
+    releaseGeneration();
+    const outcome = await running.then(
+      (value) => value,
+      (error: unknown) => error,
+    );
+
+    await expect(fixture.db.one(
+      "select count(*)::int as count from events where type='brain.response.completed'",
+    )).resolves.toEqual({ count: 0 });
+    const job = await fixture.db.one<{ readonly status: string; readonly output_event_id: string | null }>(
+      "select status,output_event_id::text from bridge_model_jobs where job_id=$1",
+      [sourceJob.job_id],
+    );
+    expect(job.status).not.toBe("COMPLETED");
+    expect(job.output_event_id).toBeNull();
+    expect(JSON.stringify(outcome)).not.toMatch(/private deferred source|deferred private reply/iu);
+  }, 30_000);
+
+  it("never completes the job when the routed Node event cannot commit", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-output-rollback");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-output-rollback-source",
+      role: "USER",
+      text: "private output rollback source",
+    });
+    await fixture.db.query(`
+      create function reject_hybrid_node_output_outbox() returns trigger language plpgsql as $$
+      begin
+        if new.topic='brain.response.completed' then
+          raise exception 'TEST_NODE_OUTPUT_COMMIT_FAILED';
+        end if;
+        return new;
+      end;
+      $$;
+      create trigger reject_hybrid_node_output_outbox before insert on transactional_outbox
+      for each row execute function reject_hybrid_node_output_outbox();
+    `);
+
+    await expect(runOneHybridJob({
+      db: fixture.db,
+      workerId: "local-worker-v1",
+      generate: vi.fn().mockResolvedValue(generationResult("uncommitted reply")),
+    })).resolves.toMatchObject({ role: "NODE", status: "FAILED" });
+    await expect(fixture.db.one(
+      "select status,output_event_id from bridge_model_jobs",
+    )).resolves.toEqual({ status: "FAILED", output_event_id: null });
+    await expect(fixture.db.one(
+      "select count(*)::int as count from events where type='brain.response.completed'",
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("maps an unavailable model to the explicit safe terminal code", async () => {
+    const { runOneHybridJob } = await import("../../worker/hybrid/runtime");
+    const fixture = await createConversationFixture("bridge-node-model-unavailable");
+    await appendMessage(fixture, {
+      idempotencyKey: "node-model-unavailable-source",
+      role: "USER",
+      text: "private unavailable model source",
+    });
+
+    await expect(runOneHybridJob({
+      db: fixture.db,
+      workerId: "local-worker-v1",
+      generate: vi.fn().mockRejectedValue(new Error("CODEX_MODEL_UNAVAILABLE")),
+    })).resolves.toMatchObject({
+      role: "NODE",
+      status: "FAILED",
+      safeCode: "CODEX_MODEL_UNAVAILABLE",
+    });
+  }, 30_000);
+
+  it("publishes only an opaque wake after commit and returns 202 when QStash is unavailable", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("GUSTAVO_HYBRID_BRIDGE_ENABLED", "true");
+    vi.stubEnv("GUSTAVO_HYBRID_WAKE_URL", "https://worker.tailnet.ts.net/wake");
+    vi.stubEnv("QSTASH_TOKEN", "qstash-secret-token-canary");
+    const fixture = await createConversationFixture("bridge-node-route-wake");
+    routeState.db = fixture.db;
+    routeState.publishJSON.mockImplementation(async (input: unknown) => {
+      const persisted = await fixture.db.one<{ readonly count: number }>(
+        `select count(*)::int as count
+           from messages message
+           join bridge_model_jobs job on job.source_event_id=message.event_id
+          where message.idempotency_key='route-wake-source'`,
+      );
+      expect(persisted).toEqual({ count: 1 });
+      expect(input).toEqual({
+        url: "https://worker.tailnet.ts.net/wake",
+        body: { jobId: expect.any(String) },
+      });
+      expect(JSON.stringify(input)).not.toContain("private route wake text");
+      throw new Error("qstash-secret-error-canary");
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const request = new Request(
+      `https://gustavo.lol/api/conversations/${fixture.conversationId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: `__Host-gustavo-session=${fixture.sessionToken}`,
+          origin: "https://gustavo.lol",
+        },
+        body: JSON.stringify({
+          idempotencyKey: "route-wake-source",
+          text: "private route wake text",
+        }),
+      },
+    );
+
+    const response = await POST(request, {
+      params: Promise.resolve({ conversationId: fixture.conversationId }),
+    });
+    const responseText = await response.text();
+
+    expect(response.status).toBe(202);
+    expect(JSON.parse(responseText)).toMatchObject({
+      eventId: expect.any(String),
+      status: "COMPLETED",
+      queued: true,
+    });
+    expect(routeState.publishJSON).toHaveBeenCalledOnce();
+    expect(routeState.clientConfigs).toEqual([{ token: "qstash-secret-token-canary" }]);
+    expect(`${responseText}${JSON.stringify(log.mock.calls)}${JSON.stringify(error.mock.calls)}`)
+      .not.toMatch(/private route wake text|qstash-secret|worker\.tailnet\.ts\.net/iu);
+  }, 30_000);
+
+  it("bounds the QStash publish await and handles a late rejection without leaking", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("GUSTAVO_HYBRID_BRIDGE_ENABLED", "true");
+    vi.stubEnv("GUSTAVO_HYBRID_WAKE_URL", "https://worker.tailnet.ts.net/wake");
+    vi.stubEnv("QSTASH_TOKEN", "qstash-late-rejection-token");
+    const fixture = await createConversationFixture("bridge-wake-timeout");
+    routeState.db = fixture.db;
+    let rejectPublish!: (error: Error) => void;
+    let publishStarted!: () => void;
+    const atPublish = new Promise<void>((resolve) => { publishStarted = resolve; });
+    routeState.publishJSON.mockReturnValue(new Promise((_resolve, reject) => {
+      rejectPublish = reject;
+      publishStarted();
+    }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const request = new Request(
+      `https://gustavo.lol/api/conversations/${fixture.conversationId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: `__Host-gustavo-session=${fixture.sessionToken}`,
+          origin: "https://gustavo.lol",
+        },
+        body: JSON.stringify({
+          idempotencyKey: "bounded-wake-source",
+          text: "private bounded wake text",
+        }),
+      },
+    );
+
+    const nativeSetTimeout = globalThis.setTimeout;
+    const timeout = vi.spyOn(globalThis, "setTimeout").mockImplementation((
+      (callback: (...arguments_: unknown[]) => void, milliseconds?: number, ...arguments_: unknown[]) =>
+        nativeSetTimeout(callback, milliseconds === 2_000 ? 0 : milliseconds, ...arguments_)
+    ) as typeof setTimeout);
+    const pendingResponse = POST(request, {
+      params: Promise.resolve({ conversationId: fixture.conversationId }),
+    });
+    await atPublish;
+    const response = await pendingResponse;
+    expect(response.status).toBe(202);
+    expect(timeout).toHaveBeenCalledWith(expect.any(Function), 2_000);
+    rejectPublish(new Error("qstash-late-rejection-canary"));
+    await Promise.resolve();
+    const responseText = await response.text();
+    expect(`${responseText}${JSON.stringify(log.mock.calls)}${JSON.stringify(error.mock.calls)}`)
+      .not.toMatch(/private bounded wake text|qstash-late-rejection|worker\.tailnet\.ts\.net/iu);
+  }, 30_000);
+
+  it("replays a committed USER response after terminal job pruning without republishing", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("GUSTAVO_HYBRID_BRIDGE_ENABLED", "true");
+    vi.stubEnv("GUSTAVO_HYBRID_WAKE_URL", "https://worker.tailnet.ts.net/wake");
+    vi.stubEnv("QSTASH_TOKEN", "qstash-pruned-replay-token");
+    const fixture = await createConversationFixture("bridge-user-pruned-replay");
+    routeState.db = fixture.db;
+    routeState.publishJSON.mockResolvedValue({ messageId: "published-once" });
+    const request = (text: string) => new Request(
+      `https://gustavo.lol/api/conversations/${fixture.conversationId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: `__Host-gustavo-session=${fixture.sessionToken}`,
+          origin: "https://gustavo.lol",
+        },
+        body: JSON.stringify({
+          idempotencyKey: "pruned-user-replay-source",
+          text,
+        }),
+      },
+    );
+
+    const first = await POST(request("private pruned replay text"), {
+      params: Promise.resolve({ conversationId: fixture.conversationId }),
+    });
+    expect(first.status).toBe(201);
+    const job = await claimNextBridgeJob(fixture.db, {
+      workerId: "pruned-replay-worker",
+      now: new Date(),
+    });
+    await failBridgeJob(fixture.db, {
+      jobId: job!.jobId,
+      workerId: "pruned-replay-worker",
+      attemptCount: job!.attemptCount,
+      safeCode: "CODEX_PROCESS_FAILED",
+    });
+    await fixture.db.transaction(async (transaction) => {
+      await transaction.query(
+        "alter table bridge_model_jobs disable trigger bridge_model_jobs_are_semantically_immutable",
+      );
+      await transaction.query(
+        `update bridge_model_jobs
+            set created_at=created_at-interval '8 days',
+                updated_at=updated_at-interval '8 days'
+          where job_id=$1`,
+        [job!.jobId],
+      );
+      await transaction.query(
+        "alter table bridge_model_jobs enable trigger bridge_model_jobs_are_semantically_immutable",
+      );
+      await transaction.query("delete from bridge_model_jobs where job_id=$1", [job!.jobId]);
+    });
+
+    const replay = await POST(request("private pruned replay text"), {
+      params: Promise.resolve({ conversationId: fixture.conversationId }),
+    });
+    expect(replay.status).toBe(201);
+    await expect(replay.json()).resolves.toMatchObject({
+      eventId: (await first.json()).eventId,
+      status: "COMPLETED",
+    });
+    expect(routeState.publishJSON).toHaveBeenCalledOnce();
+
+    const conflicting = await POST(request("different private replay text"), {
+      params: Promise.resolve({ conversationId: fixture.conversationId }),
+    });
+    expect(conflicting.status).toBe(409);
+    expect(routeState.publishJSON).toHaveBeenCalledOnce();
+  }, 30_000);
+
+  it.each([
+    ["attacker host", "https://attacker.example/wake"],
+    ["suffix lookalike", "https://worker.tailnet.ts.net.attacker.example/wake"],
+    ["missing tailnet label", "https://worker.ts.net/wake"],
+    ["bare suffix", "https://ts.net/wake"],
+    ["hostile label", "https://worker_bad.tailnet.ts.net/wake"],
+    ["credentials", "https://user:secret@worker.tailnet.ts.net/wake"],
+    ["query", "https://worker.tailnet.ts.net/wake?redirect=attacker"],
+    ["fragment", "https://worker.tailnet.ts.net/wake#secret"],
+    ["nondefault port", "https://worker.tailnet.ts.net:8443/wake"],
+    ["wrong path", "https://worker.tailnet.ts.net/not-wake"],
+    ["trailing slash", "https://worker.tailnet.ts.net/wake/"],
+  ])("fails closed for a noncanonical Funnel %s without publishing", async (_label, wakeUrl) => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("GUSTAVO_HYBRID_BRIDGE_ENABLED", "true");
+    vi.stubEnv("GUSTAVO_HYBRID_WAKE_URL", wakeUrl);
+    vi.stubEnv("QSTASH_TOKEN", "qstash-hostile-url-token");
+    const fixture = await createConversationFixture(`bridge-hostile-funnel-${_label}`);
+    routeState.db = fixture.db;
+    routeState.publishJSON.mockResolvedValue({ messageId: "must-not-publish" });
+    const request = new Request(
+      `https://gustavo.lol/api/conversations/${fixture.conversationId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: `__Host-gustavo-session=${fixture.sessionToken}`,
+          origin: "https://gustavo.lol",
+        },
+        body: JSON.stringify({
+          idempotencyKey: `hostile-funnel-${_label}`,
+          text: "private hostile Funnel text",
+        }),
+      },
+    );
+
+    const response = await POST(request, {
+      params: Promise.resolve({ conversationId: fixture.conversationId }),
+    });
+    const responseText = await response.text();
+
+    expect(response.status).toBe(202);
+    expect(JSON.parse(responseText)).toMatchObject({ queued: true });
+    expect(routeState.publishJSON).not.toHaveBeenCalled();
+    expect(responseText).not.toContain(wakeUrl);
+    expect(responseText).not.toMatch(/qstash-hostile-url-token|private hostile Funnel text/iu);
   }, 30_000);
 });

@@ -1,3 +1,4 @@
+import { Client } from "@upstash/qstash";
 import {
   assertRequestOrigin,
   authenticateSession,
@@ -5,9 +6,10 @@ import {
 } from "../../../../../lib/server/auth/sessions";
 import { getDatabase } from "../../../../../lib/server/db/postgres";
 import {
-  appendMessage,
+  appendMessageWithDisposition,
   listMessages,
 } from "../../../../../lib/server/history/messages";
+import { publishOpaqueWake } from "../../../../../lib/server/bridge/qstash";
 
 interface RouteContext {
   readonly params: Promise<{ readonly conversationId: string }>;
@@ -17,6 +19,9 @@ interface ParticipantMessageBody {
   readonly idempotencyKey: string;
   readonly text: string;
 }
+
+const FUNNEL_HOST_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+const HYBRID_WAKE_TIMEOUT_MS = 2_000;
 
 function privateHeaders(): Headers {
   return new Headers({
@@ -118,6 +123,56 @@ function routeFailure(error: unknown, operation: "READ" | "WRITE"): Response {
   );
 }
 
+async function publishCommittedNodeWake(jobId: string): Promise<void> {
+  const token = process.env.QSTASH_TOKEN;
+  const destinationUrl = canonicalFunnelWakeUrl(process.env.GUSTAVO_HYBRID_WAKE_URL);
+  if (!token) throw new Error("HYBRID_WAKE_UNAVAILABLE");
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      publishOpaqueWake(new Client({ token }), destinationUrl, { jobId }),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("HYBRID_WAKE_TIMEOUT")),
+          HYBRID_WAKE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function canonicalFunnelWakeUrl(value: string | undefined): string {
+  if (!value || value.includes("?") || value.includes("#")) {
+    throw new Error("HYBRID_WAKE_UNAVAILABLE");
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("HYBRID_WAKE_UNAVAILABLE");
+  }
+  const labels = url.hostname.split(".");
+  if (
+    url.protocol !== "https:"
+    || url.username !== ""
+    || url.password !== ""
+    || url.port !== ""
+    || url.pathname !== "/wake"
+    || url.search !== ""
+    || url.hash !== ""
+    || url.href !== value
+    || labels.length < 4
+    || labels.at(-2) !== "ts"
+    || labels.at(-1) !== "net"
+    || labels.slice(0, -2).some((label) => !FUNNEL_HOST_LABEL.test(label))
+  ) {
+    throw new Error("HYBRID_WAKE_UNAVAILABLE");
+  }
+  return value;
+}
+
 export async function POST(
   request: Request,
   context: RouteContext,
@@ -138,7 +193,7 @@ export async function POST(
     const body = await participantMessageBody(request);
     // appendMessage resolves only after its event, ciphertext, message metadata,
     // and transactional-outbox row have committed as one database transaction.
-    const message = await appendMessage(
+    const appended = await appendMessageWithDisposition(
       { db: database, accountId: session.accountId, conversationId },
       {
         idempotencyKey: body.idempotencyKey,
@@ -146,18 +201,28 @@ export async function POST(
         text: body.text,
       },
     );
-    return Response.json(
-      {
-        eventId: message.eventId,
-        role: message.role,
-        status: message.status,
-        occurredAt: message.occurredAt,
-        completedAt: message.completedAt,
-        abortedAt: message.abortedAt,
-        abortReason: message.abortReason,
-      },
-      { status: 201, headers: privateHeaders() },
-    );
+    const message = appended.message;
+    const acknowledgement = {
+      eventId: message.eventId,
+      role: message.role,
+      status: message.status,
+      occurredAt: message.occurredAt,
+      completedAt: message.completedAt,
+      abortedAt: message.abortedAt,
+      abortReason: message.abortReason,
+    } as const;
+    if (process.env.GUSTAVO_HYBRID_BRIDGE_ENABLED === "true" && appended.inserted) {
+      try {
+        if (!appended.bridgeJobId) throw new Error("HYBRID_WAKE_JOB_INVALID");
+        await publishCommittedNodeWake(appended.bridgeJobId);
+      } catch {
+        return Response.json(
+          { ...acknowledgement, queued: true },
+          { status: 202, headers: privateHeaders() },
+        );
+      }
+    }
+    return Response.json(acknowledgement, { status: 201, headers: privateHeaders() });
   } catch (error) {
     return routeFailure(error, "WRITE");
   }
