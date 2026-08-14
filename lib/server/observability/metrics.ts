@@ -1,6 +1,11 @@
 import { cpus, freemem, platform, release, totalmem } from "node:os";
 import { performance } from "node:perf_hooks";
 import { randomUUID } from "node:crypto";
+import {
+  collectHybridHealth,
+  type HybridHealthDto,
+  type HostedHybridHealth,
+} from "../bridge/health";
 import type { EventDatabase } from "../events/types";
 import {
   authorizeRecall,
@@ -511,6 +516,10 @@ export interface OperatorHealth {
   readonly models: readonly Record<string, unknown>[];
 }
 
+export interface OperatorHealthResponse extends OperatorHealth {
+  readonly hybrid: HybridHealthDto;
+}
+
 interface CommitBucketRow extends Record<string, unknown> {
   readonly outcome: "success" | "failure";
   readonly latency_bucket_ms: number;
@@ -665,4 +674,22 @@ export async function collectOperatorHealth(db: EventDatabase): Promise<Operator
     }),
     models: Object.freeze(models.map((row) => Object.freeze({ ...row }))),
   });
+}
+
+function hostedHybridHealth(health: OperatorHealth): HostedHybridHealth {
+  const cacheDegraded = health.cacheInvalidation.failureCount > 0
+    || (health.cacheDivergence.mismatches !== null && health.cacheDivergence.mismatches > 0);
+  return Object.freeze({
+    database: "HEALTHY",
+    cache: cacheDegraded ? "DEGRADED" : "HEALTHY",
+    stream: "HEALTHY",
+  });
+}
+
+export async function collectOperatorHealthResponse(
+  database: EventDatabase,
+): Promise<OperatorHealthResponse> {
+  const performanceHealth = await collectOperatorHealth(database);
+  const hybrid = await collectHybridHealth(database, hostedHybridHealth(performanceHealth));
+  return Object.freeze({ ...performanceHealth, hybrid });
 }

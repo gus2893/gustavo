@@ -1,8 +1,386 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
+import { createOperatorHealthHandler } from "../../app/api/operator/health/route";
+import {
+  collectHybridHealth,
+  HYBRID_HEALTH_POLICY,
+  projectHybridHealth,
+} from "../../lib/server/bridge/health";
 import { postgresPoolPolicy } from "../../lib/server/db/postgres";
+import type { EventDatabase } from "../../lib/server/events/types";
 import { runProductionMigrations } from "../../scripts/migrate-production";
+import { testContext } from "../helpers/postgres";
+
+describe("hybrid operator health", () => {
+  it("separates hosted and local components with durable bounded quota state", async () => {
+    const dto = await projectHybridHealth({
+      hosted: { database: "HEALTHY", cache: "DEGRADED", stream: "HEALTHY" },
+      heartbeats: [
+        { component: "CODEX", observedAt: "2026-08-13T12:00:00.000Z", safeCode: null },
+        { component: "MARKET", observedAt: "2026-08-13T11:55:00.000Z", safeCode: "RATE_LIMITED" },
+        { component: "TUNNEL", observedAt: "2026-08-13T12:00:00.000Z", safeCode: null },
+      ],
+      quotas: [
+        { name: "CODEX_JOBS", used: 4, limit: 100 },
+        { name: "QSTASH_MESSAGES", used: 20, limit: 900 },
+        { name: "FINNHUB_CALLS", used: 96, limit: 96 },
+      ],
+      pendingJobs: 2,
+      now: new Date("2026-08-13T12:01:00.000Z"),
+    });
+
+    expect(dto).toMatchObject({
+      hosted: { database: "HEALTHY", cache: "DEGRADED", stream: "HEALTHY" },
+      local: { codex: "AVAILABLE", market: "DEGRADED", tunnel: "AVAILABLE" },
+      bridge: { pendingJobs: 2 },
+    });
+    expect(JSON.stringify(dto)).not.toMatch(/hostname|url|prompt|price|token|ciphertext|providerKey/i);
+  });
+
+  it("uses the database-clock 12-minute CODEX lease and rejects future heartbeats", async () => {
+    const atBoundary = await projectHybridHealth({
+      hosted: { database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY" },
+      heartbeats: [{
+        component: "CODEX",
+        status: "HEALTHY",
+        observedAt: "2026-08-13T11:48:00.000Z",
+        safeCode: null,
+      }],
+      quotas: [{ name: "CODEX_JOBS", used: 99, limit: 100 }],
+      pendingJobs: 0,
+      now: new Date("2026-08-13T12:00:00.000Z"),
+    });
+    const stale = await projectHybridHealth({
+      hosted: { database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY" },
+      heartbeats: [{
+        component: "CODEX",
+        status: "HEALTHY",
+        observedAt: "2026-08-13T11:47:59.999Z",
+        safeCode: null,
+      }],
+      quotas: [{ name: "CODEX_JOBS", used: 99, limit: 100 }],
+      pendingJobs: 0,
+      now: new Date("2026-08-13T12:00:00.000Z"),
+    });
+    const future = await projectHybridHealth({
+      hosted: { database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY" },
+      heartbeats: [{
+        component: "CODEX",
+        status: "HEALTHY",
+        observedAt: "2026-08-13T12:00:00.001Z",
+        safeCode: null,
+      }],
+      quotas: [{ name: "CODEX_JOBS", used: 99, limit: 100 }],
+      pendingJobs: 0,
+      now: new Date("2026-08-13T12:00:00.000Z"),
+    });
+
+    expect(HYBRID_HEALTH_POLICY.codexLeaseSeconds).toBe(12 * 60);
+    expect(atBoundary.local.codex).toBe("AVAILABLE");
+    expect(atBoundary.components.find(({ component }) => component === "CODEX"))
+      .toMatchObject({ ageSeconds: 720, safeCode: null });
+    expect(stale.local.codex).toBe("OFFLINE");
+    expect(future.local.codex).toBe("OFFLINE");
+    expect(future.components.find(({ component }) => component === "CODEX"))
+      .toMatchObject({ ageSeconds: 0, safeCode: "WORKER_OFFLINE" });
+  });
+
+  it("lets the fixed current-UTC CODEX quota override a fresh heartbeat", async () => {
+    const dto = await projectHybridHealth({
+      hosted: { database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY" },
+      heartbeats: [{
+        component: "CODEX",
+        status: "HEALTHY",
+        observedAt: "2026-08-13T12:00:00.000Z",
+        safeCode: null,
+      }],
+      quotas: [{ name: "CODEX_JOBS", used: 100, limit: 100 }],
+      pendingJobs: 1,
+      now: new Date("2026-08-13T12:01:00.000Z"),
+    });
+
+    expect(dto.local.codex).toBe("DEGRADED");
+    expect(dto.components.find(({ component }) => component === "CODEX"))
+      .toMatchObject({ safeCode: "QUOTA_EXHAUSTED" });
+    expect(dto.quotas).toContainEqual({
+      name: "CODEX_JOBS",
+      used: 100,
+      limit: 100,
+      exhausted: true,
+    });
+  });
+
+  it("reads only fixed durable rows with database time and current UTC quotas", async () => {
+    const queries: string[] = [];
+    const db = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        return [
+          { component: "CODEX", heartbeat_status: "HEALTHY", safe_code: null,
+            age_seconds: 60, codex_lease_healthy: true,
+            quota_name: "CODEX_JOBS", used: 100, quota_limit: 100, pending_jobs: 2 },
+          { component: "MARKET", heartbeat_status: "DEGRADED", safe_code: "RATE_LIMITED",
+            age_seconds: 360, codex_lease_healthy: null,
+            quota_name: "QSTASH_MESSAGES", used: 20, quota_limit: 900, pending_jobs: 2 },
+          { component: "TUNNEL", heartbeat_status: "HEALTHY", safe_code: null,
+            age_seconds: 60, codex_lease_healthy: null,
+            quota_name: "FINNHUB_CALLS", used: 96, quota_limit: 27_648, pending_jobs: 2 },
+        ];
+      }),
+      one: vi.fn(async () => { throw new Error("HYBRID_HEALTH_SPLIT_READ"); }),
+      transaction: vi.fn(),
+    } as unknown as EventDatabase;
+
+    const dto = await collectHybridHealth(db, {
+      database: "HEALTHY", cache: "DEGRADED", stream: "HEALTHY",
+    });
+
+    expect(dto).toMatchObject({
+      local: { codex: "DEGRADED" },
+      bridge: { pendingJobs: 2 },
+    });
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toMatch(/hybrid_worker_heartbeats[\s\S]*deployment_quota_counters/iu);
+    expect(queries[0]).toMatch(/status='PENDING'[\s\S]*status='CLAIMED'/iu);
+    expect(db.one).not.toHaveBeenCalled();
+    expect(db.transaction).not.toHaveBeenCalled();
+  });
+
+  it("uses one materialized database clock across a UTC quota rollover", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (!sql.includes("database_clock as materialized")) {
+        throw new Error("HYBRID_HEALTH_DATABASE_CLOCK_NOT_COHERENT");
+      }
+      return [
+        { component: "CODEX", heartbeat_status: "HEALTHY", safe_code: null,
+          age_seconds: 1, codex_lease_healthy: true,
+          quota_name: "CODEX_JOBS", used: 100, quota_limit: 100, pending_jobs: 0 },
+        { component: "MARKET", heartbeat_status: "HEALTHY", safe_code: null,
+          age_seconds: 1, codex_lease_healthy: null,
+          quota_name: "QSTASH_MESSAGES", used: 0, quota_limit: 900, pending_jobs: 0 },
+        { component: "TUNNEL", heartbeat_status: "HEALTHY", safe_code: null,
+          age_seconds: 1, codex_lease_healthy: null,
+          quota_name: "FINNHUB_CALLS", used: 0, quota_limit: 27_648, pending_jobs: 0 },
+      ];
+    });
+    const db = {
+      query,
+      one: vi.fn(async () => { throw new Error("HYBRID_HEALTH_SPLIT_CLOCK_READ"); }),
+      transaction: vi.fn(),
+    } as unknown as EventDatabase;
+
+    const dto = await collectHybridHealth(db, {
+      database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY",
+    });
+    const sql = query.mock.calls[0]?.[0] ?? "";
+
+    expect(query).toHaveBeenCalledOnce();
+    expect(dto.local.codex).toBe("DEGRADED");
+    expect(dto.quotas.find(({ name }) => name === "CODEX_JOBS"))
+      .toMatchObject({ used: 100, limit: 100, exhausted: true });
+    expect(sql).toMatch(/with database_clock as materialized\s*\(\s*select clock_timestamp\(\) observed_now/iu);
+    expect(sql).toMatch(/bucket_date\s*=\s*\(database_clock\.observed_now at time zone 'UTC'\)::date/iu);
+    expect(db.one).not.toHaveBeenCalled();
+    expect(db.transaction).not.toHaveBeenCalled();
+  });
+
+  it("keeps the PostgreSQL microsecond CODEX lease decision authoritative", async () => {
+    const roundedByJavaScript = await projectHybridHealth({
+      hosted: { database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY" },
+      heartbeats: [{ component: "CODEX", status: "HEALTHY",
+        observedAt: "2026-08-13T11:48:00.000Z", safeCode: null }],
+      quotas: [{ name: "CODEX_JOBS", used: 99, limit: 100 }],
+      pendingJobs: 0,
+      now: new Date("2026-08-13T12:00:00.000Z"),
+    });
+    expect(roundedByJavaScript.local.codex).toBe("AVAILABLE");
+
+    const query = vi.fn(async (_sql: string, _parameters?: readonly unknown[]) => [
+      { component: "CODEX", heartbeat_status: "HEALTHY", safe_code: null,
+        age_seconds: 720, codex_lease_healthy: false,
+        quota_name: "CODEX_JOBS", used: 99, quota_limit: 100, pending_jobs: 0 },
+      { component: "MARKET", heartbeat_status: null, safe_code: null,
+        age_seconds: null, codex_lease_healthy: null,
+        quota_name: "QSTASH_MESSAGES", used: 0, quota_limit: 900, pending_jobs: 0 },
+      { component: "TUNNEL", heartbeat_status: null, safe_code: null,
+        age_seconds: null, codex_lease_healthy: null,
+        quota_name: "FINNHUB_CALLS", used: 0, quota_limit: 27_648, pending_jobs: 0 },
+    ]);
+    const db = {
+      query,
+      one: vi.fn(async () => { throw new Error("HYBRID_HEALTH_JAVASCRIPT_CLOCK_USED"); }),
+      transaction: vi.fn(),
+    } as unknown as EventDatabase;
+
+    const dto = await collectHybridHealth(db, {
+      database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY",
+    });
+    const sql = query.mock.calls[0]?.[0] ?? "";
+    const parameters = query.mock.calls[0]?.[1] ?? [];
+
+    expect(dto.local.codex).toBe("OFFLINE");
+    expect(dto.components.find(({ component }) => component === "CODEX"))
+      .toMatchObject({ ageSeconds: 720, safeCode: "WORKER_OFFLINE" });
+    expect(parameters.slice(0, 2)).toEqual([
+      HYBRID_HEALTH_POLICY.codexLeaseSeconds,
+      HYBRID_HEALTH_POLICY.maximumHeartbeatAgeSeconds,
+    ]);
+    expect(sql).toMatch(/observed_at between\s+database_clock\.observed_now\s*-\s*make_interval\(secs => \$1::double precision\)\s+and database_clock\.observed_now/isu);
+    expect(sql).toMatch(/extract\(epoch from\s+\(database_clock\.observed_now-heartbeat\.observed_at\)\)/iu);
+    expect(db.one).not.toHaveBeenCalled();
+  });
+
+  it("bounds the pending scan at maximumPendingJobs plus one before counting", async () => {
+    const query = vi.fn(async (_sql: string, _parameters?: readonly unknown[]) => [
+      { component: "CODEX", heartbeat_status: "OFFLINE", safe_code: "WORKER_OFFLINE",
+        age_seconds: 1, codex_lease_healthy: false,
+        quota_name: "CODEX_JOBS", used: 0, quota_limit: 100, pending_jobs: 10_001 },
+      { component: "MARKET", heartbeat_status: null, safe_code: null,
+        age_seconds: null, codex_lease_healthy: null,
+        quota_name: "QSTASH_MESSAGES", used: 0, quota_limit: 900, pending_jobs: 10_001 },
+      { component: "TUNNEL", heartbeat_status: null, safe_code: null,
+        age_seconds: null, codex_lease_healthy: null,
+        quota_name: "FINNHUB_CALLS", used: 0, quota_limit: 27_648, pending_jobs: 10_001 },
+    ]);
+    const db = {
+      query,
+      one: vi.fn(async () => { throw new Error("HYBRID_HEALTH_UNBOUNDED_PENDING_READ"); }),
+      transaction: vi.fn(),
+    } as unknown as EventDatabase;
+
+    const dto = await collectHybridHealth(db, {
+      database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY",
+    });
+    const sql = query.mock.calls[0]?.[0] ?? "";
+    const parameters = query.mock.calls[0]?.[1] ?? [];
+    const scanLimit = HYBRID_HEALTH_POLICY.maximumPendingJobs + 1;
+
+    expect(dto.bridge.pendingJobs).toBe(HYBRID_HEALTH_POLICY.maximumPendingJobs);
+    expect(parameters[2]).toBe(scanLimit);
+    expect(sql).toMatch(/bounded_pending as materialized[\s\S]*limit \$3[\s\S]*count\(\*\)/iu);
+    expect(sql).not.toMatch(/select count\(\*\)::text pending_jobs\s+from bridge_model_jobs/iu);
+    expect(query).toHaveBeenCalledOnce();
+    expect(db.one).not.toHaveBeenCalled();
+  });
+
+  it("executes the coherent health authority against PostgreSQL microsecond timestamps", async () => {
+    const { db } = await testContext();
+    await db.query(
+      `insert into hybrid_worker_heartbeats (component,status,safe_code)
+       values ('CODEX','HEALTHY',null)`,
+    );
+    await db.query(
+      "alter table hybrid_worker_heartbeats disable trigger hybrid_worker_heartbeats_are_bounded",
+    );
+    try {
+      await db.query(
+        `update hybrid_worker_heartbeats
+            set observed_at=clock_timestamp()-interval '12 minutes 0.0001 seconds',
+                updated_at=clock_timestamp()
+          where component='CODEX'`,
+      );
+    } finally {
+      await db.query(
+        "alter table hybrid_worker_heartbeats enable trigger hybrid_worker_heartbeats_are_bounded",
+      );
+    }
+    await db.query(
+      `insert into deployment_quota_counters
+         (quota_name,bucket_date,used_count,limit_count)
+       values ('CODEX_JOBS',(clock_timestamp() at time zone 'UTC')::date,99,100)`,
+    );
+
+    const dto = await collectHybridHealth(db, {
+      database: "HEALTHY", cache: "HEALTHY", stream: "HEALTHY",
+    });
+
+    expect(dto.local.codex).toBe("OFFLINE");
+    expect(dto.components.find(({ component }) => component === "CODEX"))
+      .toMatchObject({ ageSeconds: 720, safeCode: "WORKER_OFFLINE" });
+    expect(dto.quotas.find(({ name }) => name === "CODEX_JOBS"))
+      .toMatchObject({ used: 99, limit: 100, exhausted: false });
+    expect(dto.bridge.pendingJobs).toBe(0);
+  }, 20_000);
+
+  it("returns a fixed bounded DTO and drops every sensitive or identifying input field", async () => {
+    const dto = await projectHybridHealth({
+      hosted: { database: "HEALTHY", cache: "HEALTHY", stream: "DEGRADED" },
+      heartbeats: [{
+        component: "CODEX",
+        status: "DEGRADED",
+        observedAt: "2026-08-13T11:59:59.999Z",
+        safeCode: "PROVIDER_UNAVAILABLE",
+        hostname: "private-host-canary",
+        url: "https://private-funnel.invalid",
+        prompt: "private-prompt-canary",
+        price: "123.45",
+        token: "private-token-canary",
+        ciphertext: "private-ciphertext-canary",
+        providerKey: "private-provider-key-canary",
+        containerId: "private-container-canary",
+        imageDigest: "private-image-canary",
+        volumeName: "private-volume-canary",
+        accountId: "private-account-canary",
+        jobId: "private-job-canary",
+      } as never],
+      quotas: [{
+        name: "CODEX_JOBS", used: 4, limit: 100, providerAccountId: "private-provider-account",
+      } as never],
+      pendingJobs: Number.MAX_SAFE_INTEGER,
+      now: new Date("2026-08-13T12:00:00.000Z"),
+    });
+    const serialized = JSON.stringify(dto);
+
+    expect(dto.bridge.pendingJobs).toBe(HYBRID_HEALTH_POLICY.maximumPendingJobs);
+    expect(dto.components).toHaveLength(3);
+    expect(dto.quotas).toHaveLength(3);
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThan(4 * 1024);
+    expect(serialized).not.toMatch(
+      /private-|hostname|https?:|prompt|price|token|ciphertext|providerKey|containerId|imageDigest|volumeName|accountId|jobId/iu,
+    );
+  });
+
+  it("authenticates before protected reads and keeps private generic bounded failures", async () => {
+    const resolveDatabase = vi.fn(() => ({ marker: "private-db" }) as never);
+    const collect = vi.fn(async () => ({ privateState: "never-returned" }) as never);
+    const handler = createOperatorHealthHandler({
+      resolveDatabase,
+      token: "operator-health-token-that-is-at-least-32-bytes",
+      collect,
+    });
+
+    const denied = await handler(new Request("http://localhost/api/operator/health"));
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get("cache-control")).toBe("private, no-store, max-age=0");
+    expect(await denied.json()).toEqual({ error: "UNAUTHORIZED" });
+    expect(resolveDatabase).not.toHaveBeenCalled();
+    expect(collect).not.toHaveBeenCalled();
+
+    const failing = createOperatorHealthHandler({
+      resolveDatabase: vi.fn(() => { throw new Error("private-host-canary"); }),
+      token: "operator-health-token-that-is-at-least-32-bytes",
+    });
+    const unavailable = await failing(new Request("http://localhost/api/operator/health", {
+      headers: { authorization: "Bearer operator-health-token-that-is-at-least-32-bytes" },
+    }));
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers.get("cache-control")).toBe("private, no-store, max-age=0");
+    expect(await unavailable.json()).toEqual({ error: "OPERATOR_HEALTH_UNAVAILABLE" });
+
+    const oversized = createOperatorHealthHandler({
+      resolveDatabase,
+      token: "operator-health-token-that-is-at-least-32-bytes",
+      collect: vi.fn(async () => ({ payload: "x".repeat(70 * 1024) }) as never),
+    });
+    const bounded = await oversized(new Request("http://localhost/api/operator/health", {
+      headers: { authorization: "Bearer operator-health-token-that-is-at-least-32-bytes" },
+    }));
+    expect(bounded.status).toBe(503);
+    expect(Number(bounded.headers.get("content-length"))).toBeLessThan(1024);
+    expect(await bounded.json()).toEqual({ error: "OPERATOR_HEALTH_RESPONSE_TOO_LARGE" });
+  });
+});
 
 describe("production migrations", () => {
   it("takes one advisory lock and applies each ordered migration once", async () => {

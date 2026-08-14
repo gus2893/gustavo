@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { EventDatabase } from "../../../../lib/server/events/types";
 import { getDatabase } from "../../../../lib/server/db/postgres";
 import {
-  collectOperatorHealth,
+  collectOperatorHealthResponse,
   type OperatorHealth,
 } from "../../../../lib/server/observability/metrics";
 
@@ -59,7 +59,7 @@ export function createOperatorHealthHandler(dependencies: {
     }
     try {
       const database = dependencies.resolveDatabase();
-      const health = await (dependencies.collect ?? collectOperatorHealth)(database);
+      const health = await (dependencies.collect ?? collectOperatorHealthResponse)(database);
       return json(health, 200);
     } catch {
       return json({ error: "OPERATOR_HEALTH_UNAVAILABLE" }, 503);
