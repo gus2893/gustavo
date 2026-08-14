@@ -179,6 +179,7 @@ export interface ReconcileCodexContainersOptions {
   readonly dockerExecutable: string;
   readonly resolveDockerExecutable?: DockerExecutableResolver;
   readonly controller?: CodexDockerController;
+  readonly signal?: AbortSignal;
 }
 
 interface RawDockerResult {
@@ -749,8 +750,21 @@ async function bounded<T>(
   operation: Promise<T>,
   controller: AbortController,
   milliseconds = CONTROL_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const externalAbort = Symbol("EXTERNAL_ABORT");
+  let onExternalAbort: (() => void) | undefined;
+  const interrupted = externalSignal === undefined
+    ? new Promise<never>(() => undefined)
+    : new Promise<typeof externalAbort>((resolveAbort) => {
+      onExternalAbort = () => {
+        controller.abort();
+        resolveAbort(externalAbort);
+      };
+      if (externalSignal.aborted) onExternalAbort();
+      else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    });
   const expired = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       controller.abort();
@@ -760,21 +774,33 @@ async function bounded<T>(
     timer.unref?.();
   });
   try {
-    return await Promise.race([operation, expired]);
+    const outcome = await Promise.race([operation, expired, interrupted]);
+    // Cancellation terminates the helper but never abandons it. The caller,
+    // process owner, and named-pipe lease remain held until actual settlement.
+    if (outcome === externalAbort) return await operation;
+    return outcome;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (externalSignal !== undefined && onExternalAbort !== undefined) {
+      externalSignal.removeEventListener("abort", onExternalAbort);
+    }
   }
+}
+
+function throwIfReconcileAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw safeError("CODEX_CONTAINER_RECONCILIATION_FAILED");
 }
 
 async function proveAbsent(
   controller: CodexDockerController,
   identity: CodexContainerIdentity,
+  externalSignal?: AbortSignal,
 ): Promise<boolean> {
   const operationController = new AbortController();
   const result = await bounded(controller.inspect({
     identity,
     signal: operationController.signal,
-  }), operationController);
+  }), operationController, CONTROL_TIMEOUT_MS, externalSignal);
   return result.daemonAvailable && !result.exists;
 }
 
@@ -794,13 +820,14 @@ function parseContainerId(result: DockerCommandResult): string | undefined {
 async function inspectOwned(
   controller: CodexDockerController,
   identity: CodexContainerIdentity,
+  externalSignal?: AbortSignal,
 ): Promise<DockerInspectResult | undefined> {
   const inspectController = new AbortController();
   try {
     return await bounded(controller.inspect({
       identity,
       signal: inspectController.signal,
-    }), inspectController);
+    }), inspectController, CONTROL_TIMEOUT_MS, externalSignal);
   } catch {
     return undefined;
   }
@@ -820,14 +847,16 @@ function guardedWait(
 async function removeOwnedAndProveAbsent(
   controller: CodexDockerController,
   identity: CodexContainerIdentity,
+  externalSignal?: AbortSignal,
 ): Promise<boolean> {
   const removeController = new AbortController();
   try {
     const removed = await bounded(controller.remove({
       identity,
       signal: removeController.signal,
-    }), removeController);
-    return removed.helperExitCode === 0 && await proveAbsent(controller, identity);
+    }), removeController, CONTROL_TIMEOUT_MS, externalSignal);
+    return removed.helperExitCode === 0
+      && await proveAbsent(controller, identity, externalSignal);
   } catch {
     return false;
   }
@@ -840,6 +869,7 @@ async function terminateOwned(
     readonly controller: AbortController;
     readonly promise: ReturnType<typeof guardedWait>;
   },
+  externalSignal?: AbortSignal,
 ): Promise<{ readonly exitCode: number | null; readonly proven: boolean; readonly absent: boolean }> {
   // `docker wait` is registered before the exact-name kill in every termination path.
   const waitController = existingWait?.controller ?? new AbortController();
@@ -850,7 +880,7 @@ async function terminateOwned(
     const killed = await bounded(controller.kill({
       identity,
       signal: killController.signal,
-    }), killController);
+    }), killController, CONTROL_TIMEOUT_MS, externalSignal);
     killProven = killed.helperExitCode === 0;
   } catch {
     killProven = false;
@@ -858,12 +888,17 @@ async function terminateOwned(
   const waitBoundController = new AbortController();
   let waited: DockerWaitResult | undefined;
   try {
-    const outcome = await bounded(waitPromise, waitBoundController);
+    const outcome = await bounded(
+      waitPromise,
+      waitBoundController,
+      CONTROL_TIMEOUT_MS,
+      externalSignal,
+    );
     if (outcome.ok) waited = outcome.value;
   } catch {
     waitController.abort();
   }
-  const stopped = await inspectOwned(controller, identity);
+  const stopped = await inspectOwned(controller, identity, externalSignal);
   const stoppedProven = stopped?.daemonAvailable === true
     && stopped.exists
     && stopped.inspection !== undefined
@@ -871,7 +906,7 @@ async function terminateOwned(
     && stopped.inspection.state === "exited"
     && waited?.containerExitCode === stopped.inspection.exitCode;
   const absent = stoppedProven
-    ? await removeOwnedAndProveAbsent(controller, identity)
+    ? await removeOwnedAndProveAbsent(controller, identity, externalSignal)
     : false;
   return {
     exitCode: waited?.containerExitCode ?? null,
@@ -887,11 +922,12 @@ async function reconcileOwnedInspection(
   controller: CodexDockerController,
   identity: CodexContainerIdentity,
   inspection: DockerInspection,
+  externalSignal?: AbortSignal,
 ): Promise<boolean> {
   if (!inspectionMatches(inspection, identity)) return false;
   const owned = ownedIdentity(identity, inspection.id);
   if (inspection.state === "created") {
-    return removeOwnedAndProveAbsent(controller, owned);
+    return removeOwnedAndProveAbsent(controller, owned, externalSignal);
   }
   if (inspection.state === "exited") {
     const waitController = new AbortController();
@@ -899,12 +935,14 @@ async function reconcileOwnedInspection(
       const waitOutcome = await bounded(
         guardedWait(controller, owned, waitController),
         waitController,
+        CONTROL_TIMEOUT_MS,
+        externalSignal,
       );
       return waitOutcome.ok
         && waitOutcome.value.helperExitCode === 0
         && waitOutcome.value.containerExitCode !== null
         && waitOutcome.value.containerExitCode === inspection.exitCode
-        && await removeOwnedAndProveAbsent(controller, owned);
+        && await removeOwnedAndProveAbsent(controller, owned, externalSignal);
     } catch {
       return false;
     }
@@ -914,7 +952,7 @@ async function reconcileOwnedInspection(
     || inspection.state === "paused"
     || inspection.state === "restarting"
   ) {
-    const terminated = await terminateOwned(controller, owned);
+    const terminated = await terminateOwned(controller, owned, undefined, externalSignal);
     return terminated.proven && terminated.absent;
   }
   return false;
@@ -1510,6 +1548,11 @@ export async function reconcileCodexContainers(
   options: ReconcileCodexContainersOptions,
 ): Promise<{ readonly reconciled: true }> {
   const image = immutableImage(options.image);
+  if (options.signal !== undefined && !(options.signal instanceof AbortSignal)) {
+    throw safeError("CODEX_CONTAINER_RECONCILIATION_FAILED");
+  }
+  const reconcileSignal = options.signal ?? new AbortController().signal;
+  throwIfReconcileAborted(reconcileSignal);
   const ownerToken = claimAuthority("RECONCILE");
   launchLocked = true;
   try {
@@ -1524,10 +1567,11 @@ export async function reconcileCodexContainers(
         options.resolveDockerExecutable,
       );
     }
-    const leaseController = new AbortController();
-    if (!await acquireOwnerHostLease(ownerToken, controller, leaseController.signal)) {
+    throwIfReconcileAborted(reconcileSignal);
+    if (!await acquireOwnerHostLease(ownerToken, controller, reconcileSignal)) {
       throw safeError("CODEX_CONTAINER_RECONCILIATION_FAILED");
     }
+    throwIfReconcileAborted(reconcileSignal);
     if (interruptedCreate !== undefined && interruptedCreate.image !== image) {
       throw safeError("CODEX_CONTAINER_RECONCILIATION_FAILED");
     }
@@ -1540,7 +1584,8 @@ export async function reconcileCodexContainers(
         [RUN_ID_LABEL_NAME]: "0".repeat(32),
       }),
     });
-    const before = await inspectOwned(controller, lookupIdentity);
+    const before = await inspectOwned(controller, lookupIdentity, reconcileSignal);
+    throwIfReconcileAborted(reconcileSignal);
     if (before?.daemonAvailable !== true) {
       throw safeError("CODEX_CONTAINER_RECONCILIATION_FAILED");
     }
@@ -1561,11 +1606,18 @@ export async function reconcileCodexContainers(
       interruptedCreate !== undefined
       && !sameIdentity(interruptedCreate, identity)
     ) throw safeError("CODEX_CONTAINER_RECONCILIATION_FAILED");
-    if (!await reconcileOwnedInspection(controller, identity, before.inspection)) {
+    if (!await reconcileOwnedInspection(
+      controller,
+      identity,
+      before.inspection,
+      reconcileSignal,
+    )) {
       throw safeError("CODEX_CONTAINER_RECONCILIATION_FAILED");
     }
+    throwIfReconcileAborted(reconcileSignal);
     clearInterruptedCreate(identity);
-    const finalLookup = await inspectOwned(controller, lookupIdentity);
+    const finalLookup = await inspectOwned(controller, lookupIdentity, reconcileSignal);
+    throwIfReconcileAborted(reconcileSignal);
     if (finalLookup?.daemonAvailable !== true || finalLookup.exists) {
       throw safeError("CODEX_CONTAINER_RECONCILIATION_FAILED");
     }

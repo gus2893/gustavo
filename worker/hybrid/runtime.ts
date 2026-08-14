@@ -24,6 +24,7 @@ import type {
   ModelGenerationRequest,
   ModelGenerationResult,
 } from "../../lib/server/models/types";
+import { marketWindowStart } from "../../lib/server/market-data/session";
 import {
   NODE_ROUTING_POLICY_VERSION,
   routeNodeReply,
@@ -1251,4 +1252,378 @@ export async function runOneHybridJob(
   });
   if (!job) return Object.freeze({ status: "IDLE" });
   return HYBRID_ROLE_HANDLERS[job.role](options, job);
+}
+
+const HYBRID_STOP_TIMEOUT_MS = 25_000 as const;
+
+export interface HybridContainerController {
+  /** Proves Docker, the recorded image digest, and the dedicated auth volume. */
+  verifyReady(signal: AbortSignal): Promise<void>;
+  /** Reconciles only the T7 fixed-name, exact-label singleton authority. */
+  reconcile(signal: AbortSignal): Promise<void>;
+  /** Kills/waits/removes only an exact owned singleton, if one is active. */
+  stop(signal: AbortSignal): Promise<void>;
+  /** Proves no exact-label singleton remains after reconciliation or stop. */
+  proveAbsent(signal: AbortSignal): Promise<boolean>;
+}
+
+export type HybridRuntimeWake =
+  | { readonly jobId: string }
+  | { readonly windowId: string };
+
+export interface HybridRuntimeControllerOptions {
+  readonly container: HybridContainerController;
+  /** Recovers retained prior windows and prunes expired ones without provider work. */
+  readonly recoverMarket: (signal: AbortSignal) => Promise<void>;
+  /** Drains durable model authority; T7 remains the container singleton boundary. */
+  readonly drainModel: (signal: AbortSignal) => Promise<void>;
+  readonly pollMarket: (windowId: string, signal: AbortSignal) => Promise<void>;
+  /** Closes follow-up work, database pools, and the outer server/tunnel seam. */
+  readonly closeResources: (signal: AbortSignal) => Promise<void>;
+  /** Stops new HTTP acceptance synchronously before asynchronous teardown begins. */
+  readonly stopAccepting?: () => void;
+  /** A failed check disables only explicit latest-to-observation materialization. */
+  readonly verifyMarketMaterializer?: (signal: AbortSignal) => Promise<boolean>;
+  readonly heartbeat?: (
+    heartbeat: HybridRuntimeHeartbeat,
+    signal: AbortSignal,
+  ) => Promise<void>;
+  readonly stopTimeoutMs?: number;
+}
+
+export interface HybridRuntimeHeartbeat {
+  readonly component: "CODEX" | "MARKET";
+  readonly status: "HEALTHY" | "DEGRADED" | "OFFLINE";
+  readonly safeCode: null | "DATABASE_UNAVAILABLE" | "PROVIDER_UNAVAILABLE" | "WORKER_OFFLINE";
+}
+
+export interface HybridRuntimeStatus {
+  readonly accepting: boolean;
+  readonly codexAvailable: boolean;
+  readonly marketMaterializationAvailable: boolean;
+  readonly modelActive: boolean;
+  readonly marketActive: boolean;
+}
+
+export interface HybridRuntimeController {
+  start(): Promise<void>;
+  enqueue(wake: HybridRuntimeWake): void;
+  wake(wake: HybridRuntimeWake): Promise<void>;
+  wakeModelDrain(): Promise<void>;
+  wakeMarketWindow(windowId: string): Promise<void>;
+  stop(timeoutMs?: number): Promise<void>;
+  status(): HybridRuntimeStatus;
+}
+
+type HybridControllerState = "NEW" | "STARTING" | "READY" | "STOPPING" | "STOPPED";
+
+function runtimeConfiguration(
+  options: HybridRuntimeControllerOptions,
+): { readonly stopTimeoutMs: number } {
+  if (!options || typeof options !== "object"
+    || !options.container || typeof options.container.verifyReady !== "function"
+    || typeof options.container.reconcile !== "function"
+    || typeof options.container.stop !== "function"
+    || typeof options.container.proveAbsent !== "function"
+    || typeof options.recoverMarket !== "function"
+    || typeof options.drainModel !== "function"
+    || typeof options.pollMarket !== "function"
+    || typeof options.closeResources !== "function"
+    || options.stopAccepting !== undefined && typeof options.stopAccepting !== "function"
+    || options.verifyMarketMaterializer !== undefined
+      && typeof options.verifyMarketMaterializer !== "function"
+    || options.heartbeat !== undefined && typeof options.heartbeat !== "function") {
+    throw new Error("HYBRID_RUNTIME_OPTIONS_INVALID");
+  }
+  const stopTimeoutMs = options.stopTimeoutMs ?? HYBRID_STOP_TIMEOUT_MS;
+  if (!Number.isSafeInteger(stopTimeoutMs)
+    || stopTimeoutMs < 1
+    || stopTimeoutMs > HYBRID_STOP_TIMEOUT_MS) {
+    throw new Error("HYBRID_RUNTIME_OPTIONS_INVALID");
+  }
+  return Object.freeze({ stopTimeoutMs });
+}
+
+function exactRuntimeWake(value: HybridRuntimeWake): HybridRuntimeWake {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("HYBRID_WAKE_INVALID");
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 1) throw new Error("HYBRID_WAKE_INVALID");
+  if (keys[0] === "jobId"
+    && "jobId" in value
+    && typeof value.jobId === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+      .test(value.jobId)) {
+    return Object.freeze({ jobId: value.jobId });
+  }
+  if (keys[0] === "windowId"
+    && "windowId" in value
+    && typeof value.windowId === "string") {
+    marketWindowStart(value.windowId);
+    return Object.freeze({ windowId: value.windowId });
+  }
+  throw new Error("HYBRID_WAKE_INVALID");
+}
+
+function boundedTeardown<Result>(
+  timeoutMs: number,
+  work: (signal: AbortSignal) => Promise<Result>,
+): Promise<Result> {
+  const controller = new AbortController();
+  return new Promise<Result>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    const timer = setTimeout(() => {
+      controller.abort();
+      finish(() => reject(new Error("HYBRID_STOP_TIMEOUT")));
+    }, timeoutMs);
+    timer.unref?.();
+    void work(controller.signal).then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+  });
+}
+
+/**
+ * One-shot controller used by the signed server and by deterministic tests.
+ * It owns no interval: durable wakes and startup recovery are the schedulers.
+ */
+export function createHybridRuntimeController(
+  options: HybridRuntimeControllerOptions,
+): HybridRuntimeController {
+  const configuration = runtimeConfiguration(options);
+  let state: HybridControllerState = "NEW";
+  let codexAvailable = false;
+  let marketMaterializationAvailable = false;
+  let startPromise: Promise<void> | undefined;
+  let stopPromise: Promise<void> | undefined;
+  let modelPromise: Promise<void> | undefined;
+  let modelWakePending = false;
+  let marketPromise: Promise<void> | undefined;
+  let activeMarketWindow: string | undefined;
+  let pendingMarketWindow: string | undefined;
+  const workController = new AbortController();
+
+  const requireReady = () => {
+    if (state === "STOPPING" || state === "STOPPED") {
+      throw new Error("HYBRID_RUNTIME_STOPPED");
+    }
+    if (state !== "READY") throw new Error("HYBRID_RUNTIME_NOT_READY");
+  };
+
+  const assertStarting = () => {
+    if (state !== "STARTING" || workController.signal.aborted) {
+      throw new Error("HYBRID_RUNTIME_START_ABORTED");
+    }
+  };
+
+  const start = (): Promise<void> => {
+    if (state === "READY") return Promise.resolve();
+    if (startPromise) return startPromise;
+    if (state !== "NEW") return Promise.reject(new Error("HYBRID_RUNTIME_STOPPED"));
+    state = "STARTING";
+    startPromise = (async () => {
+      try {
+        await options.container.reconcile(workController.signal);
+        assertStarting();
+        // T7's named-pipe lease must reject a competing host before any
+        // readiness probe can touch Docker.
+        await options.container.verifyReady(workController.signal);
+        assertStarting();
+        if (!await options.container.proveAbsent(workController.signal)) {
+          throw new Error("CODEX_CONTAINER_RECONCILIATION_FAILED");
+        }
+        assertStarting();
+        codexAvailable = true;
+        await options.heartbeat?.(Object.freeze({
+          component: "CODEX",
+          status: "HEALTHY",
+          safeCode: null,
+        }), workController.signal);
+        assertStarting();
+        if (options.verifyMarketMaterializer) {
+          try {
+            marketMaterializationAvailable = await options.verifyMarketMaterializer(
+              workController.signal,
+            );
+          } catch {
+            marketMaterializationAvailable = false;
+          }
+          assertStarting();
+        }
+        // No current-window wake is accepted until bounded no-repoll recovery settles.
+        await options.recoverMarket(workController.signal);
+        assertStarting();
+        // Durable jobs survive a lost wake. Drain them once before opening the
+        // socket, then coalesced wakes own all later drains.
+        await options.drainModel(workController.signal);
+        assertStarting();
+        await options.heartbeat?.(Object.freeze({
+          component: "MARKET",
+          status: marketMaterializationAvailable ? "HEALTHY" : "DEGRADED",
+          safeCode: marketMaterializationAvailable ? null : "DATABASE_UNAVAILABLE",
+        }), workController.signal);
+        assertStarting();
+        state = "READY";
+      } catch {
+        await options.heartbeat?.(Object.freeze({
+          component: "CODEX",
+          status: "OFFLINE",
+          safeCode: "PROVIDER_UNAVAILABLE",
+        }), workController.signal).catch(() => undefined);
+        const failedState = state as HybridControllerState;
+        if (failedState !== "STOPPING") state = "STOPPED";
+        codexAvailable = false;
+        marketMaterializationAvailable = false;
+        workController.abort();
+        throw new Error("HYBRID_RUNTIME_START_FAILED");
+      }
+    })();
+    return startPromise;
+  };
+
+  const wakeModelDrain = (): Promise<void> => {
+    try {
+      requireReady();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!codexAvailable) return Promise.reject(new Error("CODEX_COMPONENT_OFFLINE"));
+    if (modelPromise) {
+      modelWakePending = true;
+      return modelPromise;
+    }
+    modelPromise = (async () => {
+      do {
+        modelWakePending = false;
+        await options.drainModel(workController.signal);
+      } while (modelWakePending && !workController.signal.aborted);
+    })().finally(() => {
+      modelWakePending = false;
+      modelPromise = undefined;
+    });
+    return modelPromise;
+  };
+
+  const wakeMarketWindow = (windowId: string): Promise<void> => {
+    try {
+      requireReady();
+      marketWindowStart(windowId);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (marketPromise) {
+      if (windowId !== activeMarketWindow) pendingMarketWindow = windowId;
+      return marketPromise;
+    }
+    activeMarketWindow = windowId;
+    marketPromise = (async () => {
+      while (activeMarketWindow && !workController.signal.aborted) {
+        const currentWindow = activeMarketWindow;
+        await options.pollMarket(currentWindow, workController.signal);
+        activeMarketWindow = pendingMarketWindow;
+        pendingMarketWindow = undefined;
+      }
+    })().finally(() => {
+      activeMarketWindow = undefined;
+      pendingMarketWindow = undefined;
+      marketPromise = undefined;
+    });
+    return marketPromise;
+  };
+
+  const stop = (timeoutMs = configuration.stopTimeoutMs): Promise<void> => {
+    if (!Number.isSafeInteger(timeoutMs)
+      || timeoutMs < 1
+      || timeoutMs > configuration.stopTimeoutMs) {
+      return Promise.reject(new Error("HYBRID_STOP_TIMEOUT_INVALID"));
+    }
+    if (stopPromise) return stopPromise;
+    if (state === "STOPPED" && !startPromise) {
+      return Promise.reject(new Error(
+        codexAvailable ? "HYBRID_RUNTIME_STOPPED" : "CODEX_CONTAINER_TERMINATION_UNPROVEN",
+      ));
+    }
+    state = "STOPPING";
+    try {
+      options.stopAccepting?.();
+    } catch {
+      // Acceptance is also blocked by state; teardown must continue.
+    }
+    workController.abort();
+    stopPromise = boundedTeardown(timeoutMs, async (stopSignal) => {
+      // A startup stage must observe the abort and settle before the same
+      // bounded authority reconciles container state under T7's lease.
+      await Promise.allSettled([startPromise ?? Promise.resolve()]);
+      if (options.heartbeat) {
+        await Promise.allSettled([
+          options.heartbeat(Object.freeze({
+            component: "CODEX", status: "OFFLINE", safeCode: "WORKER_OFFLINE",
+          }), stopSignal),
+          options.heartbeat(Object.freeze({
+            component: "MARKET", status: "OFFLINE", safeCode: "WORKER_OFFLINE",
+          }), stopSignal),
+        ]);
+      }
+      await Promise.allSettled([
+        modelPromise ?? Promise.resolve(),
+        marketPromise ?? Promise.resolve(),
+      ]);
+      await options.container.stop(stopSignal);
+      await options.closeResources(stopSignal);
+      if (!await options.container.proveAbsent(stopSignal)) {
+        throw new Error("CODEX_CONTAINER_TERMINATION_UNPROVEN");
+      }
+    }).then(() => {
+      codexAvailable = false;
+      marketMaterializationAvailable = false;
+      state = "STOPPED";
+    }, () => {
+      codexAvailable = false;
+      marketMaterializationAvailable = false;
+      state = "STOPPED";
+      throw new Error("CODEX_CONTAINER_TERMINATION_UNPROVEN");
+    });
+    return stopPromise;
+  };
+
+  return Object.freeze({
+    start,
+    enqueue(wake: HybridRuntimeWake): void {
+      requireReady();
+      const exact = exactRuntimeWake(wake);
+      const work = "jobId" in exact
+        ? wakeModelDrain()
+        : wakeMarketWindow(exact.windowId);
+      void work.catch(() => {
+        // Durable job/window authority remains pending or terminalized by its
+        // worker path. HTTP acknowledgement is intentionally decoupled.
+      });
+    },
+    wake(wake: HybridRuntimeWake): Promise<void> {
+      const exact = exactRuntimeWake(wake);
+      return "jobId" in exact
+        ? wakeModelDrain()
+        : wakeMarketWindow(exact.windowId);
+    },
+    wakeModelDrain,
+    wakeMarketWindow,
+    stop,
+    status(): HybridRuntimeStatus {
+      return Object.freeze({
+        accepting: state === "READY",
+        codexAvailable,
+        marketMaterializationAvailable,
+        modelActive: modelPromise !== undefined,
+        marketActive: marketPromise !== undefined,
+      });
+    },
+  });
 }

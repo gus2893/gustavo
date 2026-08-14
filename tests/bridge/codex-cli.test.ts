@@ -820,6 +820,55 @@ describe("container-isolated Codex runner", () => {
     await expect(first).resolves.toEqual({ reconciled: true });
   });
 
+  it("propagates reconcile cancellation without releasing its lease before helper settlement", async () => {
+    const external = new AbortController();
+    const releaseLease = vi.fn(async () => undefined);
+    let announceInspect!: () => void;
+    let settleInspect!: () => void;
+    let helperSignal: AbortSignal | undefined;
+    const inspectBegan = new Promise<void>((resolveBegan) => { announceInspect = resolveBegan; });
+    const inspectGate = new Promise<{
+      readonly daemonAvailable: true;
+      readonly exists: false;
+    }>((resolveInspect) => {
+      settleInspect = () => resolveInspect({ daemonAvailable: true, exists: false });
+    });
+    const controller = emptyController();
+    controller.acquireHostLease = vi.fn(async () => ({ release: releaseLease }));
+    controller.inspect = vi.fn(async ({ signal }) => {
+      helperSignal = signal;
+      announceInspect();
+      return inspectGate;
+    });
+    const reconciliation = reconcileCodexContainers({
+      image: IMAGE,
+      controller,
+      signal: external.signal,
+    });
+    void reconciliation.catch(() => undefined);
+    await inspectBegan;
+
+    try {
+      external.abort();
+      await Promise.resolve();
+      expect(helperSignal?.aborted).toBe(true);
+      expect(releaseLease).not.toHaveBeenCalled();
+
+      const overlap = emptyController();
+      await expect(reconcileCodexContainers({ image: IMAGE, controller: overlap }))
+        .rejects.toThrow(/^CODEX_CONTAINER_RECONCILIATION_FAILED$/u);
+      expect(overlap.acquireHostLease).not.toHaveBeenCalled();
+    } finally {
+      settleInspect();
+      await reconciliation.catch(() => undefined);
+    }
+
+    await expect(reconciliation).rejects.toThrow(/^CODEX_CONTAINER_RECONCILIATION_FAILED$/u);
+    expect(releaseLease).toHaveBeenCalledOnce();
+    await expect(reconcileCodexContainers({ image: IMAGE, controller: emptyController() }))
+      .resolves.toEqual({ reconciled: true });
+  });
+
   it("retains execution ownership after a bounded timeout until the underlying promise settles", async () => {
     vi.useFakeTimers();
     try {
