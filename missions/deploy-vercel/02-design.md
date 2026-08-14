@@ -37,7 +37,7 @@
    - QStash calls one authenticated bounded Vercel maintenance route every 15 minutes for cache, privacy, stream, and schedule steps.
    - QStash calls the local Tailscale Funnel market wake every five minutes; direct chat sends an extra signed opaque-job wake.
    - Neon is the correctness boundary: lost wake/pubsub messages leave durable work pending for startup/reconnect recovery.
-   - SSE closes within Vercel duration and reconnects through the existing ordered `Last-Event-ID` database cursor.
+   - SSE installs one cancellation authority before authentication, stops admission by 54 seconds, settles all admitted authentication/revalidation/body-load/subscription work, and closes by 55 seconds; reconnect uses the existing ordered `Last-Event-ID` database cursor.
 
 6. **R6 — Fail closed at a hard $0 ceiling** → Story 6 / AC1–AC4.
    - Use Vercel Hobby, Neon Free, Upstash Redis Free, QStash Free, Tailscale Free personal, Finnhub Free personal, and existing ChatGPT/Codex entitlement only.
@@ -154,7 +154,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 
 - `POST /api/internal/maintenance` accepts a valid QStash signature for the exact production URL/body only.
 - An advisory lock prevents overlap; a deadline below 55 seconds bounds cache invalidation, forget propagation, stream publication, due cycles, and stale bridge leases.
-- SSE has a 55-second maximum, bounded heartbeats/cleanup, and reconnects through existing ordered database replay.
+- SSE has a 55-second maximum and one shared idempotent abort-and-settle pump. The pump owns active authentication, authorization, protected loading, replay/pubsub iteration, queue backpressure, source close, iterator return, and response completion; cancellation may discard output but may not leave database/decryption or Redis work detached. Heartbeats and queues remain bounded, and reconnect uses existing ordered database replay.
 - The initial deployment manifest may configure the existing SSE route. The maintenance duration entry is added only in the same task/commit that creates `app/api/internal/maintenance/route.ts`, preventing Vercel's unmatched-function-pattern deployment error.
 
 ### New files
@@ -182,6 +182,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `lib/server/dal/account-surfaces.ts`, `app/(account)/chat/page.tsx`, `components/chat/Conversation.tsx`: pending/failed/offline state and market link.
 - `lib/server/observability/metrics.ts`, `app/api/operator/health/route.ts`: safe hybrid/quota health.
 - `app/api/feed/stream/route.ts`: Vercel duration/reconnect hardening.
+- `lib/server/stream/events.ts`: shared cancellation-owned stream pump that settles active projection and source/iterator cleanup before response completion.
 - `scripts/issue-invitation.ts`: canonical redemption URL mode.
 - `infra/env.example`, `docs/{OPERATIONS,PRODUCTION_CHECKLIST,SMOKE_TEST}.md`: deployment mode/runbook links.
 - `scripts/{setup-hybrid-worker,start-hybrid-worker}.ps1`, `infra/env.example`, and hybrid production tests: provision/validate the local-only materializer URL without printing or forwarding it to Vercel or the Codex container.
@@ -255,7 +256,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `tests/market-data/finnhub-poller.test.ts`: exact 95, pacing/caps, 429/unavailable, closed session, encryption/public exclusion.
 - `tests/infra/hybrid-worker.test.ts`: startup, one active job, priority, recovery, heartbeat, loopback binding, safe logs.
 - `tests/ui/account-surfaces.test.tsx`: bridge state and auth-first 95 dashboard.
-- `tests/stream/sse-authorization.test.ts`: bounded reconnect and ordered replay.
+- `tests/stream/sse-authorization.test.ts`: bounded reconnect, ordered replay, queue-full cancellation, and proof that authentication/revalidation/protected loading/source iteration settle before response completion.
 - `tests/privacy/forget-propagation.test.ts`, `tests/cache/postgres.test.ts`: one-shot maintenance preserves fences.
 - `tests/e2e/gustavo-hybrid-production.spec.ts`: fresh invite, fake-Codex roles, fake-Finnhub 95, offline/recovery, public redaction, no copied data.
 
@@ -337,6 +338,11 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
   - Revised intent: successful windows still complete inside their five-minute interval; a retained prior `PENDING` row may transition exactly once to `FAILED` using database time before its seven-day `prune_after`, with no provider call, latest mutation, quota re-reservation, or second poll. Rows at/after `prune_after` are cleanup-only.
   - Preserved intent: fixed 95-symbol results for live polls, 96-call ceiling, one reservation per window, database-owned transition time, terminal immutability, seven-day summary retention, and explicit safe degraded state.
 - 2026-08-14 late-market-recovery update approved under the user's standing instruction to “Proceed with all without needed input”; T14, T15, T18, T21, T22, and T23 require regeneration before their affected execution resumes.
+- 2026-08-14 prompt-update: move SSE abort-and-settle ownership into the shared stream pump after `debug-t17-queue-finalization.md` exhausted three route-only cancellation fixes while an active `openFeedStream` pull remained unsettled.
+  - Previous intent: “SSE closes within Vercel duration and reconnects through the existing ordered `Last-Event-ID` database cursor.”
+  - Previous system design: “SSE has a 55-second maximum, bounded heartbeats/cleanup, and reconnects through existing ordered database replay.”
+  - Revised intent: install lifecycle authority before authentication, stop admission by 54 seconds, and make one shared idempotent pump abort and await all admitted authentication/revalidation/protected-load, replay/pubsub, backpressure, source, iterator, and response work before the 55-second close. No database/decryption or Redis promise may remain detached; durable cursor and authorization semantics are unchanged.
+- 2026-08-14 SSE cancellation-authority update approved under the user's standing instruction to “Proceed with all without needed input”; T17 and the T23 verification delta require regeneration before execution resumes.
 
 ## Self-review checklist
 

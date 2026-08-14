@@ -343,6 +343,7 @@ describe("Vercel hybrid deployment contract", () => {
     });
     expect(vercel.functions).toEqual({
       "app/api/feed/stream/route.ts": { maxDuration: 60 },
+      "app/api/internal/maintenance/route.ts": { maxDuration: 60 },
     });
     const bridgeFlag = "GUSTAVO_HYBRID_BRIDGE_ENABLED";
     const corepackFlag = "ENABLE_EXPERIMENTAL_COREPACK";

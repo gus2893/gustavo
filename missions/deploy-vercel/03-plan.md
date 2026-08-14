@@ -1207,10 +1207,10 @@ Yes. It introduces one authenticated hosted endpoint by composing existing bound
 
 ---
 
-### T17 — Bound SSE to Vercel duration while preserving ordered database replay
+### T17 — Bound SSE and settle every admitted operation before close
 
 **Maps to:** R1, R5
-**Files touched:** `app/api/feed/stream/route.ts` (modify), `tests/stream/sse-authorization.test.ts` (modify)
+**Files touched:** `lib/server/stream/events.ts` (modify), `app/api/feed/stream/route.ts` (modify), `tests/stream/sse-authorization.test.ts` (modify), `tests/deployment/vercel-hybrid.test.ts` (regression-only exact T16 manifest expectation), approved `debug-t17-*.md` records (new)
 
 #### Red — failing test
 
@@ -1218,55 +1218,99 @@ File: `tests/stream/sse-authorization.test.ts`
 
 ```ts
 import { describe, expect, it, vi } from "vitest";
-import { streamAuthorizedEvents } from "../../app/api/feed/stream/route";
+import { createFeedStreamHandler } from "../../app/api/feed/stream/route";
+import type { EventIdSource } from "../../lib/server/stream/events";
 
-describe("Vercel SSE lifecycle", () => {
-  it("closes by 55 seconds and resumes after the last emitted durable cursor", async () => {
-    let now = 0;
-    const load = vi.fn().mockResolvedValue([])
-      .mockResolvedValueOnce([{ cursor: "sse.v1:41:event-a", eventId: "event-a" }])
-      .mockResolvedValueOnce([{ cursor: "sse.v1:42:event-b", eventId: "event-b" }]);
-    const emitted: string[] = [];
-
-    const result = await streamAuthorizedEvents({
-      lastEventId: "sse.v1:40:event-z",
-      now: () => now,
-      sleep: async (ms) => { now += ms; },
-      load,
-      authorize: vi.fn().mockResolvedValue(true),
-      emit: async (event) => { emitted.push(event.cursor); },
-      maxDurationMs: 55_000,
+describe("Vercel SSE cancellation authority", () => {
+  it("settles a queue-full producer, source, active pull, and response cancel", async () => {
+    const controller = new AbortController();
+    let nextCount = 0;
+    let queueFull!: () => void;
+    let finalized!: () => void;
+    const queueFullPromise = new Promise<void>((resolve) => { queueFull = resolve; });
+    const finalizedPromise = new Promise<void>((resolve) => { finalized = resolve; });
+    const source: EventIdSource = {
+      close: vi.fn(),
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<string>> {
+            nextCount += 1;
+            if (nextCount >= 102) queueFull();
+            return { done: false, value: `private-${nextCount}` };
+          },
+          async return(): Promise<IteratorResult<string>> {
+            finalized();
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    const handler = createFeedStreamHandler({
+      authenticate: async () => ({
+        actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+        revalidate: async () => true,
+      }),
+      subscribe: () => source,
+      load: async (_actor, eventId) => ({
+        id: eventId,
+        visibility: "PRIVATE_ACCOUNT",
+        accountId: "acct-a",
+      }),
     });
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream", {
+      signal: controller.signal,
+    }));
+    await expect(Promise.race([
+      queueFullPromise.then(() => "QUEUE_FULL" as const),
+      new Promise<"QUEUE_NOT_REACHED">((resolve) => (
+        setTimeout(() => resolve("QUEUE_NOT_REACHED"), 100)
+      )),
+    ])).resolves.toBe("QUEUE_FULL");
 
-    expect(result.reason).toBe("DURATION_BOUND");
-    expect(emitted).toEqual(["sse.v1:41:event-a", "sse.v1:42:event-b"]);
-    expect(load.mock.calls[1][0]).toMatchObject({ after: "sse.v1:41:event-a" });
+    controller.abort();
+
+    await expect(Promise.race([
+      finalizedPromise.then(() => "FINALIZED" as const),
+      new Promise<"HUNG">((resolve) => setTimeout(() => resolve("HUNG"), 100)),
+    ])).resolves.toBe("FINALIZED");
+    expect(source.close).toHaveBeenCalledOnce();
+    await expect(Promise.race([
+      response.body!.cancel().then(() => "CANCELLED" as const),
+      new Promise<"CANCEL_HUNG">((resolve) => (
+        setTimeout(() => resolve("CANCEL_HUNG"), 100)
+      )),
+    ])).resolves.toBe("CANCELLED");
   });
 });
 ```
 
-Expected initial state: TypeScript compilation fails because the route does not export `streamAuthorizedEvents` with a duration bound.
+Expected initial state: the queue and source finalize, but `response.body.cancel()` remains pending and the assertion receives `CANCEL_HUNG`. `debug-t17-queue-finalization.md` records the three exhausted route-only attempts.
 
 #### Green — minimum implementation
 
-- Extract the existing authorized replay/live loop into the injected core shown above without changing cursor format or database authority.
-- Subscribe before replay, re-authorize before protected body load and before emit, page all allocated stream positions, and deduplicate live/replay overlap.
-- Stop accepting new work by 54 seconds, emit no protected shutdown payload, close subscription/iterator, and let the browser reconnect with the last emitted cursor.
-- Export `maxDuration = 60` and retain private no-store SSE headers, heartbeat bounds, queue bounds, cancellation cleanup, and fail-closed malformed cursor handling.
+- In `lib/server/stream/events.ts`, make `openFeedStream().readable()` own one idempotent settle promise. Request abort and consumer cancel stop new pulls, wake any active wait, await the active projection/revalidation/load, close the source, call iterator return exactly once, then close or cancel the readable.
+- In the route, install the 54-second lifecycle before authentication. Pass its signal and remaining monotonic budget into authentication, revalidation, protected loading, replay, and Redis subscription; use the existing bounded database transaction adapter so each admitted database/decryption operation actually settles.
+- Keep Redis connect bounded by remaining time; route/source close destroys the exact active client and awaits the generator. Wake every queue writer on abort so backpressure cannot retain the producer.
+- Retain the already-captured deterministic regressions named `aborts and awaits a non-resolving revalidator before source cleanup`, `awaits protected-load cancellation settlement before closing the response`, and `installs the 54-second lifecycle before authentication and awaits its abort`.
+- Preserve the original T17 contract: subscribe before replay; page all allocated positions; deduplicate live/replay overlap; reauthorize before protected load and before emit; stop admission by 54 seconds; close by 55 seconds without a protected shutdown payload; export `maxDuration = 60`; retain private no-store headers, bounded heartbeats/queues, and fail-closed cursor parsing.
 
 #### Refactor
 
-- Use one finalizer for duration, abort, backpressure, authorization loss, and source close.
+- Remove the route-owned readable wrapper and route all duration, request-abort, consumer-cancel, authorization-loss, backpressure, and source-close paths through the shared stream settle authority.
 
 #### Verify
 
 Command: `pnpm vitest run tests/stream/sse-authorization.test.ts`
 
-Expected: all existing SSE tests plus duration/reconnect pass, zero fail, exit code 0.
+Expected: the queue-full, authentication, revalidation, protected-load, duration/reconnect, and all pre-existing SSE tests pass; zero fail; exit code 0.
+
+Command: `pnpm exec tsc --noEmit`
+
+Expected: zero diagnostics, exit code 0.
 
 #### Reviewable as a unit?
 
-Yes. It is confined to one existing stream route and its focused suite.
+Yes. The shared pump and route wiring are one cancellation authority; splitting them would leave an intermediate tree that can still detach active work or hang response cancellation.
 
 ---
 
@@ -1683,6 +1727,7 @@ Expected initial state: with live verification enabled before cutover, the curre
 - Install/sign in the isolated local worker account, Docker Desktop, the pinned local Codex image/auth volume, Tailscale, and Finnhub key; verify the recorded image digest and internal timeout, start the exact loopback/Funnel controller, and create only the 15-minute maintenance and five-minute market QStash schedules.
 - Run Preview smoke, public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, container kill/wait and startup-reconciliation rehearsal, and quota boundary checks before production promotion.
 - Rehearse a retained prior market window and an already pruned one: prove no historical repoll or quota re-reservation, one bounded failed summary before retention expiry, cleanup-only afterward, and a normal current-window poll.
+- Run the regenerated focused SSE suite before cutover and retain its queue-full, active-authentication, active-revalidation, protected-load, source/iterator, response-cancel, and ordered durable reconnect proofs.
 - Promote that exact Ready deployment, verify apex TLS and `www` redirect, then rehearse flags-first local/schedule rollback while confirming the hosted public/history surfaces remain available; restore the verified production state afterward.
 - Run the live test with the Vercel token supplied through the process environment; never write tokens or resource URLs containing credentials to disk or command arguments.
 
@@ -1695,13 +1740,14 @@ Expected initial state: with live verification enabled before cutover, the curre
 Commands, in order:
 
 1. `pnpm install --frozen-lockfile`
-2. `pnpm test`
-3. `pnpm tsc --noEmit`
-4. `pnpm build`
-5. `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1`
-6. `pnpm playwright test tests/e2e/gustavo-hybrid-production.spec.ts --workers=1`
-7. `$env:GUSTAVO_RUN_LIVE_VERCEL_VERIFY='1'; pnpm vitest run tests/deployment/vercel-hybrid.test.ts -t "serves the Ready Node-24 deployment on the canonical domains without public leakage"`
-8. `git diff --check`
+2. `pnpm vitest run tests/stream/sse-authorization.test.ts`
+3. `pnpm test`
+4. `pnpm tsc --noEmit`
+5. `pnpm build`
+6. `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1`
+7. `pnpm playwright test tests/e2e/gustavo-hybrid-production.spec.ts --workers=1`
+8. `$env:GUSTAVO_RUN_LIVE_VERCEL_VERIFY='1'; pnpm vitest run tests/deployment/vercel-hybrid.test.ts -t "serves the Ready Node-24 deployment on the canonical domains without public leakage"`
+9. `git diff --check`
 
 Expected: every command exits 0; full unit/integration and focused Playwright suites have zero failures; validator reports a fresh build with no public leak; the live deployment test passes; only design-listed mission files and approved mission artifacts differ; `AGENTS.md` is byte-for-byte untouched by the mission.
 
@@ -1727,5 +1773,6 @@ Yes. All code is already green before this task; this unit contains named extern
 - [x] The final task verifies the full suite, typecheck, build, validator, browser story, live Preview/production state, diff hygiene, and resource cleanup.
 - [x] Prompt-update impact is resolved: T7 is fully regenerated and T8/T15/T19/T21/T22/T23 explicitly use the container authority without weakening unchanged T1–T6 behavior.
 - [x] Market-materializer prompt-update impact is resolved: T13 defines the role-separated binding boundary; T15 provisions it locally; T21 documents it; T22 proves distinct identities; T23 provisions/verifies it without exposing the URL to Vercel.
+- [x] SSE cancellation-authority prompt-update impact is resolved: T17 owns active work through the shared stream pump and T23 reruns its focused cancellation/reconnect gate before cutover.
 
 Plan approved. Next: `mcax-execute`.

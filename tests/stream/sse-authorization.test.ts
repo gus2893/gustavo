@@ -9,7 +9,9 @@ import {
 import {
   createFeedStreamHandler,
   loadStreamEvent,
+  maxDuration,
   resumeEventIds,
+  streamAuthorizedEvents,
 } from "../../app/api/feed/stream/route";
 import { appendEvent } from "../../lib/server/events/store";
 import type { EventDatabase } from "../../lib/server/events/types";
@@ -25,6 +27,521 @@ const fixtures: Record<string, { id: string; visibility: string; accountId?: str
   "private-a": { id: "private-a", visibility: "PRIVATE_ACCOUNT", accountId: "acct-a", text: "private-a text" },
   "private-b": { id: "private-b", visibility: "PRIVATE_ACCOUNT", accountId: "acct-b", text: "private-b text" },
 };
+
+describe("Vercel SSE lifecycle", () => {
+  it("closes by 55 seconds and resumes after the last emitted durable cursor", async () => {
+    let now = 0;
+    const load = vi.fn().mockResolvedValue([])
+      .mockResolvedValueOnce([{ cursor: "sse.v1:41:event-a", eventId: "event-a" }])
+      .mockResolvedValueOnce([{ cursor: "sse.v1:42:event-b", eventId: "event-b" }]);
+    const emitted: string[] = [];
+
+    const result = await streamAuthorizedEvents({
+      lastEventId: "sse.v1:40:event-z",
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+      load,
+      authorize: vi.fn().mockResolvedValue(true),
+      emit: async (event) => { emitted.push(event.cursor); },
+      maxDurationMs: 55_000,
+    });
+
+    expect(result.reason).toBe("DURATION_BOUND");
+    expect(emitted).toEqual(["sse.v1:41:event-a", "sse.v1:42:event-b"]);
+    expect(load.mock.calls[1][0]).toMatchObject({ after: "sse.v1:41:event-a" });
+  });
+
+  it("subscribes before replay, pages allocated positions, deduplicates overlap, and finalizes once", async () => {
+    let now = 0;
+    const order: string[] = [];
+    const close = vi.fn(async () => { order.push("close"); });
+    const pages = [
+      [
+        { cursor: "sse.v1:41:event-a", eventId: "event-a" },
+        { cursor: "sse.v1:42:event-b", eventId: "event-b" },
+      ],
+      [
+        { cursor: "sse.v1:42:event-b", eventId: "event-b" },
+        { cursor: "sse.v1:43:event-c", eventId: "event-c" },
+      ],
+      [],
+    ];
+
+    const result = await streamAuthorizedEvents({
+      lastEventId: "sse.v1:40:event-z",
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+      subscribe: async () => {
+        order.push("subscribe");
+        return { close };
+      },
+      load: async ({ after }) => {
+        order.push(`load:${after}`);
+        return pages.shift() ?? [];
+      },
+      authorize: async () => {
+        order.push("authorize");
+        return true;
+      },
+      loadProtected: async (event) => {
+        order.push(`body:${event.eventId}`);
+        return event;
+      },
+      emit: async (event) => { order.push(`emit:${event.eventId}`); },
+      maxDurationMs: 55_000,
+    });
+
+    expect(order[0]).toBe("subscribe");
+    expect(order).toContain("load:sse.v1:42:event-b");
+    expect(order.filter((item) => item.startsWith("body:"))).toEqual([
+      "body:event-a", "body:event-b", "body:event-c",
+    ]);
+    expect(order.filter((item) => item.startsWith("emit:"))).toEqual([
+      "emit:event-a", "emit:event-b", "emit:event-c",
+    ]);
+    for (const prefix of ["body:", "emit:"]) {
+      for (const index of order.keys()) {
+        if (order[index]?.startsWith(prefix)) expect(order[index - 1]).toBe("authorize");
+      }
+    }
+    expect(close).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      reason: "DURATION_BOUND",
+      lastEmittedCursor: "sse.v1:43:event-c",
+    });
+  });
+
+  it("fails closed before protected loading when authorization is lost", async () => {
+    const loadProtected = vi.fn();
+    const emit = vi.fn();
+    const result = await streamAuthorizedEvents({
+      lastEventId: "sse.v1:40:event-z",
+      now: () => 0,
+      sleep: async () => undefined,
+      load: vi.fn().mockResolvedValue([
+        { cursor: "sse.v1:41:event-a", eventId: "event-a" },
+      ]),
+      authorize: vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false),
+      loadProtected,
+      emit,
+      maxDurationMs: 55_000,
+    });
+
+    expect(result.reason).toBe("AUTHORIZATION_LOST");
+    expect(loadProtected).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("exports the Vercel route duration and rejects malformed cursors before auth", async () => {
+    expect(maxDuration).toBe(60);
+    const authenticate = vi.fn();
+    const subscribe = vi.fn();
+    const handler = createFeedStreamHandler({
+      authenticate,
+      subscribe,
+      load: vi.fn(),
+      validateLastEventId: (value) => { parseStreamCursor(value); },
+    });
+
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream", {
+      headers: { "Last-Event-ID": "sse.v1:0:not-authority" },
+    }));
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(authenticate).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it("counts authentication time against the 54-second admission boundary", async () => {
+    let now = 0;
+    const subscribe = vi.fn(() => [] as const);
+    const handler = createFeedStreamHandler({
+      authenticate: async () => {
+        now = 54_000;
+        return {
+          actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+          revalidate: async () => true,
+        };
+      },
+      subscribe,
+      load: async () => undefined,
+      monotonicNow: () => now,
+    });
+
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream"));
+
+    expect(await response.text()).toBe("");
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it("does not emit a protected event when cancellation wins its body load", async () => {
+    const controller = new AbortController();
+    let loading!: () => void;
+    let release!: (event: typeof fixtures["private-a"]) => void;
+    const loadingPromise = new Promise<void>((resolve) => { loading = resolve; });
+    const loaded = new Promise<typeof fixtures["private-a"]>((resolve) => { release = resolve; });
+    const handler = createFeedStreamHandler({
+      authenticate: async () => ({
+        actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+        revalidate: async () => true,
+      }),
+      subscribe: () => ["private-a"],
+      load: async () => {
+        loading();
+        return loaded;
+      },
+      heartbeatMs: 60_000,
+    });
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream", {
+      signal: controller.signal,
+    }));
+    const reading = response.body!.getReader().read();
+    await loadingPromise;
+
+    controller.abort();
+    release(fixtures["private-a"]);
+
+    expect(await reading).toEqual({ done: true, value: undefined });
+  });
+
+  it("does not subscribe when the request is cancelled before the first pull", async () => {
+    const controller = new AbortController();
+    const subscribe = vi.fn(() => [] as const);
+    const handler = createFeedStreamHandler({
+      authenticate: async () => ({
+        actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+        revalidate: async () => true,
+      }),
+      subscribe,
+      load: async () => undefined,
+    });
+    controller.abort();
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream", {
+      signal: controller.signal,
+    }));
+
+    expect(await response.text()).toBe("");
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it("settles a queue-full producer and finalizes its source when a non-reader aborts", async () => {
+    const controller = new AbortController();
+    let nextCount = 0;
+    let queueFull!: () => void;
+    let finalized!: () => void;
+    const queueFullPromise = new Promise<void>((resolve) => { queueFull = resolve; });
+    const finalizedPromise = new Promise<void>((resolve) => { finalized = resolve; });
+    const source: EventIdSource = {
+      close: vi.fn(),
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<string>> {
+            nextCount += 1;
+            if (nextCount >= 102) queueFull();
+            return { done: false, value: `private-${nextCount}` };
+          },
+          async return(): Promise<IteratorResult<string>> {
+            finalized();
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    const handler = createFeedStreamHandler({
+      authenticate: async () => ({
+        actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+        revalidate: async () => true,
+      }),
+      subscribe: () => source,
+      load: async (_actor, eventId) => ({
+        id: eventId,
+        visibility: "PRIVATE_ACCOUNT",
+        accountId: "acct-a",
+      }),
+    });
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream", {
+      signal: controller.signal,
+    }));
+    await expect(Promise.race([
+      queueFullPromise.then(() => "QUEUE_FULL" as const),
+      new Promise<"QUEUE_NOT_REACHED">((resolve) => (
+        setTimeout(() => resolve("QUEUE_NOT_REACHED"), 100)
+      )),
+    ])).resolves.toBe("QUEUE_FULL");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    controller.abort();
+
+    await expect(Promise.race([
+      finalizedPromise.then(() => "FINALIZED" as const),
+      new Promise<"HUNG">((resolve) => setTimeout(() => resolve("HUNG"), 100)),
+    ])).resolves.toBe("FINALIZED");
+    expect(source.close).toHaveBeenCalledOnce();
+    await expect(Promise.race([
+      response.body!.cancel().then(() => "CANCELLED" as const),
+      new Promise<"CANCEL_HUNG">((resolve) => setTimeout(() => resolve("CANCEL_HUNG"), 100)),
+    ])).resolves.toBe("CANCELLED");
+  });
+
+  it("keeps the lifecycle alarm armed until a finite producer response settles", async () => {
+    let fireDeadline: (() => void) | undefined;
+    let alarmDisposals = 0;
+    let nextCount = 0;
+    let finalized!: () => void;
+    const finalizedPromise = new Promise<void>((resolve) => { finalized = resolve; });
+    const iteratorReturn = vi.fn(async (): Promise<IteratorResult<string>> => {
+      finalized();
+      return { done: true, value: undefined };
+    });
+    const source: EventIdSource = {
+      close: vi.fn(),
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<string>> {
+            nextCount += 1;
+            return nextCount <= 20
+              ? { done: false, value: `private-finite-${nextCount}` }
+              : { done: true, value: undefined };
+          },
+          return: iteratorReturn,
+        };
+      },
+    };
+    const handler = createFeedStreamHandler({
+      scheduleLifecycleAlarm: (_milliseconds, fire) => {
+        let active = true;
+        fireDeadline = () => { if (active) fire(); };
+        return () => {
+          if (!active) return;
+          active = false;
+          alarmDisposals += 1;
+        };
+      },
+      authenticate: async () => ({
+        actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+        revalidate: async () => true,
+      }),
+      subscribe: () => source,
+      load: async (_actor, eventId) => ({
+        id: eventId,
+        visibility: "PRIVATE_ACCOUNT",
+        accountId: "acct-a",
+      }),
+    });
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream"));
+
+    await expect(Promise.race([
+      finalizedPromise.then(() => "FINALIZED" as const),
+      new Promise<"HUNG">((resolve) => setTimeout(() => resolve("HUNG"), 100)),
+    ])).resolves.toBe("FINALIZED");
+    expect(alarmDisposals).toBe(0);
+    expect(fireDeadline).toBeTypeOf("function");
+
+    fireDeadline!();
+
+    await expect(Promise.race([
+      response.body!.cancel().then(() => "CANCELLED" as const),
+      new Promise<"CANCEL_HUNG">((resolve) => setTimeout(() => resolve("CANCEL_HUNG"), 100)),
+    ])).resolves.toBe("CANCELLED");
+    expect(alarmDisposals).toBe(1);
+    expect(source.close).toHaveBeenCalledOnce();
+    expect(iteratorReturn).toHaveBeenCalledOnce();
+  });
+
+  it("finalizes a subscription that resolves after cancellation", async () => {
+    const controller = new AbortController();
+    let subscribing!: () => void;
+    let resolveSubscription!: (source: EventIdSource) => void;
+    const subscribingPromise = new Promise<void>((resolve) => { subscribing = resolve; });
+    const subscriptionPromise = new Promise<EventIdSource>((resolve) => {
+      resolveSubscription = resolve;
+    });
+    const iteratorReturn = vi.fn(async (): Promise<IteratorResult<string>> => ({
+      done: true,
+      value: undefined,
+    }));
+    const source: EventIdSource = {
+      close: vi.fn(),
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<string>> {
+            return { done: true, value: undefined };
+          },
+          return: iteratorReturn,
+        };
+      },
+    };
+    const handler = createFeedStreamHandler({
+      authenticate: async () => ({
+        actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+        revalidate: async () => true,
+      }),
+      subscribe: async () => {
+        subscribing();
+        return subscriptionPromise;
+      },
+      load: async () => undefined,
+    });
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream", {
+      signal: controller.signal,
+    }));
+    await subscribingPromise;
+
+    controller.abort();
+    resolveSubscription(source);
+
+    await expect(Promise.race([
+      response.body!.cancel().then(() => "CANCELLED" as const),
+      new Promise<"CANCEL_HUNG">((resolve) => setTimeout(() => resolve("CANCEL_HUNG"), 100)),
+    ])).resolves.toBe("CANCELLED");
+    expect(source.close).toHaveBeenCalledOnce();
+    expect(iteratorReturn).toHaveBeenCalledOnce();
+  });
+
+  it("aborts and awaits a non-resolving revalidator before source cleanup", async () => {
+    const controller = new AbortController();
+    let authorizing!: () => void;
+    let finalized!: () => void;
+    let authorizationSettled = false;
+    const authorizingPromise = new Promise<void>((resolve) => { authorizing = resolve; });
+    const finalizedPromise = new Promise<void>((resolve) => { finalized = resolve; });
+    const source: EventIdSource = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<string>> {
+            return { done: false, value: "private-a" };
+          },
+          async return(): Promise<IteratorResult<string>> {
+            finalized();
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    const handler = createFeedStreamHandler({
+      authenticate: async () => ({
+        actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+        revalidate: async (operation?: { readonly signal: AbortSignal }) => {
+          authorizing();
+          return new Promise<boolean>((resolve) => {
+            operation?.signal.addEventListener("abort", () => {
+              authorizationSettled = true;
+              resolve(false);
+            }, { once: true });
+          });
+        },
+      }),
+      subscribe: () => source,
+      load: async () => undefined,
+    });
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream", {
+      signal: controller.signal,
+    }));
+    await authorizingPromise;
+
+    controller.abort();
+
+    await expect(Promise.race([
+      finalizedPromise.then(() => "FINALIZED" as const),
+      new Promise<"HUNG">((resolve) => setTimeout(() => resolve("HUNG"), 100)),
+    ])).resolves.toBe("FINALIZED");
+    expect(authorizationSettled).toBe(true);
+    await response.body?.cancel();
+  });
+
+  it("awaits protected-load cancellation settlement before closing the response", async () => {
+    const controller = new AbortController();
+    let loading!: () => void;
+    let settled = false;
+    const loadingPromise = new Promise<void>((resolve) => { loading = resolve; });
+    const handler = createFeedStreamHandler({
+      authenticate: async () => ({
+        actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+        revalidate: async () => true,
+      }),
+      subscribe: () => ["private-a"],
+      load: async (
+        _actor,
+        _eventId,
+        operation?: { readonly signal: AbortSignal },
+      ) => {
+        loading();
+        return new Promise<undefined>((resolve) => {
+          operation?.signal.addEventListener("abort", () => {
+            settled = true;
+            resolve(undefined);
+          }, { once: true });
+        });
+      },
+    });
+    const response = await handler(new Request("http://localhost:3000/api/feed/stream", {
+      signal: controller.signal,
+    }));
+    const reading = response.body!.getReader().read();
+    await loadingPromise;
+
+    controller.abort();
+
+    expect(await reading).toEqual({ done: true, value: undefined });
+    expect(settled).toBe(true);
+  });
+
+  it("installs the 54-second lifecycle before authentication and awaits its abort", async () => {
+    let now = 0;
+    let fireDeadline: (() => void) | undefined;
+    let releaseFallback!: () => void;
+    let authenticating!: () => void;
+    let authenticationSettled = false;
+    const fallback = new Promise<void>((resolve) => { releaseFallback = resolve; });
+    const authenticatingPromise = new Promise<void>((resolve) => { authenticating = resolve; });
+    const subscribe = vi.fn(() => [] as const);
+    const handler = createFeedStreamHandler({
+      monotonicNow: () => now,
+      scheduleLifecycleAlarm: (_milliseconds: number, fire: () => void) => {
+        fireDeadline = fire;
+        return () => undefined;
+      },
+      authenticate: async (
+        _request,
+        operation?: { readonly signal: AbortSignal },
+      ) => {
+        authenticating();
+        if (!operation) {
+          await fallback;
+          return {
+            actor: { role: "ACCOUNT" as const, accountId: "acct-a" },
+            revalidate: async () => true,
+          };
+        }
+        await new Promise<void>((_resolve, reject) => {
+          operation.signal.addEventListener("abort", () => {
+            authenticationSettled = true;
+            reject(new Error("SSE_DURATION_BOUND"));
+          }, { once: true });
+        });
+        throw new Error("unreachable");
+      },
+      subscribe,
+      load: async () => undefined,
+    });
+    const pendingResponse = handler(new Request("http://localhost:3000/api/feed/stream"));
+    await authenticatingPromise;
+
+    if (fireDeadline) {
+      now = 54_000;
+      fireDeadline();
+    } else {
+      releaseFallback();
+    }
+    const response = await pendingResponse;
+
+    expect(fireDeadline).toBeTypeOf("function");
+    expect(response.status).toBe(500);
+    expect(authenticationSettled).toBe(true);
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+});
 
 describe("authorized SSE feed", () => {
   it("reloads and projects event IDs instead of trusting fan-out payloads", async () => {

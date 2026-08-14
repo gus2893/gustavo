@@ -68,6 +68,8 @@ export interface OpenFeedStreamInput {
   readonly eventIds: EventIdSource;
   readonly load: (eventId: string) => Promise<StreamSourceEvent | undefined>;
   readonly revalidate?: () => boolean | Promise<boolean>;
+  readonly abort?: () => void;
+  readonly onResponseSettled?: () => void | Promise<void>;
   readonly lastEventId?: string;
   readonly signal?: AbortSignal;
   readonly heartbeatMs?: number;
@@ -119,6 +121,29 @@ function asyncIterator(source: EventIdSource): AsyncIterator<string> {
       return iterator.return?.() ?? { done: true, value: undefined };
     },
   };
+}
+
+interface EventIdSourceAuthority {
+  readonly iterator: AsyncIterator<string>;
+  settle(): Promise<void>;
+}
+
+function eventIdSourceAuthority(source: EventIdSource): EventIdSourceAuthority {
+  const iterator = asyncIterator(source);
+  let settlement: Promise<void> | undefined;
+  return Object.freeze({
+    iterator,
+    settle() {
+      settlement ??= Promise.resolve().then(async () => {
+        try {
+          await source.close?.();
+        } finally {
+          await iterator.return?.();
+        }
+      });
+      return settlement;
+    },
+  });
 }
 
 async function waitForNext(
@@ -209,7 +234,10 @@ async function authorized(revalidate: OpenFeedStreamInput["revalidate"]): Promis
   }
 }
 
-async function* emissions(input: OpenFeedStreamInput): AsyncGenerator<StreamEmission> {
+async function* emissions(
+  input: OpenFeedStreamInput,
+  sourceAuthority = eventIdSourceAuthority(input.eventIds),
+): AsyncGenerator<StreamEmission> {
   const heartbeatMs = positiveInteger(
     input.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
     60_000,
@@ -229,7 +257,7 @@ async function* emissions(input: OpenFeedStreamInput): AsyncGenerator<StreamEmis
     throw new Error("INVALID_LAST_EVENT_ID");
   }
 
-  const iterator = asyncIterator(input.eventIds);
+  const iterator = sourceAuthority.iterator;
   let pending: Promise<IteratorResult<string>> | undefined;
   let consecutiveHeartbeats = 0;
   let eventCount = 0;
@@ -274,11 +302,7 @@ async function* emissions(input: OpenFeedStreamInput): AsyncGenerator<StreamEmis
       yield { kind: "EVENT", cursorId, dto };
     }
   } finally {
-    try {
-      await (input.eventIds as ClosableEventIdSource).close?.();
-    } finally {
-      await iterator.return?.();
-    }
+    await sourceAuthority.settle();
   }
 }
 
@@ -295,8 +319,10 @@ export function openFeedStream(input: OpenFeedStreamInput): FeedStream {
     "X-Accel-Buffering": "no",
     "X-Content-Type-Options": "nosniff",
   });
-  const createFrames = async function* (): AsyncGenerator<string> {
-    for await (const emission of emissions(input)) {
+  const createFrames = async function* (
+    sourceAuthority = eventIdSourceAuthority(input.eventIds),
+  ): AsyncGenerator<string> {
+    for await (const emission of emissions(input, sourceAuthority)) {
       yield emission.kind === "HEARTBEAT"
         ? ": heartbeat\n\n"
         : formatSseEvent(emission.dto, emission.cursorId);
@@ -319,18 +345,71 @@ export function openFeedStream(input: OpenFeedStreamInput): FeedStream {
     frames: createFrames,
     readable() {
       const encoder = new TextEncoder();
-      const iterator = createFrames()[Symbol.asyncIterator]();
+      const sourceAuthority = eventIdSourceAuthority(input.eventIds);
+      const iterator = createFrames(sourceAuthority)[Symbol.asyncIterator]();
+      let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+      let settlement: Promise<void> | undefined;
+      let cancelled = false;
+      let terminal = false;
+
+      const settle = (): Promise<void> => {
+        settlement ??= Promise.resolve().then(async () => {
+          input.abort?.();
+          try {
+            await iterator.return?.(undefined);
+          } finally {
+            try {
+              await sourceAuthority.settle();
+            } finally {
+              input.signal?.removeEventListener("abort", abortAndSettle);
+              await input.onResponseSettled?.();
+              if (!cancelled && !terminal) {
+                terminal = true;
+                controller?.close();
+              }
+            }
+          }
+        });
+        return settlement;
+      };
+      const abortAndSettle = () => {
+        void settle().catch((error: unknown) => {
+          if (!cancelled && !terminal) {
+            terminal = true;
+            controller?.error(error);
+          }
+        });
+      };
+
       return new ReadableStream<Uint8Array>({
+        start(streamController) {
+          controller = streamController;
+          input.signal?.addEventListener("abort", abortAndSettle, { once: true });
+          if (input.signal?.aborted) abortAndSettle();
+        },
         async pull(controller) {
-          const next = await iterator.next();
-          if (next.done) {
-            controller.close();
+          if (settlement || input.signal?.aborted) {
+            await settle();
             return;
           }
-          controller.enqueue(encoder.encode(next.value));
+          try {
+            const next = await iterator.next();
+            if (input.signal?.aborted || next.done) {
+              await settle();
+              return;
+            }
+            controller.enqueue(encoder.encode(next.value));
+          } catch (error) {
+            if (!cancelled && !terminal) {
+              terminal = true;
+              controller.error(error);
+            }
+            await settle();
+          }
         },
         async cancel() {
-          await iterator.return?.(undefined);
+          cancelled = true;
+          await settle();
         },
       });
     },
