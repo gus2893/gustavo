@@ -6,13 +6,14 @@
 
 1. **R1 — Repair and publish the existing Vercel project** → Story 1 / AC1–AC5.
    - Reuse project `prj_HoIxQexO64tsgXrNI6m89g3P87TB` in team `team_2ZsWunVLuTIHx2h2zmWEAvAH`.
-   - Build with Node 24 and pnpm 11.16.0 through Corepack; verify Preview first, then smoke a staged production deployment created with `vercel --prod --skip-domain` before promoting that exact no-rebuild artifact to `gustavo.lol`.
-   - Redirect `www.gustavo.lol` to the apex, retain the exact simulation label, and exclude operator data, live quotes, secrets, and ciphertext from all public output.
+   - Build with Node 24 and pnpm 11.16.0 through a trusted absolute Corepack executable; pin Vercel CLI `58.4.0` in the repository and invoke it only through that Corepack/pnpm dependency boundary. Ambient `pnpm`, `npx`, `vercel`, PowerShell, or mutable environment-derived executable paths are not deployment authority.
+   - Verify a clean pushed reviewed commit, then verify Preview first, smoke a staged production deployment created with `vercel --prod --skip-domain`, and promote that exact no-rebuild artifact to `gustavo.lol`.
+   - Explicitly configure `gustavo.lol` and `www.gustavo.lol` in Vercel Project Domains with `www` redirected to the apex before verifying TLS/redirect behavior; retain the exact simulation label and exclude operator data, live quotes, secrets, and ciphertext from all public output.
    - Every committed `vercel.json` function pattern must match a route that exists in the same commit; route-specific duration configuration lands atomically with that route.
 
 2. **R2 — Create a fresh, invitation-only production account** → Story 2 / AC1–AC5.
    - Provision an empty Neon Free database; never copy local accounts, conversations, memories, quotes, or backups.
-   - Apply each migration once under an advisory lock, seed configuration/authority only, and issue one opaque, expiring invitation URL.
+   - Apply each migration once under an advisory lock, verify the migrated authority-only database is empty, create and verify the migrated-empty encrypted backup, then issue one opaque, expiring invitation URL. The existing backup script is never run against an unmigrated database.
    - Preserve current single-use invitations, strict sessions/origins/cookies, and auth-before-read.
 
 3. **R3 — Run Node, Main, and Evaluator through the local Codex CLI** → Story 3 / AC1–AC6.
@@ -20,6 +21,7 @@
    - Run one Codex subprocess at a time in priority order: Node, Evaluator, Main.
    - Use standalone `codex exec` authenticated by ChatGPT sign-in. Never use an OpenAI API key, paid fallback, Ollama, or provider substitution.
    - Run that CLI only inside a pinned, ephemeral Docker container with a read-only image, a fresh tmpfs workspace, a dedicated Codex-auth volume, no repository or application-secret mounts, and container-level process/resource deadlines.
+   - A reviewed maintenance mode in the hardened worker setup owns image rebuild, exact optional auth-volume rotation, atomic owner/SYSTEM-only configuration replacement, and credential retirement. It preserves T15 KnownFolder, reparse, ACL, exact executable, named-pipe, label, container-absence, and process-environment boundaries; operators never move the secret configuration or remove the auth volume through ambient manual paths.
    - Preserve bounded Codex-reported input/output token counts when the pinned CLI emits them. When it does not, return explicit `UNKNOWN` provider metering while separately retaining gateway-observed token counts; incremental billable cost is the known constant zero, never an inferred provider charge.
    - Persist prompt/output only through existing encrypted event bodies; queue rows contain identifiers, digests, leases, bounded status, and safe error codes.
 
@@ -36,6 +38,7 @@
    - Vercel web functions do not run `worker/runtime.ts` persistent loops.
    - QStash calls one authenticated bounded Vercel maintenance route every 15 minutes for cache, privacy, stream, and schedule steps.
    - QStash calls the local Tailscale Funnel every five minutes with one fixed exact signed `MARKET_CURRENT` body; direct chat sends an extra signed opaque-job wake. Only after signature, replay receipt, and quota succeed does the local worker derive the current five-minute window from PostgreSQL time and pass that exact window through normal reservation.
+   - `GUSTAVO_HYBRID_BRIDGE_ENABLED` is the hosted direct-chat publication gate. There is no local runtime consumer for `GUSTAVO_MARKET_POLLER_ENABLED`, so that inert variable is removed rather than documented as a safety control. Market shutdown authority is pausing the exact QStash market schedule, settling the admitted current poll, closing the worker admission barrier, stopping the exact task, and proving container/Funnel absence. Durable `PENDING` jobs may remain for reconnect recovery; only claimed/active work must settle before local shutdown.
    - Every accepted signed wake coalesces one database-clock CODEX heartbeat refresh with no additional timer/polling loop. A CODEX heartbeat older than 12 minutes is offline, and the current UTC `CODEX_JOBS` quota counter overrides heartbeat status as quota-limited.
    - Neon is the correctness boundary: lost wake/pubsub messages leave durable work pending for startup/reconnect recovery.
    - SSE installs one cancellation authority before authentication, stops admission by 54 seconds, settles all admitted authentication/revalidation/body-load/subscription work, and closes by 55 seconds; reconnect uses the existing ordered `Last-Event-ID` database cursor.
@@ -46,8 +49,8 @@
    - Quota exhaustion delays/rejects only the affected feature with a safe reason; it never upgrades or enables overage.
 
 7. **R7 — Make cutover and recovery operable** → all stories.
-   - Provide migration/bootstrap, Vercel env, Windows startup, Funnel, quota, degraded-mode, rollback, backup, and smoke instructions.
-   - Preserve a repeatable command trail without printing secrets.
+   - Provide migration/bootstrap, Vercel env, Windows startup/maintenance, Funnel, quota, degraded-mode, rollback, backup, domain, and smoke instructions.
+   - Preserve a repeatable command trail without printing secrets. Hosted `GUSTAVO_HYBRID_WAKE_URL` is supplied to Vercel for direct chat publication; local `GUSTAVO_HYBRID_PUBLIC_WAKE_URL` is stored only in the protected worker configuration. Neither is printed.
 
 ## E — Existing context
 
@@ -123,6 +126,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 6. **Two-phase release.** Preview validates the hosted integration early. Final cutover uses a separate staged production deployment created with production environment authority and `--skip-domain`; resources, migration, bootstrap, local bridge/market, health, leakage scan, and rollback rehearsal must pass against that staged deployment before no-rebuild promotion.
 7. **Wake-refreshed local liveness lease.** The local host writes CODEX/market state at startup and stop, and each already-scheduled signed wake coalesces at most one in-flight CODEX heartbeat refresh using database time. This adds no persistent timer or extra QStash message and preserves Neon auto-suspend between existing wakes. Account/operator projections treat CODEX as available only while its last database timestamp is at most 12 minutes old; the durable current-UTC `CODEX_JOBS` counter at its fixed limit takes precedence as quota-limited. Abrupt PC/process loss therefore becomes offline after two missed five-minute wakes without relying on a clean stop.
 8. **Static scheduled market trigger, database-owned window.** QStash schedules replay a fixed body and cannot interpolate a canonical timestamp into `{windowId}`. The recurring market schedule therefore signs only the exact constant `MARKET_CURRENT` trigger. T6 still verifies the exact URL/body/JWT and durably records receipt/quota before dispatch. The local host then opens a short database lifecycle, derives the current five-minute bucket from PostgreSQL clock authority, disconnects, and invokes the existing T14 reservation. Reservation rechecks that same database-owned current bucket before provider work, so a boundary crossing skips without historical polling or quota reservation. Dynamic `{windowId}` remains an internal/adversarial one-shot authority, not the recurring schedule body.
+9. **Operational controls must be real authorities.** A clean reviewed commit plus trusted absolute Git/Node/Corepack/PowerShell executables and repository-pinned Vercel CLI own deployment commands. Hosted bridge disable is materialized in a staged/smoked/exact-promoted artifact. Recurring market disable is the exact schedule pause followed by active-poll settlement and the T15 worker stop/absence proof, not an unused environment variable. Local image/auth/config maintenance runs only through the reviewed setup maintenance mode. Migration precedes the first authority-empty backup, and bootstrap follows that verified backup.
 
 ### Data model
 
@@ -178,7 +182,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 
 ### Modified files
 
-- `package.json`, `pnpm-lock.yaml`: add `@vercel/functions`, `@upstash/qstash`, and bounded deployment/container commands.
+- `package.json`, `pnpm-lock.yaml`: add `@vercel/functions`, `@upstash/qstash`, repository-pinned Vercel CLI `58.4.0`, and bounded deployment/container commands.
 - `lib/server/db/postgres.ts`: bounded Vercel pool/Fluid Compute attachment and bounded local pool.
 - `lib/server/history/messages.ts`: return exact job/source binding without weakening authority.
 - `app/api/conversations/[conversationId]/messages/route.ts`: best-effort opaque wake after durable commit.
@@ -187,8 +191,8 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `app/api/feed/stream/route.ts`: Vercel duration/reconnect hardening.
 - `lib/server/stream/events.ts`: shared cancellation-owned stream pump that settles active projection and source/iterator cleanup before response completion.
 - `scripts/issue-invitation.ts`: canonical redemption URL mode.
-- `infra/env.example`, `docs/{OPERATIONS,PRODUCTION_CHECKLIST,SMOKE_TEST}.md`: deployment mode/runbook links.
-- `scripts/{setup-hybrid-worker,start-hybrid-worker}.ps1`, `infra/env.example`, and hybrid production tests: provision/validate the local-only materializer URL without printing or forwarding it to Vercel or the Codex container.
+- `infra/{env.example,vercel.env.example}`, `docs/{OPERATIONS,PRODUCTION_CHECKLIST,SMOKE_TEST}.md`: exact hosted/local variable placement, real market-disable semantics, and deployment/runbook links; remove the inert market-poller flag from asserted authority.
+- `scripts/{setup-hybrid-worker,start-hybrid-worker}.ps1`, `infra/env.example`, and hybrid production tests: provision/validate the local-only materializer URL without printing or forwarding it to Vercel or the Codex container; setup adds a reviewed maintenance mode for safe image/auth/config rotation under the existing T15 path/ACL/process authority.
 - `worker/hybrid/runtime.ts`, `tests/infra/hybrid-worker.test.ts`: coalesce one database-clock CODEX heartbeat refresh per accepted wake without delaying HTTP acknowledgement or adding a timer loop.
 - `lib/server/bridge/qstash.ts`, `worker/hybrid/{runtime,wake-server}.ts`, and focused T6/T14/T15 tests: accept the fixed signed `MARKET_CURRENT` schedule trigger, then derive the exact window from database time before normal reservation/provider work.
 
@@ -289,13 +293,13 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - **SC4/R4:** Exactly 95 results complete within 300 seconds using at most 96 calls and render operator-only.
 - **SC5/R5:** PC-offline preserves public/history and pending jobs; restart drains once; maintenance completes below 55 seconds.
 - **SC6/R6:** Tests reject job 101, QStash 901, Finnhub call 97, second Codex process, and paid fallback.
-- **SC7/R7:** `pnpm test`, typecheck, build, validator, focused Playwright, Preview smoke, staged-production smoke, exact staged-deployment promotion, production smoke, and rollback rehearsal pass without secret leakage.
+- **SC7/R7:** tests, typecheck, build, validator, focused Playwright, and every Vercel command run through trusted absolute Corepack plus repository-pinned Vercel CLI `58.4.0`; Preview smoke, staged-production smoke, exact staged-deployment promotion, production smoke, and rollback rehearsal pass from one clean reviewed commit without secret leakage.
 
 ## Rollback plan
 
-1. Set `GUSTAVO_HYBRID_BRIDGE_ENABLED=false` and `GUSTAVO_MARKET_POLLER_ENABLED=false` first.
-2. Pause/delete only the two mission-created QStash schedules, stop the exact `Gustavo Hybrid Worker` task, and run `tailscale funnel reset`.
-3. Promote the last verified pre-mission Vercel deployment; if none is Ready, redeploy exact commit `a0c90dc15390e5accbb42869965e5347f7576b3f` as the safe hosted shell.
+1. Materialize `GUSTAVO_HYBRID_BRIDGE_ENABLED=false` in a clean staged Production deployment, smoke it, and exact-promote it before local cleanup. An environment edit alone is not a deployed control.
+2. Pause/delete only the two mission-created QStash schedules. Allow any already-admitted market poll/claimed Codex job to settle; durable `PENDING` jobs remain recoverable. Stop the exact `Gustavo Hybrid Worker` task, run `tailscale funnel reset` through the trusted executable, and prove worker/container absence through the T15 authority.
+3. Use an earlier deployment only if it is already verified bridge-disabled. Otherwise rebuild the exact reviewed previous commit, or safe-shell commit `a0c90dc15390e5accbb42869965e5347f7576b3f`, with the bridge disabled as a staged Production deployment; smoke and exact-promote it.
 4. Revert mission implementation commits in reverse order and delete only additive files listed here. Do not edit historical migrations.
 5. Migration 0022 is forward-only/additive. Leave its tables in place; resource deletion is a separate explicit decommission after backup/verification.
 
@@ -363,6 +367,12 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
   - Revised intent: schedule the exact fixed `MARKET_CURRENT` body. After existing T6 signature/receipt/quota authority, the local worker derives the current bucket from PostgreSQL and passes it to existing T14 reservation; no sender or host wall clock becomes authoritative.
   - Preserved intent: exactly two QStash schedules, no hosted relay/third schedule, no historical re-poll, no provider work during database reservation, 202 decoupling, and the 900/day application cap.
 - 2026-08-14 static market-wake update approved under the user's standing instruction to “Proceed with all without needed input”; new T20A plus T21/T22/T23 require regeneration before affected execution resumes.
+
+- 2026-08-14 prompt-update: replace documentation-only deployment controls with executable authority after T21 Stage B found ambient tool resolution, unsafe manual secret-file/auth-volume operations, an inert market flag, contradictory queue shutdown, unmigrated backup ordering, and unproven source/domain setup.
+  - Previous intent: operators would run bare `pnpm`/`vercel`, manually move the protected worker config and remove the Codex auth volume, set both bridge/market env flags false as rollback, back up the fresh database before migration, and verify an assumed `www` redirect.
+  - Revised intent: trusted absolute Node/Corepack/Git/PowerShell plus repository-pinned Vercel CLI own every command; setup gains a reviewed maintenance mode preserving T15 authority; only the hosted bridge flag is a deployed flag, while exact schedule pause plus worker settlement/absence disables market work; migrate and verify emptiness before backup/bootstrap; deploy only a clean reviewed commit and explicitly configure the domain redirect.
+  - Preserved intent: exact staged no-rebuild promotion, two schedules, durable offline recovery, flags-first hosted bridge safety, additive migrations, secret-free logs, zero paid fallback, and exact local isolation remain unchanged.
+- 2026-08-14 operable-deployment-maintenance prompt update approved under the user's standing instruction to “Proceed with all without needed input”; new T20B/T20C plus regenerated T21/T22/T23 are required before execution resumes.
 
 ## Self-review checklist
 

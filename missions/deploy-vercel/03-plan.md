@@ -1,18 +1,18 @@
 # Plan: deploy-vercel
 
 **Plan status:** approved for execution after the self-review below
-**Source contract:** `missions/deploy-vercel/02-design.md` approved 2026-08-13
+**Source contract:** `missions/deploy-vercel/02-design.md` approved 2026-08-14 after the operable-deployment-maintenance prompt update
 **Execution rule:** each task begins with its Red section and reaches its stated Green verification before the next task starts.
 
 ## Requirement → task map
 
-- R1 → T1, T2, T17, T21, T22, T23
+- R1 → T1, T2, T17, T20B, T21, T22, T23
 - R2 → T3, T20, T21, T22, T23
-- R3 → T4, T5, T7, T8, T9, T10, T15, T18, T19, T21, T23
+- R3 → T4, T5, T7, T8, T9, T10, T15, T18, T19, T20C, T21, T23
 - R4 → T11, T12, T13, T14, T18, T21, T23
-- R5 → T6, T9, T14, T15, T16, T17, T19, T21, T23
+- R5 → T6, T9, T14, T15, T16, T17, T19, T20B, T21, T23
 - R6 → T1, T5, T6, T7, T11, T12, T13, T14, T19, T20, T22, T23
-- R7 → T3, T15, T20, T21, T22, T23
+- R7 → T3, T15, T20, T20B, T20C, T21, T22, T23
 
 ## Task list
 
@@ -1581,10 +1581,111 @@ Yes. It closes one recurring-wake authority gap without changing the market rese
 
 ---
 
+### T20B — Pin trusted deployment tooling and remove the inert market flag
+
+**Maps to:** R1, R5, R7
+**Files touched:** `package.json` (modify), `pnpm-lock.yaml` (modify), `infra/env.example` (modify), `infra/vercel.env.example` (modify), `tests/deployment/vercel-hybrid.test.ts` (modify)
+
+#### Red — failing test
+
+File: `tests/deployment/vercel-hybrid.test.ts`
+
+```ts
+it("pins the deployment CLI and exposes only real hosted and local controls", () => {
+  const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+  const local = readFileSync("infra/env.example", "utf8");
+  const hosted = readFileSync("infra/vercel.env.example", "utf8");
+
+  expect(manifest.devDependencies.vercel).toBe("58.4.0");
+  expect(local).toContain("GUSTAVO_HYBRID_PUBLIC_WAKE_URL=");
+  expect(local).not.toContain("GUSTAVO_HYBRID_WAKE_URL=");
+  expect(hosted).toContain("GUSTAVO_HYBRID_WAKE_URL=");
+  expect(hosted).not.toContain("GUSTAVO_HYBRID_PUBLIC_WAKE_URL=");
+  expect(`${local}\n${hosted}`).not.toContain("GUSTAVO_MARKET_POLLER_ENABLED");
+});
+```
+
+Expected initial state: the exact Vercel CLI dependency is absent and both env templates still claim the unused market-poller variable is authority.
+
+#### Green — minimum implementation
+
+- Add exact devDependency `vercel: "58.4.0"` and regenerate the lockfile through the trusted bundled Node/Corepack pnpm runtime.
+- Keep hosted `GUSTAVO_HYBRID_WAKE_URL` in `infra/vercel.env.example` and local `GUSTAVO_HYBRID_PUBLIC_WAKE_URL` in `infra/env.example`; never cross-place them.
+- Remove `GUSTAVO_MARKET_POLLER_ENABLED` from both templates and update prior static assertions that treated it as an implemented runtime gate. Preserve `GUSTAVO_HYBRID_BRIDGE_ENABLED=false` as the hosted fail-closed default.
+
+#### Refactor
+
+- None. This is the smallest package/config authority delta.
+
+#### Verify
+
+Command: trusted bundled Node 24 with the pinned pnpm JS runs `vitest run tests/deployment/vercel-hybrid.test.ts -t "pins the deployment CLI and exposes only real hosted and local controls"`.
+
+Expected: one selected test passes, zero fail, exit code 0; frozen lockfile install and TypeScript exit 0.
+
+#### Reviewable as a unit?
+
+Yes. It pins one deployable CLI and removes one false configuration authority without changing runtime behavior.
+
+---
+
+### T20C — Add a hardened local worker maintenance mode
+
+**Maps to:** R3, R7
+**Files touched:** `scripts/setup-hybrid-worker.ps1` (modify), `tests/infra/hybrid-worker.test.ts` (modify)
+
+#### Red — failing test
+
+File: `tests/infra/hybrid-worker.test.ts`
+
+```ts
+it("rebuilds and optionally rotates worker authority without ambient paths or a plaintext backup", () => {
+  const setup = readFileSync("scripts/setup-hybrid-worker.ps1", "utf8");
+
+  for (const marker of [
+    "[switch]$MaintenanceRebuild",
+    "[switch]$RotateCodexAuthVolume",
+    "HYBRID_MAINTENANCE_TASK_RUNNING",
+    "HYBRID_MAINTENANCE_CONTAINER_PRESENT",
+    "HYBRID_MAINTENANCE_LEASE_UNAVAILABLE",
+    "[IO.File]::Replace",
+  ]) expect(setup).toContain(marker);
+  expect(setup).toMatch(/NamedPipeServerStream[\s\S]+gustavo-codex-runner-v1/);
+  expect(setup).toMatch(/volume["'],\s*["']rm["'][\s\S]+\$AuthVolume/);
+  expect(setup).not.toMatch(/\.previous|\$env:ProgramFiles[\s\S]+volume rm|Move-Item[\s\S]+hybrid-worker\.env/);
+});
+```
+
+Expected initial state: setup has neither maintenance switch and still rejects every existing config with `HYBRID_CONFIG_ALREADY_EXISTS`.
+
+#### Green — minimum implementation
+
+- Add explicit `-MaintenanceRebuild` and optional `-RotateCodexAuthVolume` modes to the existing setup script; the initial mode stays byte-for-byte fail-closed for an existing config.
+- Maintenance requires the exact dedicated local SID, KnownFolder-derived direct-child config path, no reparse component, owner/SYSTEM-only directory/file ACL, exact persisted trusted executables, exact scheduled task not running, and exclusive `gustavo-codex-runner-v1` named-pipe ownership.
+- While holding that lease, prove `gustavo-codex-singleton-v1` absent before any build or optional exact `gustavo-codex-auth-v1` removal. Use only the already validated absolute Docker executable with a minimal child environment; reject every unexpected result.
+- Build/inspect the pinned image, perform interactive ChatGPT sign-in, construct a same-directory random temporary config with final ACL before secret bytes, validate both database identities against that temp config, then atomically replace the existing config with `[IO.File]::Replace(temp, exactConfig, null)`. Never create a plaintext `.previous` copy; settle/remove the exact temp file on failure and reveal no values.
+- Re-register the exact task only after replacement and final validation. Release the pipe only after every Docker/process/file operation settles. Existing initial setup and `-ValidateOnly` behavior remain unchanged.
+
+#### Refactor
+
+- Share the existing KnownFolder, ACL, trusted-process, image, volume, config-write, and task-registration helpers between initial and maintenance paths; do not introduce a second weaker implementation.
+
+#### Verify
+
+Commands: trusted bundled Node/pnpm runs `vitest run tests/infra/hybrid-worker.test.ts -t "rebuilds and optionally rotates worker authority"`, then the full hybrid-worker file; parse both PowerShell scripts with Windows PowerShell 5.1; run `tsc --noEmit`.
+
+Expected: focused regression passes, full file has zero failures with controlled-live tests still skipped by default, both parsers report zero errors, TypeScript exits 0, and no real Docker/Tailscale/provider action occurs.
+
+#### Reviewable as a unit?
+
+Yes. It adds one explicit local maintenance authority while preserving the existing setup/start runtime boundary.
+
+---
+
 ### T21 — Document exact free-tier setup, operation, degraded mode, and rollback
 
 **Maps to:** R1, R2, R5, R6, R7
-**Files touched:** `docs/VERCEL_DEPLOYMENT.md` (new), `docs/OPERATIONS.md` (modify), `docs/PRODUCTION_CHECKLIST.md` (modify), `docs/SMOKE_TEST.md` (modify), `infra/env.example` (modify), `tests/deployment/vercel-hybrid.test.ts` (modify)
+**Files touched:** `docs/VERCEL_DEPLOYMENT.md` (new), `docs/OPERATIONS.md` (modify), `docs/PRODUCTION_CHECKLIST.md` (modify), `docs/SMOKE_TEST.md` (modify), `tests/deployment/vercel-hybrid.test.ts` (modify)
 
 #### Red — failing test
 
@@ -1595,43 +1696,70 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 describe("hybrid deployment runbook", () => {
-  it("names every free quota, secret channel, smoke gate, degraded state, and exact rollback action", () => {
+  it("uses executable authorities for deploy, maintenance, market shutdown, backup, and rollback", () => {
     const deploy = readFileSync("docs/VERCEL_DEPLOYMENT.md", "utf8");
     const operations = readFileSync("docs/OPERATIONS.md", "utf8");
     const checklist = readFileSync("docs/PRODUCTION_CHECKLIST.md", "utf8");
     const smoke = readFileSync("docs/SMOKE_TEST.md", "utf8");
     const combined = [deploy, operations, checklist, smoke].join("\n");
 
-    for (const required of [
-      "Vercel Hobby", "Neon Free", "Upstash Redis Free", "QStash Free",
-      "Tailscale Free", "Finnhub Free", "Docker Desktop Personal",
-      "gustavo-codex-auth-v1", "@openai/codex@0.146.0",
-      "1,000 messages/day", "900 messages/day application cap", "100 jobs/day",
-      "96 calls/window", "95 results/window", "SIMULATION ONLY — NOT A REAL TRADE",
-      "GUSTAVO_HYBRID_BRIDGE_ENABLED=false", "GUSTAVO_MARKET_POLLER_ENABLED=false",
-      "GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL", "gustavo_market_materializer",
-      "tailscale funnel reset", "a0c90dc15390e5accbb42869965e5347f7576b3f",
-    ]) expect(combined).toContain(required);
-    expect(combined).toContain("local bridge unavailable");
-    expect(combined).toContain("Preview");
-    expect(combined).toContain("promote");
-    expect(combined).not.toMatch(/OPENAI_API_KEY=.*\S|FINNHUB_API_KEY=.*\S|DATABASE_URL=.*\S/);
+    expect(deploy).toContain("vercel: 58.4.0");
+    expect(deploy).toContain("trusted absolute Corepack");
+    expect(combined).not.toMatch(/^\s*(?:pnpm|npx|vercel|powershell)(?:\.exe)?\s/mu);
+    expect(deploy).not.toMatch(/\$env:(?:LOCALAPPDATA|ProgramFiles)[\s\S]{0,240}(?:Move-Item|volume\s+rm)/u);
+    expect(deploy).toContain("scripts/setup-hybrid-worker.ps1 -MaintenanceRebuild");
+    expect(deploy).toContain("GUSTAVO_HYBRID_WAKE_URL");
+    expect(deploy).toContain("GUSTAVO_HYBRID_PUBLIC_WAKE_URL");
+    expect(combined).not.toContain("GUSTAVO_MARKET_POLLER_ENABLED");
+
+    const migrate = deploy.indexOf("production:migrate");
+    const empty = deploy.indexOf("migrated authority-only empty inventory");
+    const backup = deploy.indexOf("create.ps1");
+    const bootstrap = deploy.indexOf("production:bootstrap");
+    expect(migrate).toBeGreaterThan(-1);
+    expect(empty).toBeGreaterThan(migrate);
+    expect(backup).toBeGreaterThan(empty);
+    expect(bootstrap).toBeGreaterThan(backup);
+
+    expect(deploy).toContain("git status --porcelain");
+    expect(deploy).toContain("reviewed pushed HEAD");
+    expect(deploy).toContain("deployment source metadata");
+    expect(deploy).toContain("Project Settings > Domains");
+    expect(deploy).toContain("www.gustavo.lol -> gustavo.lol");
+
+    const bridgeDisabled = deploy.indexOf("GUSTAVO_HYBRID_BRIDGE_ENABLED=false");
+    const pauseMarket = deploy.indexOf("pause the exact five-minute market schedule", bridgeDisabled);
+    const settleActive = deploy.indexOf("zero CLAIMED jobs and no active market poll", pauseMarket);
+    const stopWorker = deploy.indexOf("prove worker and container absence", settleActive);
+    expect(pauseMarket).toBeGreaterThan(bridgeDisabled);
+    expect(settleActive).toBeGreaterThan(pauseMarket);
+    expect(stopWorker).toBeGreaterThan(settleActive);
+    expect(deploy).toContain("durable PENDING jobs remain queued for reconnect recovery");
+
+    expect(deploy).toContain("GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL");
+    expect(deploy).toContain("1,000 messages/day provider ceiling");
+    expect(deploy).toContain("900 messages/day application cap");
+    expect(deploy).toContain("SIMULATION ONLY — NOT A REAL TRADE");
+    expect(combined).not.toMatch(/^(?:OPENAI_API_KEY|FINNHUB_API_KEY|DATABASE_URL|GUSTAVO_EVENT_ROOT_KEY_V1|QSTASH_(?:TOKEN|CURRENT_SIGNING_KEY|NEXT_SIGNING_KEY))\s*=\s*\S+/mu);
   });
 });
 ```
 
-Expected initial state: `readFileSync("docs/VERCEL_DEPLOYMENT.md")` fails with `ENOENT`.
+Expected initial state: current T21 docs fail on bare ambient commands, mutable destructive paths, backup order, hosted/local wake classification, the inert market flag, source/domain proof, and contradictory pending-work shutdown.
 
 #### Green — minimum implementation
 
-- Write one command-ordered runbook: create Free resources, link the existing Vercel team/project, set Node 24/Corepack, set secrets through dashboards/CLI stdin, migrate, bootstrap, install Docker Desktop/local worker, build and record the pinned local Codex image digest, create/sign into the exact auth volume, start Funnel, configure two QStash schedules, deploy and smoke Preview, create a staged production deployment with `vercel --prod --skip-domain`, smoke that production-authority URL, promote that exact staged deployment with `vercel promote <url> --yes`, and verify domains.
+- Begin with trusted KnownFolder-derived absolute Git/Node/Corepack/PowerShell paths, verify Node 24/pnpm 11.16.0, and invoke every repository command through absolute Node plus Corepack's JS entry. Invoke repository-pinned Vercel CLI `58.4.0` only through `pnpm exec vercel`; never use bare `pnpm`, `npx`, `vercel`, PowerShell, or a mutable environment-derived executable.
+- Fail closed unless the working tree is clean, `HEAD` equals the reviewed pushed upstream commit, and Preview/staged deployment source metadata matches that exact SHA. Configure both Vercel Project Domains explicitly and set the `www.gustavo.lol -> gustavo.lol` redirect in Project Settings before verification.
+- Write one command-ordered runbook: create Free resources; link the existing Vercel team/project; set secrets through dashboards/interactive stdin including hosted `GUSTAVO_HYBRID_WAKE_URL`; migrate; verify the exact migrated authority-only empty inventory; create and verify the migrated-empty encrypted backup; bootstrap; install the local worker; configure two paused schedules; deploy/smoke Preview; activate Production bridge authority; create/smoke staged Production; exact-promote without rebuild; verify domains; then enable schedules.
 - Document daily/provider dashboard checks and application caps: QStash Free provider ceiling 1,000/day with Gustavo capped at 900/day, Codex 100/day/one active, Finnhub 96/window/exactly 95 results, Redis TTL/key bounds, latest quote and seven-day poll bounds.
 - Document PC-offline behavior: public/history hosted, messages durable/queued, market stale, local health offline; document reconnect recovery.
 - Document that existing accepted five-minute/direct wakes refresh the DB-clock CODEX lease, two missed wake intervals make it offline at 12 minutes, current-day quota 100 is quota-limited, and there is no independent timer/poller/schedule.
 - Document that reconnect never re-polls an expired window: retained incomplete rows fail once before seven-day pruning, while already pruned rows are skipped and only the newly reserved current window may call Finnhub.
 - Configure the five-minute schedule with the exact fixed signed `MARKET_CURRENT` body. Explain that QStash does not supply a timestamp: after verification/receipt/quota, the local worker derives PostgreSQL's current bucket and T14 reservation rechecks it before provider work.
-- Document backup-before-cutover, flags-first rollback, exact schedule/task/Funnel cleanup, previous Ready promotion or exact safe-shell commit, and additive migration retention.
-- Add only blank secret names and deployment-profile examples to `infra/env.example`; state that the containerized standalone Codex uses interactive ChatGPT sign-in through the dedicated volume and remains an unsupported application backend. Document image rebuild/re-auth, exact-label reconciliation, and termination-failure shutdown without printing volume/image/container identifiers in application health.
+- Document that hosted bridge disable is a staged/smoked/exact-promoted `GUSTAVO_HYBRID_BRIDGE_ENABLED=false` artifact. Recurring market disable is pausing the exact market schedule, settling already-admitted active work, then the T15 stop/Funnel/container absence proof; durable `PENDING` jobs remain queued for startup recovery and are never required to disappear.
+- Document image rebuild/re-auth only through `scripts/setup-hybrid-worker.ps1 -MaintenanceRebuild` (and its optional auth-volume rotation switch). Do not publish manual config moves, ambient Docker calls, plaintext backup files, or undefined retirement steps. Rotation/revocation occurs after the new owner-only config and smoke succeed.
+- Document backup-before-bootstrap/cutover, exact schedule/task/Funnel cleanup, previous disabled Ready or restaged exact safe-shell commit, additive migration retention, and proven worker/container absence during rollback.
 - Document creating the local-only Neon materializer login, granting only `gustavo_market_materializer`, copying its pooled URL into the protected worker configuration, rotation/revocation, and safe degradation. Explicitly forbid setting `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL` in Vercel or forwarding it to Codex/Finnhub/QStash.
 
 #### Refactor
@@ -1640,9 +1768,9 @@ Expected initial state: `readFileSync("docs/VERCEL_DEPLOYMENT.md")` fails with `
 
 #### Verify
 
-Command: `pnpm vitest run tests/deployment/vercel-hybrid.test.ts -t "names every free quota, secret channel, smoke gate, degraded state, and exact rollback action"`
+Command: trusted bundled Node/pnpm runs `vitest run tests/deployment/vercel-hybrid.test.ts -t "uses executable authorities for deploy, maintenance, market shutdown, backup, and rollback"`.
 
-Expected: one selected test passes, zero fail, exit code 0; Markdown contains no populated secret assignments.
+Expected: one selected test passes, zero fail, exit code 0; full deployment file and TypeScript pass; Markdown contains no populated secret assignment or unsafe ambient command form.
 
 #### Reviewable as a unit?
 
@@ -1662,7 +1790,8 @@ File: `tests/e2e/gustavo-hybrid-production.spec.ts`
 ```ts
 import { expect, test } from "@playwright/test";
 import {
-  assertMarketMaterializerIsolation, e2eBaseURL, issueInvitation,
+  assertHostedWakePublished, assertMarketMaterializerIsolation, e2eBaseURL,
+  issueInvitation, pauseMarketScheduleAndStopWorker,
 } from "./fixtures";
 
 const PRIVATE_CANARY = "private-hybrid-canary-813";
@@ -1682,12 +1811,25 @@ test("fresh operator chat, 95-symbol market, offline recovery, and public redact
   await page.getByLabel("Message").fill(PRIVATE_CANARY);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText(PRIVATE_CANARY)).toBeVisible();
+  await expect(assertHostedWakePublished()).resolves.toMatchObject({
+    destinationVariable: "GUSTAVO_HYBRID_WAKE_URL",
+    bodyKind: "JOB",
+    accepted: true,
+  });
   await expect(page.getByText("Node private fixture reply")).toBeVisible({ timeout: 30_000 });
 
   await page.goto(`${e2eBaseURL()}/market`);
   await expect(page.locator("[data-market-symbol]")).toHaveCount(95);
   await expect(page.locator('[data-market-symbol="AAPL"]')).toContainText(/Fresh|Unavailable/);
   await expect(page.locator('[data-market-symbol="ARKK"]')).toContainText(/Fresh|Unavailable/);
+
+  await expect(pauseMarketScheduleAndStopWorker()).resolves.toEqual({
+    schedulePaused: true,
+    activePollSettled: true,
+    claimedJobsSettled: true,
+    pendingJobsPreserved: true,
+    containerAbsent: true,
+  });
 
   await page.goto(e2eBaseURL());
   await expect(page.getByText("SIMULATION ONLY — NOT A REAL TRADE")).toBeVisible();
@@ -1704,6 +1846,8 @@ Expected initial state: the message remains queued because no local hybrid E2E c
 - Use the existing disposable PostgreSQL/Next fixture; do not add a production fixture endpoint, fake production provider, or test-mode bypass.
 - The disposable fixture creates distinct ordinary and materializer login roles, grants only the migration-created permission role to the latter, passes the materializer URL only to the local test worker, and proves an ordinary-role matching-binding forgery is rejected before the browser story.
 - The five-minute QStash fixture sends the fixed `MARKET_CURRENT` body; assert the local worker derives the current window from database time after receipt/quota and that no dynamic schedule timestamp or hosted relay exists.
+- Exercise the actual hosted direct-chat publisher with hosted `GUSTAVO_HYBRID_WAKE_URL` and QStash token authority; do not replace that proof with an unrelated local one-shot.
+- Prove market disable by pausing the exact market schedule, settling the admitted poll/claimed jobs, closing worker admission, stopping the worker, and proving container absence. Preserve durable `PENDING` jobs for restart; do not reference or synthesize the removed market-poller env flag.
 - Run one market wake, then verify 95 rows, timestamps/freshness, exact chat attribution, Main/Evaluator priority fixture, one active Codex container, and no local data copied at bootstrap.
 - Stop the local controller to verify hosted public/history plus queued/offline status; restart it and verify exactly-once drain/recovery.
 - Simulate abrupt loss without the clean OFFLINE write, advance database time past the 12-minute CODEX lease, and verify chat/health become offline; separately seed current UTC `CODEX_JOBS=100/100` with a fresh heartbeat and verify quota-limited. Accepted wake refresh must not delay the 202 or create an extra schedule/timer.
@@ -1717,7 +1861,7 @@ Expected initial state: the message remains queued because no local hybrid E2E c
 
 #### Verify
 
-Command: `pnpm playwright test tests/e2e/gustavo-hybrid-production.spec.ts --workers=1`
+Command: trusted bundled Node/pnpm runs `playwright test tests/e2e/gustavo-hybrid-production.spec.ts --workers=1`.
 
 Expected: one browser story passes, zero fail, exit code 0; no owned test child, database, result directory, or port remains.
 
@@ -1771,16 +1915,18 @@ Expected initial state: with live verification enabled before cutover, the curre
 #### Green — minimum implementation
 
 - Confirm the selected plans are Vercel Hobby, Neon Free, Upstash Redis Free, QStash Free, Tailscale Free personal, and Finnhub Free personal; record plan names and nonsecret resource IDs in the runbook.
-- Create a fresh Neon database in the selected US East region, create empty Upstash Redis/QStash resources, and set only secret-store environment values. Never upload local PostgreSQL, Valkey, backups, accounts, memories, or market data.
+- Create a fresh Neon database in the selected US East region, create empty Upstash Redis/QStash resources, and set only secret-store environment values. Hosted `GUSTAVO_HYBRID_WAKE_URL` belongs in Vercel; local `GUSTAVO_HYBRID_PUBLIC_WAKE_URL` belongs only in the worker config. Never upload local PostgreSQL, Valkey, backups, accounts, memories, or market data.
 - Create a separate Neon materializer login, grant it only the migration-created `gustavo_market_materializer` NOLOGIN role, and store its pooled URL only in the protected local worker configuration. Verify the ordinary/Vercel role cannot insert consumption bindings and that no Vercel environment contains `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL`.
-- Link the existing Vercel team/project, set Node 24.x and `ENABLE_EXPERIMENTAL_COREPACK=1`, push the reviewed mission branch, deploy Preview for the early hosted gate, then create a production-environment deployment with `vercel --prod --skip-domain`; run migrations/bootstrap against that staged authority and redeem the single invitation.
+- Through KnownFolder-derived trusted absolute Git/Node/Corepack/PowerShell paths and repository-pinned Vercel CLI `58.4.0`, require a clean tree whose `HEAD` equals the reviewed pushed upstream commit. Link the existing team/project, set Node 24.x and `ENABLE_EXPERIMENTAL_COREPACK=1`, deploy Preview for the early hosted gate, and compare deployment source metadata to that SHA.
+- Migrate the fresh database, verify the exact migrated authority-only empty inventory, create and verify the migrated-empty encrypted backup, then bootstrap and retain the single invitation outside logs. Create the staged Production deployment with pinned `vercel --prod --skip-domain`; no ambient command is authorized.
 - Install/sign in the isolated local worker account, Docker Desktop, the pinned local Codex image/auth volume, Tailscale, and Finnhub key; verify the recorded image digest and internal timeout, start the exact loopback/Funnel controller, and create only the 15-minute maintenance and five-minute market QStash schedules.
 - Run Preview smoke first. Then run the public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, container kill/wait and startup-reconciliation rehearsal, and quota boundary checks against the staged production deployment URL before promotion.
 - Rehearse a retained prior market window and an already pruned one: prove no historical repoll or quota re-reservation, one bounded failed summary before retention expiry, cleanup-only afterward, and a normal current-window poll.
 - Run the regenerated focused SSE suite before cutover and retain its queue-full, active-authentication, active-revalidation, protected-load, source/iterator, response-cancel, and ordered durable reconnect proofs.
 - Verify an accepted existing wake refreshes the database-clock CODEX lease, two missed five-minute wakes age it offline at 12 minutes, quota 100 overrides fresh heartbeat, and no third schedule or persistent heartbeat timer exists.
 - Verify the live five-minute schedule body is exactly `MARKET_CURRENT`; the local worker derives the PostgreSQL window and a forced boundary crossing skips rather than polling an old window.
-- Promote that exact staged Ready deployment without rebuild using `vercel promote <staged-production-url> --yes`, verify apex TLS and `www` redirect, then rehearse flags-first local/schedule rollback while confirming the hosted public/history surfaces remain available; restore the verified production state afterward.
+- In Vercel Project Settings > Domains, explicitly configure `www.gustavo.lol` to redirect to `gustavo.lol`. Promote the exact staged Ready deployment without rebuild using pinned `vercel promote <staged-production-url> --yes`, then verify apex TLS, redirect, unchanged deployment ID/SHA, and actual hosted chat publication.
+- Rehearse rollback by exact-promoting a bridge-disabled staged artifact, pausing the exact schedules, settling active/claimed work while preserving durable `PENDING`, stopping the worker through its admission barrier, resetting Funnel, and proving container absence. Never treat the removed market-poller env variable as authority; restore through another fully smoked exact staged artifact, then resume schedules.
 - Run the live test with the Vercel token supplied through the process environment; never write tokens or resource URLs containing credentials to disk or command arguments.
 
 #### Refactor
@@ -1791,14 +1937,14 @@ Expected initial state: with live verification enabled before cutover, the curre
 
 Commands, in order:
 
-1. `pnpm install --frozen-lockfile`
-2. `pnpm vitest run tests/stream/sse-authorization.test.ts`
-3. `pnpm test`
-4. `pnpm tsc --noEmit`
-5. `pnpm build`
-6. `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1`
-7. `pnpm playwright test tests/e2e/gustavo-hybrid-production.spec.ts --workers=1`
-8. `$env:GUSTAVO_RUN_LIVE_VERCEL_VERIFY='1'; pnpm vitest run tests/deployment/vercel-hybrid.test.ts -t "serves the Ready Node-24 deployment on the canonical domains without public leakage"`
+1. `& $TrustedNode $TrustedCorepackScript pnpm install --frozen-lockfile`
+2. `& $TrustedNode $TrustedCorepackScript pnpm vitest run tests/stream/sse-authorization.test.ts`
+3. `& $TrustedNode $TrustedCorepackScript pnpm test`
+4. `& $TrustedNode $TrustedCorepackScript pnpm tsc --noEmit`
+5. `& $TrustedNode $TrustedCorepackScript pnpm build`
+6. `& $TrustedPowerShell -NoProfile -ExecutionPolicy Bypass -File scripts/validate.ps1`
+7. `& $TrustedNode $TrustedCorepackScript pnpm playwright test tests/e2e/gustavo-hybrid-production.spec.ts --workers=1`
+8. `$env:GUSTAVO_RUN_LIVE_VERCEL_VERIFY='1'; & $TrustedNode $TrustedCorepackScript pnpm vitest run tests/deployment/vercel-hybrid.test.ts -t "serves the Ready Node-24 deployment on the canonical domains without public leakage"`
 9. `git diff --check`
 
 Expected: every command exits 0; full unit/integration and focused Playwright suites have zero failures; validator reports a fresh build with no public leak; the live deployment test passes; only design-listed mission files and approved mission artifacts differ; `AGENTS.md` is byte-for-byte untouched by the mission.
@@ -1829,5 +1975,6 @@ Yes. All code is already green before this task; this unit contains named extern
 - [x] Hybrid-heartbeat lease prompt-update impact is resolved: T18 coalesces refreshes and projects DB-clock/quota authority; T19 reuses the same policy; T21/T22/T23 document and verify abrupt-loss aging without an extra loop or schedule.
 - [x] Staged-production promotion prompt-update impact is resolved: T21 documents Preview as an early gate plus `--prod --skip-domain` staged smoke and no-rebuild promotion; T23 executes and records both deployment gates before domain assignment.
 - [x] Static market-wake prompt-update impact is resolved: T20A implements the fixed signed `MARKET_CURRENT` trigger plus PostgreSQL window derivation; T21/T22/T23 document and verify the exact schedule body and no historical polling.
+- [x] Operable-deployment-maintenance prompt-update impact is resolved: T20B pins trusted deploy tooling/removes the inert market flag, T20C adds the reviewed worker maintenance authority, and regenerated T21/T22/T23 use real source/domain/backup/shutdown controls.
 
 Plan approved. Next: `mcax-execute`.

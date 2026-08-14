@@ -678,7 +678,6 @@ const EXPECTED_ACTIVE_ENV_KEYS = [
   "GUSTAVO_EVENT_ROOT_KEY_VERSION",
   "GUSTAVO_HYBRID_BRIDGE_ENABLED",
   "GUSTAVO_HYBRID_WAKE_URL",
-  "GUSTAVO_MARKET_POLLER_ENABLED",
   "GUSTAVO_OPERATOR_HEALTH_TOKEN",
   "QSTASH_CURRENT_SIGNING_KEY",
   "QSTASH_NEXT_SIGNING_KEY",
@@ -716,6 +715,21 @@ function activeValues(env: string, name: string): string[] {
 }
 
 describe("Vercel hybrid deployment contract", () => {
+  it("pins the deployment CLI and exposes only real hosted and local controls", () => {
+    const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+    const local = readFileSync("infra/env.example", "utf8");
+    const hosted = readFileSync("infra/vercel.env.example", "utf8");
+
+    expect(manifest.devDependencies.vercel).toBe("58.4.0");
+    expect(local).toContain("GUSTAVO_HYBRID_PUBLIC_WAKE_URL=");
+    expect(local).not.toContain("GUSTAVO_HYBRID_WAKE_URL=");
+    expect(local).not.toContain("GUSTAVO_HYBRID_BRIDGE_ENABLED");
+    expect(hosted).toContain("GUSTAVO_HYBRID_WAKE_URL=");
+    expect(hosted).not.toContain("GUSTAVO_HYBRID_PUBLIC_WAKE_URL=");
+    expect(hosted).toContain("GUSTAVO_HYBRID_BRIDGE_ENABLED=false");
+    expect(`${local}\n${hosted}`).not.toContain("GUSTAVO_MARKET_POLLER_ENABLED");
+  });
+
   it("pins Node 24, pnpm 11, bounded functions, and explicit free-tier flags", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     const vercel = JSON.parse(readFileSync("vercel.json", "utf8"));
@@ -740,7 +754,6 @@ describe("Vercel hybrid deployment contract", () => {
     expect(activeValues(env, "GUSTAVO_DATABASE_SSL")).toEqual(["require"]);
     expect(activeValues(env, "GUSTAVO_EVENT_ROOT_KEY_VERSION")).toEqual(["1"]);
     expect(activeValues(env, bridgeFlag)).toEqual(["false"]);
-    expect(activeValues(env, "GUSTAVO_MARKET_POLLER_ENABLED")).toEqual(["false"]);
     expect(() => activeValues(
       env.replace("DATABASE_URL=", "DATABASE_URL"),
       "DATABASE_URL",
