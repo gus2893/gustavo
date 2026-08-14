@@ -63,6 +63,9 @@ $$;
 create table bridge_model_jobs (
   job_id uuid primary key default gen_random_uuid(),
   source_event_id uuid not null unique references events(id),
+  cycle_id uuid references broadcast_cycles(id),
+  candidate_event_id uuid references events(id),
+  parent_main_job_id uuid references bridge_model_jobs(job_id),
   role text not null check (role in ('NODE', 'EVALUATOR', 'MAIN')),
   kind text not null check (
     kind in ('NODE_REPLY', 'EVALUATOR_REVIEW', 'MAIN_GENERATION')
@@ -102,6 +105,10 @@ create table bridge_model_jobs (
     or (role='EVALUATOR' and kind='EVALUATOR_REVIEW' and priority=10)
     or (role='MAIN' and kind='MAIN_GENERATION' and priority=20)
   ),
+  check (
+    (role='EVALUATOR' and parent_main_job_id is not null)
+    or (role<>'EVALUATOR' and parent_main_job_id is null)
+  ),
   check ((lease_owner is null)=(lease_expires_at is null)),
   check (
     (status='PENDING' and attempt_count=0 and lease_owner is null
@@ -130,6 +137,12 @@ create index bridge_model_jobs_lease_recovery_idx
 create index bridge_model_jobs_terminal_retention_idx
   on bridge_model_jobs (updated_at, job_id)
   where status in ('COMPLETED', 'FAILED');
+
+create unique index bridge_model_jobs_main_cycle_idx
+  on bridge_model_jobs (cycle_id) where role='MAIN';
+
+create unique index bridge_model_jobs_evaluator_candidate_idx
+  on bridge_model_jobs (candidate_event_id) where role='EVALUATOR';
 
 create function bridge_model_job_is_prunable(
   target_status text,
@@ -161,11 +174,16 @@ $$;
 create function validate_bridge_model_job_insert() returns trigger
 language plpgsql as $$
 begin
-  if new.role<>'NODE' or new.kind<>'NODE_REPLY' or new.priority<>0
-    or new.request_digest is distinct from bridge_model_job_request_digest(
+  if new.request_digest is distinct from bridge_model_job_request_digest(
       new.source_event_id, new.role, new.kind
-    )
-    or not exists (
+    ) then
+    raise exception 'BRIDGE_JOB_SOURCE_AUTHORITY_INVALID';
+  end if;
+
+  if new.role='NODE' and new.kind='NODE_REPLY' and new.priority=0
+    and new.cycle_id is null and new.candidate_event_id is null
+    and new.parent_main_job_id is null
+    and exists (
       select 1
       from messages message
       join conversations conversation
@@ -196,10 +214,70 @@ begin
         and message.completed_at is not null
         and new.created_at>=message.completed_at
     )
-  then
-    raise exception 'BRIDGE_JOB_SOURCE_AUTHORITY_INVALID';
+  then return new;
   end if;
-  return new;
+
+  if new.role='MAIN' and new.kind='MAIN_GENERATION' and new.priority=20
+    and new.cycle_id is not null and new.candidate_event_id is null
+    and new.parent_main_job_id is null
+    and exists (
+      select 1
+      from broadcast_cycles cycle
+      join events source on source.id=cycle.open_event_id
+      join encrypted_event_bodies body
+        on body.event_id=source.id and body.aggregate_id=source.aggregate_id
+       and body.data_key_id is not null
+      join transactional_outbox outbox
+        on outbox.event_id=source.id
+       and outbox.topic='main.broadcast.generation.requested'
+       and outbox.payload=jsonb_build_object('eventId',source.id::text)
+      where cycle.id=new.cycle_id and source.id=new.source_event_id
+        and source.aggregate_id=cycle.id::text
+        and source.actor_type='MAIN_BRAIN' and source.actor_id='gustavo-main'
+        and source.type='main.broadcast.generation.requested'
+        and source.visibility='SHARED' and source.account_id is null
+        and source.policy_version=cycle.policy_version
+    )
+  then return new;
+  end if;
+
+  if new.role='EVALUATOR' and new.kind='EVALUATOR_REVIEW' and new.priority=10
+    and new.cycle_id is not null and new.candidate_event_id=new.source_event_id
+    and new.parent_main_job_id is not null
+    and exists (
+      select 1
+      from broadcast_cycles cycle
+      join bridge_model_jobs parent on parent.job_id=new.parent_main_job_id
+      join events candidate on candidate.id=new.candidate_event_id
+      join encrypted_event_bodies body
+        on body.event_id=candidate.id and body.aggregate_id=candidate.aggregate_id
+       and body.data_key_id is not null
+      join transactional_outbox outbox
+        on outbox.event_id=candidate.id
+       and outbox.topic='main.broadcast.candidate.generated'
+       and outbox.payload=jsonb_build_object('eventId',candidate.id::text)
+      where cycle.id=new.cycle_id
+        and parent.role='MAIN' and parent.kind='MAIN_GENERATION' and parent.priority=20
+        and parent.cycle_id=cycle.id and parent.candidate_event_id is null
+        and parent.status='COMPLETED' and parent.output_event_id=candidate.id
+        and parent.source_event_id=cycle.open_event_id
+        and parent.request_digest=bridge_model_job_request_digest(
+          parent.source_event_id,parent.role,parent.kind
+        )
+        and candidate.aggregate_id=cycle.id::text
+        and candidate.actor_type='MAIN_BRAIN' and candidate.actor_id='gustavo-main'
+        and candidate.type='main.broadcast.candidate.generated'
+        and candidate.visibility='SHARED' and candidate.account_id is null
+        and candidate.causation_id=cycle.open_event_id
+        and candidate.correlation_id=(
+          select source.correlation_id from events source where source.id=cycle.open_event_id
+        )
+        and candidate.policy_version=cycle.policy_version
+    )
+  then return new;
+  end if;
+
+  raise exception 'BRIDGE_JOB_SOURCE_AUTHORITY_INVALID';
 end;
 $$;
 
@@ -222,6 +300,9 @@ begin
   end if;
   if new.job_id is distinct from old.job_id
     or new.source_event_id is distinct from old.source_event_id
+    or new.cycle_id is distinct from old.cycle_id
+    or new.candidate_event_id is distinct from old.candidate_event_id
+    or new.parent_main_job_id is distinct from old.parent_main_job_id
     or new.role is distinct from old.role
     or new.kind is distinct from old.kind
     or new.priority is distinct from old.priority
@@ -290,6 +371,26 @@ $$;
 create trigger completed_user_message_enqueues_node_bridge_job
 after insert on messages
 for each row execute function enqueue_node_bridge_job();
+
+create function enqueue_main_bridge_job() returns trigger
+language plpgsql as $$
+begin
+  -- The cycle's main.broadcast.generation.requested event is the sole source authority.
+  insert into bridge_model_jobs (
+    source_event_id,cycle_id,candidate_event_id,role,kind,priority,
+    request_digest,created_at,updated_at
+  ) values (
+    new.open_event_id,new.id,null,'MAIN','MAIN_GENERATION',20,
+    bridge_model_job_request_digest(new.open_event_id,'MAIN','MAIN_GENERATION'),
+    new.opened_at,new.opened_at
+  ) on conflict (source_event_id) do nothing;
+  return new;
+end;
+$$;
+
+create trigger broadcast_cycle_enqueues_main_bridge_job
+after insert on broadcast_cycles
+for each row execute function enqueue_main_bridge_job();
 
 create table bridge_wake_receipts (
   message_id text primary key check (

@@ -1,6 +1,8 @@
-import type { EventDatabase } from "../../lib/server/events/types";
+import { readFileSync } from "node:fs";
+import type { EventDatabase, JsonValue } from "../../lib/server/events/types";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  BROADCAST_EVALUATOR_RUBRIC,
   BRIDGE_JOB_RETENTION_DAYS,
   BRIDGE_JOB_LEASE_MINUTES,
   BRIDGE_JOB_KINDS,
@@ -9,6 +11,7 @@ import {
   BRIDGE_ROLE_PRIORITIES,
   BRIDGE_SAFE_TERMINAL_CODES,
   claimNextBridgeJob,
+  commitAcceptedEvaluatorBridgeJob,
   completeBridgeJob,
   DEPLOYMENT_QUOTA_NAMES,
   HYBRID_WORKER_COMPONENTS,
@@ -21,16 +24,32 @@ import {
   MARKET_WINDOW_SAFE_CODES,
   MARKET_WINDOW_STATUSES,
   failBridgeJob,
+  stageMainCandidateAndEvaluator,
+  validateMainGenerationAuthority,
   type BridgeCallerFailureCode,
   type MarketLatestQuoteRow,
   type MarketPollWindowRow,
   type HybridWorkerHeartbeatRow,
 } from "../../lib/server/bridge/jobs";
-import { appendEvent } from "../../lib/server/events/store";
+import { canonicalContentDigest } from "../../lib/server/events/integrity";
+import {
+  appendEvent,
+  readEventBody,
+  rewrapAggregateDataKey,
+} from "../../lib/server/events/store";
 import { appendMessage, listMessages } from "../../lib/server/history/messages";
 import { forgetConversation } from "../../lib/server/memory/forget";
-import type { ModelGenerationResult } from "../../lib/server/models/types";
+import type {
+  ModelGenerationRequest,
+  ModelGenerationResult,
+} from "../../lib/server/models/types";
 import { routeNodeReply } from "../../lib/server/node-brains/router";
+import { openDueBroadcastCycles } from "../../lib/server/main-brain/schedules";
+import {
+  executeEvaluatorBridgeJob,
+  executeMainBridgeJob,
+  parseHybridModelJsonOutput,
+} from "../../worker/hybrid/runtime";
 import { createConversationFixture, type ConversationFixture } from "../helpers/postgres";
 
 const routeState = vi.hoisted(() => ({
@@ -101,6 +120,148 @@ function generationResult(output: string): ModelGenerationResult {
       },
     },
   };
+}
+
+function evaluatorAuthority(
+  candidateEventId = "candidate-event",
+): {
+  readonly cycleId: string;
+  readonly candidateEventId: string;
+  readonly prompt: string;
+  readonly rubricVersion: typeof BROADCAST_EVALUATOR_RUBRIC.version;
+  readonly rubricDigest: string;
+  readonly rubricCriteria: readonly string[];
+} {
+  return {
+    cycleId: "cycle-1",
+    candidateEventId,
+    prompt: "authorized rubric",
+    rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+    rubricDigest: BROADCAST_EVALUATOR_RUBRIC.digest,
+    rubricCriteria: BROADCAST_EVALUATOR_RUBRIC.criteria,
+  };
+}
+
+async function createForgedCandidateStateFixture(
+  id: string,
+  mainStateVersion = 2,
+  insertEvaluator = true,
+) {
+  const fixture = await createConversationFixture(`bridge-forged-candidate-${id}`);
+  const scheduleId = `bridge-forged-state-${id}`;
+  await fixture.db.query(
+    `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+     values ($1,'0 14 * * *','UTC',true,$2)`,
+    [scheduleId, "2026-08-13T13:59:00.000Z"],
+  );
+  const [cycle] = await openDueBroadcastCycles(
+    { db: fixture.db },
+    new Date("2026-08-13T14:00:00.000Z"),
+  );
+  if (!cycle) throw new Error("EXPECTED_BROADCAST_CYCLE");
+  const generation = await fixture.db.one<{
+    readonly correlation_id: string;
+    readonly integrity_hash: string;
+    readonly policy_version: string;
+    readonly request_hash: string;
+  }>(
+    `select correlation_id::text,integrity_hash::text,policy_version,request_hash::text
+     from events where id=$1`,
+    [cycle.openEventId],
+  );
+  const candidate = await appendEvent(fixture.db, {
+    aggregateId: cycle.id,
+    actor: { type: "MAIN_BRAIN", id: "gustavo-main" },
+    type: "main.broadcast.candidate.generated",
+    visibility: "SHARED",
+    body: {
+      candidate: "AAPL is testing completed support.",
+      cycleId: cycle.id,
+      editorialPolicyVersion: generation.policy_version,
+      generationEventId: cycle.openEventId,
+      generationIntegrityHash: generation.integrity_hash,
+      generationRequestHash: generation.request_hash,
+      mainStateVersion,
+      policyVersion: generation.policy_version,
+      snapshotDigest: canonicalContentDigest(cycle.snapshot),
+      sourceIds: cycle.snapshot.marketData.highWaterId === null
+        ? [] : [cycle.snapshot.marketData.highWaterId],
+    },
+    idempotencyKey: `forged-candidate-state-${id}`,
+    causationId: cycle.openEventId,
+    correlationId: generation.correlation_id,
+    policyVersion: generation.policy_version,
+  });
+  if (insertEvaluator) {
+    const parent = await claimNextBridgeJob(fixture.db, {
+      workerId: `forged-parent-${id}`,
+      now: new Date(),
+    });
+    if (!parent || parent.role !== "MAIN") throw new Error("EXPECTED_PARENT_MAIN_JOB");
+    await fixture.db.query(
+      `update bridge_model_jobs
+       set status='COMPLETED',lease_owner=null,lease_expires_at=null,
+           output_event_id=$2,safe_code=null
+       where job_id=$1 and status='CLAIMED'`,
+      [parent.jobId, candidate.id],
+    );
+    await fixture.db.query(
+      `insert into bridge_model_jobs (
+         source_event_id,cycle_id,candidate_event_id,parent_main_job_id,
+         role,kind,priority,request_digest
+       ) values (
+         $1,$2,$1,$3,'EVALUATOR','EVALUATOR_REVIEW',10,
+         bridge_model_job_request_digest($1,'EVALUATOR','EVALUATOR_REVIEW')
+       )`,
+      [candidate.id, cycle.id, parent.jobId],
+    );
+  }
+  return { fixture, cycle, candidate };
+}
+
+async function createNoncanonicalGenerationFixture(id: string) {
+  const fixture = await createConversationFixture(`bridge-forged-generation-${id}`);
+  const cycleId = crypto.randomUUID();
+  const scheduleId = `bridge-forged-generation-${id}`;
+  const slotAt = "2026-08-13T14:00:00.000Z";
+  const snapshot = {
+    mainStateVersion: null,
+    policyVersion: "main-broadcast-policy-v1",
+    marketData: { highWaterId: null, observedAt: null },
+  };
+  await fixture.db.query(
+    `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+     values ($1,'0 14 * * *','UTC',true,$2)`,
+    [scheduleId, "2026-08-13T13:59:00.000Z"],
+  );
+  const generation = await appendEvent(fixture.db, {
+    aggregateId: cycleId,
+    actor: { type: "MAIN_BRAIN", id: "gustavo-main" },
+    type: "main.broadcast.generation.requested",
+    visibility: "SHARED",
+    body: {
+      author: { type: "MAIN_BRAIN", id: "gustavo-main" },
+      scheduleId,
+      scheduleVersion: 1,
+      slotAt,
+      snapshot,
+      unexpected: "must reject",
+    },
+    idempotencyKey: `forged-generation-body-${id}`,
+    occurredAt: new Date(slotAt),
+    policyVersion: "main-broadcast-policy-v1",
+  });
+  await fixture.db.query(
+    `insert into broadcast_cycles (
+       id,schedule_id,schedule_version,slot_at,author_type,author_id,
+       main_state_version,policy_version,snapshot,open_event_id,opened_at
+     ) values (
+       $1,$2,1,$3,'MAIN_BRAIN','gustavo-main',
+       null,'main-broadcast-policy-v1',$4::jsonb,$5,$6
+     )`,
+    [cycleId, scheduleId, slotAt, JSON.stringify(snapshot), generation.id, generation.occurredAt],
+  );
+  return { fixture, cycleId };
 }
 
 function observeHybridTransactionScopes(
@@ -1142,43 +1303,39 @@ describe("bridge claiming", () => {
 
   it("claims all roles by priority and preserves identity on expired recovery", async () => {
     const fixture = await createConversationFixture("bridge-priority-recovery");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-priority-evaluator','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [evaluatorCycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const parent = await claimNextBridgeJob(fixture.db, {
+      workerId: "priority-parent-main",
+      now: new Date("2026-08-13T14:00:00.000Z"),
+    });
+    const evaluator = await stageMainCandidateAndEvaluator(fixture.db, {
+      jobId: parent!.jobId,
+      workerId: "priority-parent-main",
+      attemptCount: parent!.attemptCount,
+      cycleId: evaluatorCycle!.id,
+      candidate: "AAPL remains near completed support.",
+    });
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-priority-main','1 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T14:00:00.000Z"],
+    );
+    const [mainCycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:01:00.000Z"),
+    );
     const node = await appendMessage(fixture, {
       idempotencyKey: "priority-node",
       role: "USER",
       text: "node",
-    });
-    const evaluator = await appendMessage(fixture, {
-      idempotencyKey: "priority-evaluator",
-      role: "USER",
-      text: "evaluator",
-    });
-    const main = await appendMessage(fixture, {
-      idempotencyKey: "priority-main",
-      role: "USER",
-      text: "main",
-    });
-    await fixture.db.transaction(async (transaction) => {
-      await transaction.query(
-        "alter table bridge_model_jobs disable trigger bridge_model_jobs_are_semantically_immutable",
-      );
-      try {
-        await transaction.query(
-          `update bridge_model_jobs
-              set role='EVALUATOR',kind='EVALUATOR_REVIEW',priority=10
-            where source_event_id=$1`,
-          [evaluator.eventId],
-        );
-        await transaction.query(
-          `update bridge_model_jobs
-              set role='MAIN',kind='MAIN_GENERATION',priority=20
-            where source_event_id=$1`,
-          [main.eventId],
-        );
-      } finally {
-        await transaction.query(
-          "alter table bridge_model_jobs enable trigger bridge_model_jobs_are_semantically_immutable",
-        );
-      }
     });
 
     const first = await claimNextBridgeJob(fixture.db, {
@@ -1196,7 +1353,10 @@ describe("bridge claiming", () => {
       workerId: "local-v1",
       now: new Date("2026-08-13T12:01:00Z"),
     });
-    expect(second).toMatchObject({ sourceEventId: evaluator.eventId, role: "EVALUATOR" });
+    expect(second).toMatchObject({
+      sourceEventId: evaluator.candidateEventId,
+      role: "EVALUATOR",
+    });
     await failBridgeJob(fixture.db, {
       jobId: second!.jobId,
       workerId: "local-v1",
@@ -1207,7 +1367,7 @@ describe("bridge claiming", () => {
       workerId: "local-v1",
       now: new Date("2026-08-13T12:02:00Z"),
     });
-    expect(third).toMatchObject({ sourceEventId: main.eventId, role: "MAIN" });
+    expect(third).toMatchObject({ sourceEventId: mainCycle!.openEventId, role: "MAIN" });
     await failBridgeJob(fixture.db, {
       jobId: third!.jobId,
       workerId: "local-v1",
@@ -1426,47 +1586,50 @@ describe("bridge claiming", () => {
     actorId,
   ) => {
     const fixture = await createConversationFixture(`bridge-${role.toLowerCase()}-closed`);
-    const source = await appendMessage(fixture, {
-      idempotencyKey: `${role.toLowerCase()}-closed-source`,
-      role: "USER",
-      text: "source",
-    });
-    await fixture.db.transaction(async (transaction) => {
-      await transaction.query(
-        "alter table bridge_model_jobs disable trigger bridge_model_jobs_are_semantically_immutable",
-      );
-      try {
-        await transaction.query(
-          "update bridge_model_jobs set role=$2,kind=$3,priority=$4 where source_event_id=$1",
-          [source.eventId, role, kind, priority],
-        );
-      } finally {
-        await transaction.query(
-          "alter table bridge_model_jobs enable trigger bridge_model_jobs_are_semantically_immutable",
-        );
-      }
-    });
-    const claim = await claimNextBridgeJob(fixture.db, {
+    const scheduleId = `bridge-${role.toLowerCase()}-closed`;
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ($1,'0 14 * * *','UTC',true,$2)`,
+      [scheduleId, "2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    let claim = await claimNextBridgeJob(fixture.db, {
       workerId: "local-v1",
-      now: new Date("2026-08-13T12:00:00Z"),
+      now: new Date("2026-08-13T14:00:00Z"),
     });
+    if (role === "EVALUATOR") {
+      await stageMainCandidateAndEvaluator(fixture.db, {
+        jobId: claim!.jobId,
+        workerId: "local-v1",
+        attemptCount: claim!.attemptCount,
+        cycleId: cycle!.id,
+        candidate: "AAPL remains near completed support.",
+      });
+      claim = await claimNextBridgeJob(fixture.db, {
+        workerId: "local-v1",
+        now: new Date("2026-08-13T14:01:00Z"),
+      });
+    }
+    expect(claim).toMatchObject({ role, kind, priority });
     const sourceAuthority = await fixture.db.one<{
       readonly aggregate_id: string;
-      readonly account_id: string;
+      readonly account_id: string | null;
       readonly correlation_id: string;
     }>(
       "select aggregate_id,account_id,correlation_id::text from events where id=$1",
-      [source.eventId],
+      [claim!.sourceEventId],
     );
     const output = await appendEvent(fixture.db, {
       aggregateId: sourceAuthority.aggregate_id,
-      accountId: sourceAuthority.account_id,
       actor: { type: actorType, id: actorId },
       type: role === "MAIN" ? "bridge.main.output" : "bridge.evaluator.output",
       visibility: "SHARED",
       body: { protected: true },
       idempotencyKey: `bridge-${role.toLowerCase()}-permissive-output`,
-      causationId: source.eventId,
+      causationId: claim!.sourceEventId,
       correlationId: sourceAuthority.correlation_id,
     });
 
@@ -1709,6 +1872,1158 @@ describe("bridge claiming", () => {
       "select status,attempt_count,safe_code from bridge_model_jobs where job_id=$1",
       [claim!.jobId],
     )).resolves.toEqual({ status: "CLAIMED", attempt_count: 1, safe_code: null });
+  }, 30_000);
+});
+
+describe("Main and Evaluator bridge execution", () => {
+  it("parses bounded nested JSON with distinct object-local keys", () => {
+    expect(parseHybridModelJsonOutput(generationResult(
+      '{"left":{"value":1},"right":{"value":2}}',
+    ))).toEqual({ left: { value: 1 }, right: { value: 2 } });
+  });
+
+  it("rejects model JSON beyond the bounded nesting depth", () => {
+    const nested = `${"[".repeat(66)}null${"]".repeat(66)}`;
+    expect(() => parseHybridModelJsonOutput(generationResult(nested)))
+      .toThrow("HYBRID_MODEL_OUTPUT_INVALID");
+  });
+
+  it("rejects model JSON beyond the UTF-8 byte bound", () => {
+    const oversized = JSON.stringify({ candidate: "😀".repeat(30_000) });
+    expect(oversized.length).toBeLessThan(100_000);
+    expect(() => parseHybridModelJsonOutput(generationResult(oversized)))
+      .toThrow("HYBRID_MODEL_OUTPUT_INVALID");
+  });
+
+  it("fails Main model output with a duplicate candidate key before persistence", async () => {
+    const fixture = await createConversationFixture("bridge-main-duplicate-json-key");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-main-duplicate-json-key','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+
+    await expect((await import("../../worker/hybrid/runtime")).runOneHybridJob({
+      db: fixture.db,
+      workerId: "main-duplicate-json-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(
+        '{"candidate":"first","candidate":"second"}',
+      )),
+    })).resolves.toMatchObject({
+      role: "MAIN",
+      status: "FAILED",
+      safeCode: "CODEX_OUTPUT_INVALID",
+    });
+    await expect(fixture.db.one(
+      `select count(*)::int count from events
+        where aggregate_id=$1 and type='main.broadcast.candidate.generated'`,
+      [cycle!.id],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("fails Main model output with an escaped-equivalent candidate key", async () => {
+    const fixture = await createConversationFixture("bridge-main-escaped-duplicate-json-key");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-main-escaped-duplicate-json-key','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+
+    await expect((await import("../../worker/hybrid/runtime")).runOneHybridJob({
+      db: fixture.db,
+      workerId: "main-escaped-duplicate-json-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(
+        '{"candidate":"first","cand\\u0069date":"second"}',
+      )),
+    })).resolves.toMatchObject({
+      role: "MAIN",
+      status: "FAILED",
+      safeCode: "CODEX_OUTPUT_INVALID",
+    });
+    await expect(fixture.db.one(
+      `select count(*)::int count from events
+        where aggregate_id=$1 and type='main.broadcast.candidate.generated'`,
+      [cycle!.id],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("fails Evaluator model output with a duplicate decision key before broadcast", async () => {
+    const fixture = await createConversationFixture("bridge-evaluator-duplicate-json-key");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-evaluator-duplicate-json-key','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const runtime = await import("../../worker/hybrid/runtime");
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-duplicate-main-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(
+        JSON.stringify({ candidate: "AAPL remains near completed support." }),
+      )),
+    });
+
+    await expect(runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-duplicate-json-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(
+        '{"decision":"REJECT","decision":"ACCEPT","rationaleCode":"SUPPORTED",'
+          + `"rubricVersion":"${BROADCAST_EVALUATOR_RUBRIC.version}"}`,
+      )),
+    })).resolves.toMatchObject({
+      role: "EVALUATOR",
+      status: "FAILED",
+      safeCode: "CODEX_OUTPUT_INVALID",
+    });
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle!.id}`],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("fails Evaluator model output with an escaped-equivalent decision key", async () => {
+    const fixture = await createConversationFixture(
+      "bridge-evaluator-escaped-duplicate-json-key",
+    );
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-evaluator-escaped-duplicate-json-key','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const runtime = await import("../../worker/hybrid/runtime");
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-escaped-duplicate-main-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(
+        JSON.stringify({ candidate: "AAPL remains near completed support." }),
+      )),
+    });
+
+    await expect(runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-escaped-duplicate-json-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(
+        '{"decision":"REJECT","dec\\u0069sion":"ACCEPT","rationaleCode":"SUPPORTED",'
+          + `"rubricVersion":"${BROADCAST_EVALUATOR_RUBRIC.version}"}`,
+      )),
+    })).resolves.toMatchObject({
+      role: "EVALUATOR",
+      status: "FAILED",
+      safeCode: "CODEX_OUTPUT_INVALID",
+    });
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle!.id}`],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("stages Main through a concurrent cycle-key rewrap without lock inversion", async () => {
+    const fixture = await createConversationFixture("bridge-main-rewrap-concurrency");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-main-rewrap-concurrency','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const claimed = await claimNextBridgeJob(fixture.db, {
+      workerId: "main-rewrap-worker",
+      now: new Date(),
+    });
+    expect(claimed).toMatchObject({ role: "MAIN", cycleId: cycle!.id });
+    const gated = pauseAfterStatement(
+      fixture.db,
+      "bridge-cycle-key-lock",
+    );
+    const staging = stageMainCandidateAndEvaluator(gated.db, {
+      jobId: claimed!.jobId,
+      workerId: "main-rewrap-worker",
+      attemptCount: claimed!.attemptCount,
+      cycleId: cycle!.id,
+      candidate: "AAPL remains near completed support.",
+    });
+    void staging.catch(() => undefined);
+    try {
+      await bounded(gated.reached);
+      const rewrapping = rewrapAggregateDataKey(fixture.db, cycle!.id, 1);
+      void rewrapping.catch(() => undefined);
+      const rewrapState = await Promise.race([
+        rewrapping.then(() => "completed" as const),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
+      ]);
+      expect(rewrapState).toBe("blocked");
+      gated.release();
+      const [staged] = await bounded(Promise.all([staging, rewrapping]));
+      expect(staged).toEqual({
+        candidateEventId: expect.any(String),
+        evaluatorJobId: expect.any(String),
+      });
+    } finally {
+      gated.release();
+    }
+  }, 30_000);
+
+  it("commits Evaluator ACCEPT before concurrent cycle-key deletion without deadlock", async () => {
+    const fixture = await createConversationFixture("bridge-evaluator-key-delete-concurrency");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-evaluator-key-delete-concurrency','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const runtime = await import("../../worker/hybrid/runtime");
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-key-delete-main-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+        candidate: "AAPL remains near completed support.",
+      }))),
+    });
+    const evaluator = await claimNextBridgeJob(fixture.db, {
+      workerId: "evaluator-key-delete-worker",
+      now: new Date(),
+    });
+    expect(evaluator).toMatchObject({ role: "EVALUATOR", cycleId: cycle!.id });
+    const gated = pauseAfterStatement(fixture.db, "bridge-cycle-key-lock");
+    const accepting = commitAcceptedEvaluatorBridgeJob(gated.db, {
+      jobId: evaluator!.jobId,
+      workerId: "evaluator-key-delete-worker",
+      attemptCount: evaluator!.attemptCount,
+      cycleId: cycle!.id,
+      candidateEventId: evaluator!.candidateEventId!,
+      decision: "ACCEPT",
+      rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+      rubricDigest: BROADCAST_EVALUATOR_RUBRIC.digest,
+      rubricCriteria: BROADCAST_EVALUATOR_RUBRIC.criteria,
+      rationaleCode: "SUPPORTED",
+    });
+    void accepting.catch(() => undefined);
+    try {
+      await bounded(gated.reached);
+      const deleting = fixture.db.query(
+        "delete from aggregate_data_keys where aggregate_id=$1",
+        [cycle!.id],
+      );
+      void deleting.catch(() => undefined);
+      const deletionState = await Promise.race([
+        deleting.then(() => "completed" as const),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 50)),
+      ]);
+      expect(deletionState).toBe("blocked");
+      gated.release();
+      const [accepted] = await bounded(Promise.all([accepting, deleting]));
+      expect(accepted).toEqual({
+        broadcastId: expect.any(String),
+        reviewEventId: expect.any(String),
+      });
+    } finally {
+      gated.release();
+    }
+  }, 30_000);
+
+  it("fails Main staging closed when the cycle key was removed first", async () => {
+    const fixture = await createConversationFixture("bridge-main-removed-cycle-key");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-main-removed-cycle-key','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const main = await claimNextBridgeJob(fixture.db, {
+      workerId: "main-removed-cycle-key-worker",
+      now: new Date(),
+    });
+    expect(main).toMatchObject({ role: "MAIN", cycleId: cycle!.id });
+    await fixture.db.query(
+      "delete from aggregate_data_keys where aggregate_id=$1",
+      [cycle!.id],
+    );
+
+    await expect(stageMainCandidateAndEvaluator(fixture.db, {
+      jobId: main!.jobId,
+      workerId: "main-removed-cycle-key-worker",
+      attemptCount: main!.attemptCount,
+      cycleId: cycle!.id,
+      candidate: "AAPL remains near completed support.",
+    })).rejects.toThrow("MAIN_AUTHORITY_REVOKED");
+    await expect(fixture.db.one(
+      `select count(*)::int count from events
+        where aggregate_id=$1 and type='main.broadcast.candidate.generated'`,
+      [cycle!.id],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("fails completed Evaluator replay closed after cycle-key removal", async () => {
+    const fixture = await createConversationFixture("bridge-evaluator-replay-removed-cycle-key");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-evaluator-replay-removed-cycle-key','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const runtime = await import("../../worker/hybrid/runtime");
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-replay-key-main-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+        candidate: "AAPL remains near completed support.",
+      }))),
+    });
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-replay-key-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+        decision: "ACCEPT",
+        rationaleCode: "SUPPORTED",
+        rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+      }))),
+    });
+    const completed = await fixture.db.one<{
+      readonly attempt_count: number;
+      readonly candidate_event_id: string;
+      readonly evaluator_job_id: string;
+    }>(
+      `select evaluator.attempt_count,
+              evaluator.candidate_event_id::text candidate_event_id,
+              evaluator.job_id::text evaluator_job_id
+         from bridge_model_jobs evaluator
+        where evaluator.cycle_id=$1 and evaluator.role='EVALUATOR'`,
+      [cycle!.id],
+    );
+    await fixture.db.query(
+      "delete from aggregate_data_keys where aggregate_id=$1",
+      [cycle!.id],
+    );
+
+    await expect(commitAcceptedEvaluatorBridgeJob(fixture.db, {
+      jobId: completed.evaluator_job_id,
+      workerId: "evaluator-replay-key-worker",
+      attemptCount: completed.attempt_count,
+      cycleId: cycle!.id,
+      candidateEventId: completed.candidate_event_id,
+      decision: "ACCEPT",
+      rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+      rubricDigest: BROADCAST_EVALUATOR_RUBRIC.digest,
+      rubricCriteria: BROADCAST_EVALUATOR_RUBRIC.criteria,
+      rationaleCode: "SUPPORTED",
+    })).rejects.toThrow("EVALUATOR_REPLAY_CONFLICT");
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle!.id}`],
+    )).resolves.toEqual({ count: 1 });
+  }, 30_000);
+
+  it("rejects a metadata-valid candidate without exact completed parent Main authority", async () => {
+    const { fixture, cycle, candidate } = await createForgedCandidateStateFixture(
+      "valid-parentless",
+      1,
+      false,
+    );
+    const pendingMain = await fixture.db.one<{ readonly job_id: string }>(
+      `select job_id::text from bridge_model_jobs
+       where cycle_id=$1 and role='MAIN' and status='PENDING'`,
+      [cycle.id],
+    );
+
+    let inserted = true;
+    try {
+      await fixture.db.query(
+        `insert into bridge_model_jobs (
+           source_event_id,cycle_id,candidate_event_id,parent_main_job_id,
+           role,kind,priority,request_digest
+         ) values (
+           $1,$2,$1,$3,'EVALUATOR','EVALUATOR_REVIEW',10,
+           bridge_model_job_request_digest($1,'EVALUATOR','EVALUATOR_REVIEW')
+         )`,
+        [candidate.id, cycle.id, pendingMain.job_id],
+      );
+    } catch {
+      inserted = false;
+    }
+    const main = await claimNextBridgeJob(fixture.db, {
+      workerId: "parentless-main-worker",
+      now: new Date(),
+    });
+    expect(main).toMatchObject({ role: "MAIN", cycleId: cycle.id });
+    await failBridgeJob(fixture.db, {
+      jobId: main!.jobId,
+      workerId: "parentless-main-worker",
+      attemptCount: main!.attemptCount,
+      safeCode: "SOURCE_AUTHORITY_REVOKED",
+    });
+    const generate = vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+      decision: "ACCEPT",
+      rationaleCode: "SUPPORTED",
+      rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+    })));
+    const runtime = await (await import("../../worker/hybrid/runtime")).runOneHybridJob({
+      db: fixture.db,
+      workerId: "parentless-evaluator-worker",
+      generate,
+    });
+
+    expect(inserted).toBe(false);
+    expect(runtime).toEqual({ status: "IDLE" });
+    expect(generate).not.toHaveBeenCalled();
+    await expect(fixture.db.one(
+      `select count(*)::int count from bridge_model_jobs
+       where role='EVALUATOR' and candidate_event_id=$1`,
+      [candidate.id],
+    )).resolves.toEqual({ count: 0 });
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle.id}`],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("rejects a forged candidate state before Evaluator generation or broadcast", async () => {
+    const { fixture, cycle } = await createForgedCandidateStateFixture("runtime");
+    const generate = vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+      decision: "ACCEPT",
+      rationaleCode: "SUPPORTED",
+    })));
+
+    await expect((await import("../../worker/hybrid/runtime")).runOneHybridJob({
+      db: fixture.db,
+      workerId: "forged-state-worker",
+      generate,
+    })).resolves.toMatchObject({
+      role: "EVALUATOR",
+      status: "FAILED",
+      safeCode: "SOURCE_AUTHORITY_REVOKED",
+    });
+    expect(generate).not.toHaveBeenCalled();
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle.id}`],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("revalidates the exact next candidate state inside the ACCEPT transaction", async () => {
+    const { fixture, cycle, candidate } = await createForgedCandidateStateFixture("accept-tx");
+    const claimed = await claimNextBridgeJob(fixture.db, {
+      workerId: "forged-state-accept-worker",
+      now: new Date(),
+    });
+    expect(claimed).toMatchObject({ role: "EVALUATOR", candidateEventId: candidate.id });
+    await expect(commitAcceptedEvaluatorBridgeJob(fixture.db, {
+      jobId: claimed!.jobId,
+      workerId: "forged-state-accept-worker",
+      attemptCount: claimed!.attemptCount,
+      cycleId: cycle.id,
+      candidateEventId: candidate.id,
+      decision: "ACCEPT",
+      rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+      rubricDigest: BROADCAST_EVALUATOR_RUBRIC.digest,
+      rubricCriteria: BROADCAST_EVALUATOR_RUBRIC.criteria,
+      rationaleCode: "SUPPORTED",
+    })).rejects.toThrow("EVALUATOR_CANDIDATE_INVALID");
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle.id}`],
+    )).resolves.toEqual({ count: 0 });
+    await expect(failBridgeJob(fixture.db, {
+      jobId: claimed!.jobId,
+      workerId: "forged-state-accept-worker",
+      attemptCount: claimed!.attemptCount,
+      safeCode: "SOURCE_AUTHORITY_REVOKED",
+    })).resolves.toMatchObject({ status: "FAILED", safeCode: "SOURCE_AUTHORITY_REVOKED" });
+  }, 30_000);
+
+  it("rejects a noncanonical generation body before Main generation", async () => {
+    const { fixture } = await createNoncanonicalGenerationFixture("runtime");
+    const generate = vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+      candidate: "AAPL is testing completed support.",
+    })));
+
+    await expect((await import("../../worker/hybrid/runtime")).runOneHybridJob({
+      db: fixture.db,
+      workerId: "forged-generation-worker",
+      generate,
+    })).resolves.toMatchObject({
+      role: "MAIN",
+      status: "FAILED",
+      safeCode: "SOURCE_AUTHORITY_REVOKED",
+    });
+    expect(generate).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it("revalidates the exact generation body inside candidate commit", async () => {
+    const { fixture, cycleId } = await createNoncanonicalGenerationFixture("candidate-tx");
+    const claimed = await claimNextBridgeJob(fixture.db, {
+      workerId: "forged-generation-stage-worker",
+      now: new Date(),
+    });
+    expect(claimed).toMatchObject({ role: "MAIN", cycleId });
+    await expect(stageMainCandidateAndEvaluator(fixture.db, {
+      jobId: claimed!.jobId,
+      workerId: "forged-generation-stage-worker",
+      attemptCount: claimed!.attemptCount,
+      cycleId,
+      candidate: "AAPL is testing completed support.",
+    })).rejects.toThrow("MAIN_GENERATION_BODY_INVALID");
+    await expect(fixture.db.one(
+      `select count(*)::int count from events
+       where aggregate_id=$1 and type='main.broadcast.candidate.generated'`,
+      [cycleId],
+    )).resolves.toEqual({ count: 0 });
+    await expect(failBridgeJob(fixture.db, {
+      jobId: claimed!.jobId,
+      workerId: "forged-generation-stage-worker",
+      attemptCount: claimed!.attemptCount,
+      safeCode: "SOURCE_AUTHORITY_REVOKED",
+    })).resolves.toMatchObject({ status: "FAILED", safeCode: "SOURCE_AUTHORITY_REVOKED" });
+  }, 30_000);
+
+  it("binds every canonical generation field and derives exactly the next safe state", () => {
+    const snapshot = {
+      mainStateVersion: 7,
+      policyVersion: "main-broadcast-policy-v1",
+      marketData: {
+        highWaterId: "market-high-water",
+        observedAt: "2026-08-13T13:59:00.000Z",
+      },
+    };
+    const body = {
+      author: { type: "MAIN_BRAIN", id: "gustavo-main" },
+      scheduleId: "bridge-exact-generation",
+      scheduleVersion: 3,
+      slotAt: "2026-08-13T14:00:00.000Z",
+      snapshot,
+    };
+    const authority = {
+      cycleId: crypto.randomUUID(),
+      scheduleId: body.scheduleId,
+      scheduleVersion: body.scheduleVersion,
+      slotAt: new Date(body.slotAt),
+      snapshot,
+      currentMainStateVersion: 7,
+      policyVersion: "main-broadcast-policy-v1",
+      sourceEventId: crypto.randomUUID(),
+      sourceRequestHash: "a".repeat(64),
+      sourceIntegrityHash: "b".repeat(64),
+    };
+
+    expect(validateMainGenerationAuthority(body, authority)).toMatchObject({
+      currentMainStateVersion: 7,
+      nextMainStateVersion: 8,
+      editorialPolicyVersion: "main-broadcast-policy-v1",
+      snapshotDigest: canonicalContentDigest(snapshot),
+      sourceIds: ["market-high-water"],
+    });
+
+    const invalidBodies: readonly JsonValue[] = [
+      { ...body, unexpected: true },
+      {
+        author: body.author,
+        scheduleVersion: body.scheduleVersion,
+        slotAt: body.slotAt,
+        snapshot,
+      },
+      { ...body, scheduleId: "different" },
+      { ...body, scheduleVersion: 4 },
+      { ...body, slotAt: "2026-08-13T14:00:00Z" },
+      { ...body, snapshot: { ...snapshot, unexpected: true } },
+      { ...body, snapshot: { ...snapshot, mainStateVersion: 6 } },
+      { ...body, snapshot: { ...snapshot, mainStateVersion: "7" } },
+    ];
+    for (const invalid of invalidBodies) {
+      expect(() => validateMainGenerationAuthority(invalid, authority))
+        .toThrow("MAIN_GENERATION_BODY_INVALID");
+    }
+    const maximumSnapshot = { ...snapshot, mainStateVersion: Number.MAX_SAFE_INTEGER };
+    expect(() => validateMainGenerationAuthority({
+      ...body,
+      snapshot: maximumSnapshot,
+    }, {
+      ...authority,
+      snapshot: maximumSnapshot,
+      currentMainStateVersion: Number.MAX_SAFE_INTEGER,
+    })).toThrow("MAIN_STATE_AUTHORITY_INVALID");
+  });
+
+  it("freezes exact bounded Evaluator rubric criteria and rejects output without its authority", async () => {
+    expect(Object.isFrozen(BROADCAST_EVALUATOR_RUBRIC)).toBe(true);
+    expect(Object.isFrozen(BROADCAST_EVALUATOR_RUBRIC.criteria)).toBe(true);
+    expect(BROADCAST_EVALUATOR_RUBRIC).toMatchObject({
+      version: "broadcast-evaluator-v1",
+      digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      criteria: expect.arrayContaining([
+        expect.stringMatching(/support/iu),
+        expect.stringMatching(/educational/iu),
+        expect.stringMatching(/provenance/iu),
+        expect.stringMatching(/fresh/iu),
+      ]),
+    });
+    const commitBroadcast = vi.fn();
+    const result = await executeEvaluatorBridgeJob({
+      jobId: "evaluator-job",
+      loadAuthority: vi.fn().mockResolvedValue(evaluatorAuthority()),
+      generate: vi.fn().mockResolvedValue({
+        decision: "ACCEPT",
+        rationaleCode: "SUPPORTED",
+      }),
+      commitBroadcast,
+    });
+    expect(result).toEqual({ decision: "MALFORMED" });
+    expect(commitBroadcast).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["version", { ...evaluatorAuthority(), rubricVersion: "broadcast-evaluator-v2" }],
+    ["digest", { ...evaluatorAuthority(), rubricDigest: "0".repeat(64) }],
+    ["content", { ...evaluatorAuthority(), rubricCriteria: ["different criterion"] }],
+    ["missing", {
+      cycleId: "cycle-1",
+      candidateEventId: "candidate-event",
+      prompt: "authorized rubric",
+    }],
+  ])("rejects mismatched or %s Evaluator rubric authority before generation", async (_, authority) => {
+    const generate = vi.fn();
+    const commitBroadcast = vi.fn();
+    await expect(executeEvaluatorBridgeJob({
+      jobId: "evaluator-job",
+      loadAuthority: vi.fn().mockResolvedValue(authority),
+      generate,
+      commitBroadcast,
+    })).rejects.toThrow("EVALUATOR_AUTHORITY_REVOKED");
+    expect(generate).not.toHaveBeenCalled();
+    expect(commitBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("stages exactly one body-free Main job per durable generation cycle", async () => {
+    const fixture = await createConversationFixture("bridge-main-cycle-stage");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-main-cycle','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+
+    await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+
+    const jobs = await fixture.db.query<Record<string, unknown>>(
+      `select job.* from bridge_model_jobs job
+       join broadcast_cycles cycle on cycle.id=job.cycle_id
+       where cycle.schedule_id='bridge-main-cycle'`,
+    );
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({
+      role: "MAIN",
+      kind: "MAIN_GENERATION",
+      priority: 20,
+      status: "PENDING",
+      candidate_event_id: null,
+    });
+    expect(forbiddenFieldIntersection(jobs[0]!, FORBIDDEN_JOB_FIELDS)).toEqual([]);
+  }, 30_000);
+
+  it("replays only an identical completed Main candidate without changing durable state", async () => {
+    const fixture = await createConversationFixture("bridge-main-exact-replay");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-main-replay','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const candidate = "AAPL remains near completed support.";
+    await (await import("../../worker/hybrid/runtime")).runOneHybridJob({
+      db: fixture.db,
+      workerId: "main-replay-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({ candidate }))),
+    });
+    const completed = await fixture.db.one<{
+      readonly attempt_count: number;
+      readonly candidate_event_id: string;
+      readonly evaluator_job_id: string;
+      readonly main_job_id: string;
+    }>(
+      `select main.attempt_count,main.output_event_id::text candidate_event_id,
+              main.job_id::text main_job_id,evaluator.job_id::text evaluator_job_id
+       from bridge_model_jobs main
+       join bridge_model_jobs evaluator on evaluator.candidate_event_id=main.output_event_id
+       where main.cycle_id=$1 and main.role='MAIN' and main.status='COMPLETED'`,
+      [cycle!.id],
+    );
+    const before = await fixture.db.one<{ readonly jobs: number; readonly candidates: number }>(
+      `select
+         (select count(*)::int from bridge_model_jobs where cycle_id=$1::uuid) jobs,
+         (select count(*)::int from events
+           where aggregate_id=$1::text and type='main.broadcast.candidate.generated') candidates`,
+      [cycle!.id],
+    );
+
+    await expect(stageMainCandidateAndEvaluator(fixture.db, {
+      jobId: completed.main_job_id,
+      workerId: "main-replay-worker",
+      attemptCount: completed.attempt_count,
+      cycleId: cycle!.id,
+      candidate,
+    })).resolves.toEqual({
+      candidateEventId: completed.candidate_event_id,
+      evaluatorJobId: completed.evaluator_job_id,
+    });
+    await expect(stageMainCandidateAndEvaluator(fixture.db, {
+      jobId: completed.main_job_id,
+      workerId: "main-replay-worker",
+      attemptCount: completed.attempt_count,
+      cycleId: cycle!.id,
+      candidate: "Conflicting candidate replay.",
+    })).rejects.toThrow("MAIN_REPLAY_CONFLICT");
+    await expect(fixture.db.one(
+      `select
+         (select count(*)::int from bridge_model_jobs where cycle_id=$1::uuid) jobs,
+         (select count(*)::int from events
+           where aggregate_id=$1::text and type='main.broadcast.candidate.generated') candidates`,
+      [cycle!.id],
+    )).resolves.toEqual(before);
+  }, 30_000);
+
+  it("creates Evaluator from Main and publishes only an accepted exact review", async () => {
+    const appendCandidate = vi.fn().mockResolvedValue({ candidateEventId: "candidate-event" });
+    const stageEvaluator = vi.fn().mockResolvedValue({ jobId: "evaluator-job" });
+    const main = await executeMainBridgeJob({
+      jobId: "main-job",
+      loadAuthority: vi.fn().mockResolvedValue({
+        cycleId: "cycle-1",
+        prompt: "authorized grounding",
+      }),
+      generate: vi.fn().mockResolvedValue({ candidate: "bounded candidate" }),
+      appendCandidate,
+      stageEvaluator,
+    });
+    const commitBroadcast = vi.fn().mockResolvedValue({ broadcastId: "broadcast-1" });
+    const evaluation = await executeEvaluatorBridgeJob({
+      jobId: "evaluator-job",
+      loadAuthority: vi.fn().mockResolvedValue(evaluatorAuthority()),
+      generate: vi.fn().mockResolvedValue({
+        decision: "ACCEPT",
+        rationaleCode: "SUPPORTED",
+        rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+      }),
+      commitBroadcast,
+    });
+
+    expect(main).toEqual({
+      candidateEventId: "candidate-event",
+      evaluatorJobId: "evaluator-job",
+    });
+    expect(stageEvaluator).toHaveBeenCalledWith(expect.objectContaining({
+      candidateEventId: "candidate-event",
+    }));
+    expect(evaluation).toEqual({ broadcastId: "broadcast-1", decision: "ACCEPT" });
+    expect(commitBroadcast).toHaveBeenCalledWith(expect.objectContaining({
+      cycleId: "cycle-1",
+      candidateEventId: "candidate-event",
+    }));
+    const migration = readFileSync("db/migrations/0022_hybrid_deployment.sql", "utf8");
+    expect(migration).toMatch(/main\.broadcast\.generation\.requested[\s\S]+bridge_model_jobs/);
+    expect(migration).toMatch(/candidate_event_id[\s\S]+EVALUATOR/);
+  });
+
+  it("re-authorizes the exact Main cycle before candidate persistence", async () => {
+    const appendCandidate = vi.fn();
+    const stageEvaluator = vi.fn();
+    const loadAuthority = vi.fn()
+      .mockResolvedValueOnce({ cycleId: "cycle-1", prompt: "authorized grounding" })
+      .mockResolvedValueOnce({ cycleId: "cycle-2", prompt: "authorized grounding" });
+
+    await expect(executeMainBridgeJob({
+      jobId: "main-job",
+      loadAuthority,
+      generate: vi.fn().mockResolvedValue({ candidate: "bounded candidate" }),
+      appendCandidate,
+      stageEvaluator,
+    })).rejects.toThrow("MAIN_AUTHORITY_REVOKED");
+    expect(appendCandidate).not.toHaveBeenCalled();
+    expect(stageEvaluator).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{
+      decision: "REJECT",
+      rationaleCode: "UNSUPPORTED",
+      rubricVersion: "broadcast-evaluator-v1",
+    }, "REJECT"],
+    [{
+      decision: "ACCEPT",
+      rationaleCode: "SUPPORTED",
+      rubricVersion: "broadcast-evaluator-v1",
+      plaintext: "leak",
+    }, "MALFORMED"],
+    [{
+      decision: "ACCEPT",
+      rationaleCode: "SUPPORTED",
+      rubricVersion: "broadcast-evaluator-v2",
+    }, "MALFORMED"],
+    ["not-json", "MALFORMED"],
+  ] as const)("publishes no broadcast for %s evaluator output", async (output, expected) => {
+    const commitBroadcast = vi.fn();
+    const result = await executeEvaluatorBridgeJob({
+      jobId: "evaluator-job",
+      loadAuthority: vi.fn().mockResolvedValue(evaluatorAuthority()),
+      generate: vi.fn().mockResolvedValue(output),
+      commitBroadcast,
+    });
+
+    expect(result).toMatchObject({ decision: expected });
+    expect(commitBroadcast).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toMatch(/authorized rubric|bounded candidate/iu);
+  });
+
+  it("fails closed when exact Evaluator candidate, cycle, or rubric authority changes", async () => {
+    const commitBroadcast = vi.fn();
+    const loadAuthority = vi.fn()
+      .mockResolvedValueOnce(evaluatorAuthority())
+      .mockResolvedValueOnce(evaluatorAuthority("different-candidate"));
+
+    await expect(executeEvaluatorBridgeJob({
+      jobId: "evaluator-job",
+      loadAuthority,
+      generate: vi.fn().mockResolvedValue({
+        decision: "ACCEPT",
+        rationaleCode: "SUPPORTED",
+        rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+      }),
+      commitBroadcast,
+    })).rejects.toThrow("EVALUATOR_AUTHORITY_REVOKED");
+    expect(commitBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("encrypts the Main candidate, atomically stages Evaluator, and commits exact ACCEPT provenance once", async () => {
+    const fixture = await createConversationFixture("bridge-main-evaluator-accept");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-accept','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const candidateText = "AAPL is testing completed support.";
+
+    await expect((await import("../../worker/hybrid/runtime")).runOneHybridJob({
+      db: fixture.db,
+      workerId: "main-accept-worker",
+      generate: vi.fn().mockResolvedValue(
+        generationResult(JSON.stringify({ candidate: candidateText })),
+      ),
+    })).resolves.toMatchObject({ role: "MAIN", status: "COMPLETED" });
+
+    const staged = await fixture.db.one<{
+      readonly candidate_event_id: string;
+      readonly evaluator_job_id: string;
+      readonly evaluator_status: string;
+      readonly main_job_id: string;
+      readonly parent_main_job_id: string;
+      readonly ciphertext: Buffer;
+    }>(
+      `select main.job_id::text main_job_id,main.output_event_id::text candidate_event_id,
+              evaluator.job_id::text evaluator_job_id,
+              evaluator.parent_main_job_id::text parent_main_job_id,
+              evaluator.status evaluator_status,body.ciphertext
+       from bridge_model_jobs main
+       join bridge_model_jobs evaluator on evaluator.candidate_event_id=main.output_event_id
+       join encrypted_event_bodies body on body.event_id=main.output_event_id
+       where main.cycle_id=$1 and main.role='MAIN' and evaluator.role='EVALUATOR'`,
+      [cycle!.id],
+    );
+    expect(staged.evaluator_status).toBe("PENDING");
+    expect(staged.parent_main_job_id).toBe(staged.main_job_id);
+    expect(staged.ciphertext.toString("utf8")).not.toContain(candidateText);
+    expect(JSON.stringify(await fixture.db.query(
+      "select * from bridge_model_jobs where cycle_id=$1 order by priority",
+      [cycle!.id],
+    ))).not.toContain(candidateText);
+    expect(await readEventBody(fixture.db, staged.candidate_event_id, {
+      actor: { role: "SYSTEM" },
+    })).toMatchObject({ candidate: candidateText, cycleId: cycle!.id });
+
+    const evaluatorGenerate = vi.fn().mockImplementation(
+      (request: ModelGenerationRequest) => {
+        const input = JSON.parse(request.input) as Record<string, unknown>;
+        expect(input.rubric).toEqual({
+          version: BROADCAST_EVALUATOR_RUBRIC.version,
+          digest: BROADCAST_EVALUATOR_RUBRIC.digest,
+          criteria: [...BROADCAST_EVALUATOR_RUBRIC.criteria],
+        });
+        return Promise.resolve(generationResult(JSON.stringify({
+          decision: "ACCEPT",
+          rationaleCode: "SUPPORTED",
+          rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+        })));
+      },
+    );
+    const evaluation = await (await import("../../worker/hybrid/runtime")).runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-accept-worker",
+      generate: evaluatorGenerate,
+    });
+    expect(evaluatorGenerate).toHaveBeenCalledOnce();
+    if (evaluation.status !== "COMPLETED") {
+      throw new Error(`EXPECTED_EVALUATOR_COMPLETION:${JSON.stringify(evaluation)}`);
+    }
+    expect(evaluation).toMatchObject({ role: "EVALUATOR", status: "COMPLETED" });
+    expect(await readEventBody(fixture.db, evaluation.outputEventId, {
+      actor: { role: "SYSTEM" },
+    })).toMatchObject({
+      candidateEventId: staged.candidate_event_id,
+      cycleId: cycle!.id,
+      decision: "ACCEPT",
+      rationaleCode: "SUPPORTED",
+      rubricVersion: "broadcast-evaluator-v1",
+      rubricDigest: BROADCAST_EVALUATOR_RUBRIC.digest,
+    });
+
+    const provenance = await fixture.db.one<{
+      readonly count: number;
+      readonly source_ids: string[];
+    }>(
+      `select count(*) over()::int count,source_ids
+       from broadcasts where idempotency_key=$1 limit 1`,
+      [`bridge-broadcast:${cycle!.id}`],
+    );
+    expect(provenance.count).toBe(1);
+    expect(provenance.source_ids).toEqual([
+      cycle!.id,
+      staged.candidate_event_id,
+      evaluation.outputEventId,
+    ].sort());
+    await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    await expect(fixture.db.one(
+      "select count(*)::int count from bridge_model_jobs where cycle_id=$1",
+      [cycle!.id],
+    )).resolves.toEqual({ count: 2 });
+  }, 30_000);
+
+  it("replays only an identical completed Evaluator review and exact broadcast provenance", async () => {
+    const fixture = await createConversationFixture("bridge-evaluator-exact-replay");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-evaluator-replay','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const runtime = await import("../../worker/hybrid/runtime");
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-replay-main-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+        candidate: "AAPL remains near completed support.",
+      }))),
+    });
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-replay-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+        decision: "ACCEPT",
+        rationaleCode: "SUPPORTED",
+        rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+      }))),
+    });
+    const completed = await fixture.db.one<{
+      readonly attempt_count: number;
+      readonly broadcast_id: string;
+      readonly candidate_event_id: string;
+      readonly evaluator_job_id: string;
+      readonly review_event_id: string;
+    }>(
+      `select evaluator.attempt_count,broadcast.id::text broadcast_id,
+              evaluator.candidate_event_id::text candidate_event_id,
+              evaluator.job_id::text evaluator_job_id,
+              evaluator.output_event_id::text review_event_id
+       from bridge_model_jobs evaluator
+       join broadcasts broadcast on broadcast.idempotency_key='bridge-broadcast:'||$1::text
+       where evaluator.cycle_id=$1::uuid and evaluator.role='EVALUATOR'
+         and evaluator.status='COMPLETED'`,
+      [cycle!.id],
+    );
+    const before = await fixture.db.one<{ readonly broadcasts: number; readonly reviews: number }>(
+      `select
+         (select count(*)::int from broadcasts where idempotency_key=$1) broadcasts,
+         (select count(*)::int from events
+           where aggregate_id=$2 and type='main.broadcast.evaluation.completed') reviews`,
+      [`bridge-broadcast:${cycle!.id}`, cycle!.id],
+    );
+    const exact = {
+      jobId: completed.evaluator_job_id,
+      workerId: "evaluator-replay-worker",
+      attemptCount: completed.attempt_count,
+      cycleId: cycle!.id,
+      candidateEventId: completed.candidate_event_id,
+      decision: "ACCEPT" as const,
+      rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+      rubricDigest: BROADCAST_EVALUATOR_RUBRIC.digest,
+      rubricCriteria: BROADCAST_EVALUATOR_RUBRIC.criteria,
+      rationaleCode: "SUPPORTED",
+    };
+
+    await expect(commitAcceptedEvaluatorBridgeJob(fixture.db, exact)).resolves.toEqual({
+      broadcastId: completed.broadcast_id,
+      reviewEventId: completed.review_event_id,
+    });
+    await expect(commitAcceptedEvaluatorBridgeJob(fixture.db, {
+      ...exact,
+      rationaleCode: "CONFLICTING_REPLAY",
+    })).rejects.toThrow("EVALUATOR_REPLAY_CONFLICT");
+    await expect(fixture.db.one(
+      `select
+         (select count(*)::int from broadcasts where idempotency_key=$1) broadcasts,
+         (select count(*)::int from events
+           where aggregate_id=$2 and type='main.broadcast.evaluation.completed') reviews`,
+      [`bridge-broadcast:${cycle!.id}`, cycle!.id],
+    )).resolves.toEqual(before);
+  }, 30_000);
+
+  it.each([
+    [JSON.stringify({
+      decision: "REJECT",
+      rationaleCode: "UNSUPPORTED",
+      rubricVersion: BROADCAST_EVALUATOR_RUBRIC.version,
+    }), "EVALUATOR_REJECTED"],
+    ["not-json", "CODEX_OUTPUT_INVALID"],
+  ])("terminalizes %s without a broadcast", async (evaluation, safeCode) => {
+    const fixture = await createConversationFixture(`bridge-evaluator-${safeCode.toLowerCase()}`);
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-reject','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const runtime = await import("../../worker/hybrid/runtime");
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "main-reject-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+        candidate: "AAPL remains below completed resistance.",
+      }))),
+    });
+    await expect(runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-reject-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(evaluation)),
+    })).resolves.toMatchObject({ role: "EVALUATOR", status: "FAILED", safeCode });
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle!.id}`],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it.each([
+    [new Error("PROVIDER_RATE_LIMITED"), "CODEX_DAILY_QUOTA_EXHAUSTED"],
+    [new Error("MODEL_UNAVAILABLE"), "CODEX_MODEL_UNAVAILABLE"],
+  ])("terminalizes provider failure without broadcasting", async (providerError, safeCode) => {
+    const fixture = await createConversationFixture(`bridge-evaluator-${safeCode.toLowerCase()}`);
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-provider','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const runtime = await import("../../worker/hybrid/runtime");
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "main-provider-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+        candidate: "SPY is retesting a completed level.",
+      }))),
+    });
+    await expect(runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-provider-worker",
+      generate: vi.fn().mockRejectedValue(providerError),
+    })).resolves.toMatchObject({ role: "EVALUATOR", status: "FAILED", safeCode });
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle!.id}`],
+    )).resolves.toEqual({ count: 0 });
+  }, 30_000);
+
+  it("terminalizes revoked candidate authority before Evaluator generation", async () => {
+    const fixture = await createConversationFixture("bridge-evaluator-revoked");
+    await fixture.db.query(
+      `insert into broadcast_schedules(id,cron,timezone,enabled,created_at)
+       values ('bridge-revoked','0 14 * * *','UTC',true,$1)`,
+      ["2026-08-13T13:59:00.000Z"],
+    );
+    const [cycle] = await openDueBroadcastCycles(
+      { db: fixture.db },
+      new Date("2026-08-13T14:00:00.000Z"),
+    );
+    const runtime = await import("../../worker/hybrid/runtime");
+    await runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "main-revoked-worker",
+      generate: vi.fn().mockResolvedValue(generationResult(JSON.stringify({
+        candidate: "IWM is testing a confirmed level.",
+      }))),
+    });
+    vi.stubEnv("GUSTAVO_EVENT_ROOT_KEY_V1", Buffer.alloc(32, 9).toString("base64"));
+    const generate = vi.fn();
+
+    await expect(runtime.runOneHybridJob({
+      db: fixture.db,
+      workerId: "evaluator-revoked-worker",
+      generate,
+    })).resolves.toMatchObject({
+      role: "EVALUATOR",
+      status: "FAILED",
+      safeCode: "SOURCE_AUTHORITY_REVOKED",
+    });
+    expect(generate).not.toHaveBeenCalled();
+    await expect(fixture.db.one(
+      "select count(*)::int count from broadcasts where idempotency_key=$1",
+      [`bridge-broadcast:${cycle!.id}`],
+    )).resolves.toEqual({ count: 0 });
   }, 30_000);
 });
 
