@@ -984,8 +984,8 @@ describe("hybrid worker host boundary", () => {
     expect(sealDirectory).toBeGreaterThan(-1);
     expect(sealDirectory).toBeLessThan(openConfig);
     expect(openConfig).toBeLessThan(secretWrite);
-    expect(setup.slice(openConfig, secretWrite)).toContain("Set-OwnerOnlyAcl $ConfigFullPath");
-    expect(setup.slice(secretWrite)).toContain("Assert-OwnerOnlyAcl $ConfigFullPath");
+    expect(setup.slice(openConfig, secretWrite)).toContain("Set-OwnerOnlyAcl $ConfigWritePath");
+    expect(setup.slice(secretWrite)).toContain("Assert-OwnerOnlyAcl $ConfigWritePath");
   });
 
   it("pins executable provenance and launches the worker with a minimal child environment", () => {
@@ -1660,4 +1660,172 @@ describe("hybrid worker host boundary", () => {
     expect(`${setup}\n${start}`).not.toMatch(/-v\s+[^\r\n]*(?:docker\.sock|\.git|infra\\\.env)/iu);
     expect(start).not.toMatch(/DATABASE_URL[^\r\n]*(?:fallback|GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL)/iu);
   });
+
+  it("rebuilds and optionally rotates worker authority without ambient paths or a plaintext backup", () => {
+    const setup = readFileSync("scripts/setup-hybrid-worker.ps1", "utf8");
+
+    for (const marker of [
+      "[switch]$MaintenanceRebuild",
+      "[switch]$RotateCodexAuthVolume",
+      "HYBRID_MAINTENANCE_TASK_RUNNING",
+      "HYBRID_MAINTENANCE_CONTAINER_PRESENT",
+      "HYBRID_MAINTENANCE_LEASE_UNAVAILABLE",
+      "[IO.File]::Replace",
+    ]) expect(setup).toContain(marker);
+    expect(setup).toMatch(/NamedPipeServerStream[\s\S]+gustavo-codex-runner-v1/);
+    expect(setup).toMatch(/volume["'],\s*["']rm["'][\s\S]+\$AuthVolume/);
+    expect(setup).not.toMatch(/\.previous|\$env:ProgramFiles[\s\S]+volume rm|Move-Item[\s\S]+hybrid-worker\.env/);
+  });
+
+  it("keeps maintenance fail-closed and orders replacement before task registration", () => {
+    const setup = readFileSync("scripts/setup-hybrid-worker.ps1", "utf8");
+    expect(setup).toContain('Stop-Safely "HYBRID_MAINTENANCE_MODE_REQUIRED"');
+    expect(setup).toContain('Stop-Safely "HYBRID_MAINTENANCE_CONFIG_REQUIRED"');
+    expect(setup).toMatch(
+      /if \(\$MaintenanceRebuild\)[\s\S]+Assert-OwnerOnlyAcl \$ConfigDirectory \$LocalUser\.SID[\s\S]+Assert-OwnerOnlyAcl \$ConfigFullPath \$LocalUser\.SID/u,
+    );
+    expect(setup).toMatch(
+      /if \(-not \$MaintenanceRebuild\)[\s\S]+HYBRID_CONFIG_ALREADY_EXISTS/u,
+    );
+
+    const lease = setup.indexOf("$MaintenanceLease = New-MaintenanceLease");
+    const unregister = setup.indexOf("Unregister-ScheduledTask", lease);
+    const absence = setup.indexOf('Stop-Safely "HYBRID_MAINTENANCE_CONTAINER_PRESENT"');
+    const build = setup.indexOf('"build", "--pull", "--no-cache"');
+    const rotate = setup.indexOf('"volume", "rm", $AuthVolume');
+    const temporaryValidation = setup.indexOf("Invoke-MaintenanceRoleValidation $TemporaryConfigPath");
+    const replace = setup.indexOf("[IO.File]::Replace($TemporaryConfigPath, $ConfigFullPath, $null)");
+    const finalValidation = setup.indexOf("Invoke-WorkerConfigValidation $ConfigFullPath", replace);
+    const registration = setup.indexOf("Register-ExactWorkerTask", finalValidation);
+    const cleanup = setup.indexOf("Remove-Item -Force -LiteralPath $TemporaryConfigPath", registration);
+    const release = setup.indexOf("$MaintenanceLease.Dispose()", cleanup);
+    for (const position of [lease, unregister, absence, build, rotate, temporaryValidation, replace,
+      finalValidation, registration, cleanup, release]) {
+      expect(position).toBeGreaterThan(-1);
+    }
+    expect(lease).toBeLessThan(unregister);
+    expect(unregister).toBeLessThan(absence);
+    expect(lease).toBeLessThan(absence);
+    expect(absence).toBeLessThan(build);
+    expect(absence).toBeLessThan(rotate);
+    expect(temporaryValidation).toBeLessThan(replace);
+    expect(replace).toBeLessThan(finalValidation);
+    expect(finalValidation).toBeLessThan(registration);
+    expect(registration).toBeLessThan(cleanup);
+    expect(cleanup).toBeLessThan(release);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "holds an exclusive crash-releasing maintenance pipe lease",
+    () => {
+      const source = readFileSync("scripts/setup-hybrid-worker.ps1", "utf8");
+      const start = source.indexOf("function New-MaintenanceLease");
+      const end = source.indexOf("function ", start + "function ".length);
+      expect(start).toBeGreaterThan(-1);
+      expect(end).toBeGreaterThan(start);
+      const helper = source.slice(start, end);
+      const pipeName = `gustavo-maintenance-test-${process.pid}-${Date.now()}`;
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helper,
+        `$First = New-MaintenanceLease '${pipeName}'`,
+        "$Failure = ''",
+        "try {",
+        `  try { $Second = New-MaintenanceLease '${pipeName}'; $Second.Dispose() } catch { $Failure = $_.Exception.Message }`,
+        "} finally { $First.Dispose() }",
+        `$Third = New-MaintenanceLease '${pipeName}'`,
+        "$Third.Dispose()",
+        "[Console]::Out.Write($Failure)",
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ], {
+        encoding: "utf8",
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("HYBRID_MAINTENANCE_LEASE_UNAVAILABLE");
+    },
+  );
+
+  it("scopes every maintenance task operation to the exact root task identity", () => {
+    const setup = readFileSync("scripts/setup-hybrid-worker.ps1", "utf8");
+    expect(setup).toContain('$ExactTaskPath = "\\"');
+    expect(setup).toMatch(
+      /Get-ScheduledTask -TaskName \$TaskName -TaskPath \$ExactTaskPath -ErrorAction Stop/u,
+    );
+    expect(setup).toMatch(
+      /Disable-ScheduledTask -TaskName \$TaskName -TaskPath \$ExactTaskPath -ErrorAction Stop/u,
+    );
+    expect(setup).toMatch(
+      /Unregister-ScheduledTask -TaskName \$TaskName -TaskPath \$ExactTaskPath -Confirm:\$false -ErrorAction Stop/u,
+    );
+    expect(setup).toMatch(
+      /Register-ScheduledTask -TaskName \$TaskName -TaskPath \$ExactTaskPath /u,
+    );
+    expect(setup).toMatch(
+      /\$ExistingTask\.TaskName\.Equals\([\s\S]+\$ExistingTask\.TaskPath\.Equals\(\$ExactTaskPath,[\s\S]+\$QuiescedTask\.TaskName\.Equals\([\s\S]+\$QuiescedTask\.TaskPath\.Equals\(\$ExactTaskPath,/u,
+    );
+  });
+
+  it.runIf(process.platform === "win32")(
+    "rejects duplicate ACL identities when owner or SYSTEM is omitted",
+    () => {
+      const source = readFileSync("scripts/setup-hybrid-worker.ps1", "utf8");
+      const start = source.indexOf("function Assert-OwnerOnlyAcl");
+      const end = source.indexOf("function ", start + "function ".length);
+      expect(start).toBeGreaterThan(-1);
+      expect(end).toBeGreaterThan(start);
+      const helper = source.slice(start, end);
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "function Stop-Safely([string]$Code) { throw $Code }",
+        helper,
+        "$Owner = [Security.Principal.WindowsIdentity]::GetCurrent().User",
+        "$System = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)",
+        "$OwnerName = $Owner.Translate([Security.Principal.NTAccount]).Value",
+        "$OwnerRule = [Security.AccessControl.FileSystemAccessRule]::new($Owner, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)",
+        "$SystemRule = [Security.AccessControl.FileSystemAccessRule]::new($System, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)",
+        "function New-FakeAcl([object[]]$Rules) {",
+        "  $Acl = [PSCustomObject]@{ Owner = $OwnerName; AreAccessRulesProtected = $true; RuleSet = $Rules }",
+        "  $Acl | Add-Member -MemberType ScriptMethod -Name GetAccessRules -Value { param($Explicit, $Inherited, $TargetType) return $this.RuleSet }",
+        "  return $Acl",
+        "}",
+        "function Get-Acl { param([string]$LiteralPath) return $script:CurrentAcl }",
+        "$script:CurrentAcl = New-FakeAcl @($OwnerRule, $SystemRule)",
+        "Assert-OwnerOnlyAcl 'ignored' $Owner",
+        "$OwnerDuplicateRejected = $false",
+        "$script:CurrentAcl = New-FakeAcl @($OwnerRule, $OwnerRule)",
+        "try { Assert-OwnerOnlyAcl 'ignored' $Owner } catch { $OwnerDuplicateRejected = $_.Exception.Message -eq 'HYBRID_CONFIG_ACL_INVALID' }",
+        "$SystemDuplicateRejected = $false",
+        "$script:CurrentAcl = New-FakeAcl @($SystemRule, $SystemRule)",
+        "try { Assert-OwnerOnlyAcl 'ignored' $Owner } catch { $SystemDuplicateRejected = $_.Exception.Message -eq 'HYBRID_CONFIG_ACL_INVALID' }",
+        '[Console]::Out.Write("$OwnerDuplicateRejected|$SystemDuplicateRejected")',
+      ].join("\r\n");
+      const powerShell = join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+      );
+      const result = spawnSync(powerShell, [
+        "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ], {
+        encoding: "utf8",
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("True|True");
+    },
+  );
 });

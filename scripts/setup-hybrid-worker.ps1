@@ -3,13 +3,17 @@ param(
   [string]$DedicatedAccount = "GustavoHybridWorker",
   [string]$TaskName = "Gustavo Hybrid Worker",
   [string]$ConfigPath = "$env:LOCALAPPDATA\Gustavo\hybrid-worker.env",
-  [switch]$ConfirmDockerDesktopPersonal
+  [switch]$ConfirmDockerDesktopPersonal,
+  [switch]$MaintenanceRebuild,
+  [switch]$RotateCodexAuthVolume
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $AuthVolume = "gustavo-codex-auth-v1"
+$ContainerName = "gustavo-codex-singleton-v1"
+$ExactTaskPath = "\"
 $ImageTag = "gustavo-codex:0.146.0"
 # The nested Dockerfile pins the exact package @openai/codex@0.146.0.
 $ContainerSource = Join-Path $PSScriptRoot "..\worker\hybrid\codex-container"
@@ -110,16 +114,26 @@ function Assert-OwnerOnlyAcl(
     [Security.Principal.SecurityIdentifier]
   )
   $Rules = @($Acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
-  $Allowed = @($Owner.Value, $System.Value)
   if (-not $Acl.AreAccessRulesProtected -or $OwnerSid.Value -ne $Owner.Value -or $Rules.Count -ne 2) {
     Stop-Safely "HYBRID_CONFIG_ACL_INVALID"
   }
+  $OwnerRuleCount = 0
+  $SystemRuleCount = 0
   foreach ($Rule in $Rules) {
-    if ($Allowed -notcontains $Rule.IdentityReference.Value -or
-        $Rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
-        ($Rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl) {
+    if ($Rule.IdentityReference.Value -eq $Owner.Value) {
+      $OwnerRuleCount += 1
+    } elseif ($Rule.IdentityReference.Value -eq $System.Value) {
+      $SystemRuleCount += 1
+    } else {
       Stop-Safely "HYBRID_CONFIG_ACL_INVALID"
     }
+    if ($Rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        $Rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl) {
+      Stop-Safely "HYBRID_CONFIG_ACL_INVALID"
+    }
+  }
+  if ($OwnerRuleCount -ne 1 -or $SystemRuleCount -ne 1) {
+    Stop-Safely "HYBRID_CONFIG_ACL_INVALID"
   }
 }
 
@@ -219,6 +233,148 @@ function Invoke-TrustedProcess(
   }
 }
 
+function New-MaintenanceLease(
+  [string]$PipeName = "gustavo-codex-runner-v1"
+) {
+  try {
+    return [IO.Pipes.NamedPipeServerStream]::new(
+      $PipeName,
+      [IO.Pipes.PipeDirection]::InOut,
+      1,
+      [IO.Pipes.PipeTransmissionMode]::Byte,
+      [IO.Pipes.PipeOptions]::Asynchronous
+    )
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_LEASE_UNAVAILABLE"
+  }
+}
+
+function Read-ProtectedConfigValues([string]$Path) {
+  $AllowedNames = @($RequiredSecrets) + @(
+    "GUSTAVO_HYBRID_IMAGE_DIGEST",
+    "GUSTAVO_DOCKER_EXECUTABLE",
+    "GUSTAVO_NODE_EXECUTABLE",
+    "GUSTAVO_COREPACK_EXECUTABLE",
+    "GUSTAVO_TAILSCALE_EXECUTABLE",
+    "GUSTAVO_HYBRID_PORT"
+  )
+  $Values = [ordered]@{}
+  foreach ($Line in [IO.File]::ReadAllLines($Path)) {
+    $Separator = $Line.IndexOf('=')
+    if ($Separator -lt 1) { Stop-Safely "HYBRID_MAINTENANCE_CONFIG_INVALID" }
+    $Name = $Line.Substring(0, $Separator)
+    $Value = $Line.Substring($Separator + 1)
+    if ($AllowedNames -notcontains $Name -or $Values.Contains($Name) -or
+        [string]::IsNullOrWhiteSpace($Value) -or $Value.Contains("`0")) {
+      Stop-Safely "HYBRID_MAINTENANCE_CONFIG_INVALID"
+    }
+    $Values[$Name] = $Value
+  }
+  if ($Values.Count -ne $AllowedNames.Count) {
+    Stop-Safely "HYBRID_MAINTENANCE_CONFIG_INVALID"
+  }
+  return $Values
+}
+
+function Invoke-MaintenanceRoleValidation([string]$Path) {
+  $Values = Read-ProtectedConfigValues $Path
+  $RoleCheck = @'
+import { Pool } from "pg";
+const ordinaryUrl = process.env.DATABASE_URL;
+const materializerUrl = process.env.GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL;
+if (!ordinaryUrl || !materializerUrl || ordinaryUrl === materializerUrl) throw new Error("ROLE_URL_INVALID");
+const options = (connectionString) => ({ connectionString, max: 1, connectionTimeoutMillis: 5000, idleTimeoutMillis: 1000 });
+const ordinary = new Pool(options(ordinaryUrl));
+const materializer = new Pool(options(materializerUrl));
+const checkedQuery = async (pool, sql) => {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const result = await client.query(sql);
+    await client.query('commit');
+    return result;
+  } catch (error) {
+    await client.query('rollback').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+try {
+  const ordinaryCheck = await checkedQuery(ordinary, `select current_user,pg_has_role(current_user,'gustavo_market_materializer','MEMBER') member`);
+  const scoped = await checkedQuery(materializer, `
+    select current_user,
+           pg_has_role(current_user,'gustavo_market_materializer','MEMBER') member,
+           login.rolcanlogin login,login.rolinherit inherit,
+           login.rolsuper superuser,login.rolcreatedb createdb,
+           login.rolcreaterole createrole,login.rolreplication replication,
+           login.rolbypassrls bypassrls,
+           permission.rolcanlogin permission_login,
+           permission.rolinherit permission_inherit,
+           permission.rolsuper permission_superuser,
+           permission.rolcreatedb permission_createdb,
+           permission.rolcreaterole permission_createrole,
+           permission.rolreplication permission_replication,
+           permission.rolbypassrls permission_bypassrls,
+           (select count(*)::int from pg_auth_members membership
+             join pg_roles granted on granted.oid=membership.roleid
+            where membership.member=login.oid
+              and granted.rolname<>'gustavo_market_materializer') login_other_memberships,
+           (select count(*)::int from pg_auth_members membership
+              where membership.member=permission.oid) permission_other_memberships,
+           (select count(*)::int from pg_auth_members membership
+              where membership.roleid=permission.oid) permission_member_count
+      from pg_roles login cross join pg_roles permission
+     where login.rolname=current_user and permission.rolname='gustavo_market_materializer'`);
+  const ordinaryRow = ordinaryCheck.rows[0];
+  const row = scoped.rows[0];
+  if (!ordinaryRow || ordinaryRow.member || !row || row.current_user === 'gustavo_market_materializer'
+      || !row.member || !row.login || !row.inherit || row.superuser || row.createdb
+      || row.createrole || row.replication || row.bypassrls || row.permission_login
+      || row.permission_inherit || row.permission_superuser || row.permission_createdb
+      || row.permission_createrole || row.permission_replication || row.permission_bypassrls
+      || row.login_other_memberships !== 0 || row.permission_other_memberships !== 0
+      || row.permission_member_count !== 1) {
+    throw new Error("ROLE_SCOPE_INVALID");
+  }
+} finally {
+  await Promise.allSettled([ordinary.end(), materializer.end()]);
+}
+'@
+  $RoleEnvironment = [ordered]@{}
+  foreach ($Entry in $NodeChildEnvironment.GetEnumerator()) {
+    $RoleEnvironment[$Entry.Key] = $Entry.Value
+  }
+  $RoleEnvironment["DATABASE_URL"] = [string]$Values["DATABASE_URL"]
+  $RoleEnvironment["GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL"] = `
+    [string]$Values["GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL"]
+  $RoleValidation = Invoke-TrustedProcess $NodeExecutable `
+    @($TsxCli, "--eval", $RoleCheck) $RoleEnvironment $RepositoryRoot -CaptureOutput
+  if ($RoleValidation.ExitCode -ne 0) { Stop-Safely "HYBRID_ROLE_VALIDATION_FAILED" }
+}
+
+function Invoke-WorkerConfigValidation([string]$Path) {
+  $RoleValidation = Invoke-TrustedProcess $PowerShellExecutable @(
+    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "RemoteSigned",
+    "-File", $StartScript, "-ConfigPath", $Path, "-ValidateOnly"
+  ) $BaseChildEnvironment -CaptureOutput
+  if ($RoleValidation.ExitCode -ne 0) { Stop-Safely "HYBRID_ROLE_VALIDATION_FAILED" }
+}
+
+function Register-ExactWorkerTask {
+  $Action = New-ScheduledTaskAction -Execute $PowerShellExecutable -Argument (
+    "-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File `"$StartScript`" -ConfigPath `"$ConfigFullPath`""
+  )
+  $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $ExpectedIdentityName
+  $Principal = New-ScheduledTaskPrincipal -UserId $ExpectedIdentityName -LogonType Interactive -RunLevel Limited
+  $Settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+  Register-ScheduledTask -TaskName $TaskName -TaskPath $ExactTaskPath -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force *> $null
+}
+
+if ($RotateCodexAuthVolume -and -not $MaintenanceRebuild) {
+  Stop-Safely "HYBRID_MAINTENANCE_MODE_REQUIRED"
+}
+
 if (-not $ConfirmDockerDesktopPersonal) {
   Stop-Safely "DOCKER_DESKTOP_PERSONAL_CONFIRMATION_REQUIRED"
 }
@@ -264,29 +420,92 @@ if (-not $ConfigFullPath.Equals($ExpectedConfigPath, [StringComparison]::Ordinal
 $ConfigDirectory = Split-Path -Parent $ConfigFullPath
 $ConfigParent = Split-Path -Parent $ConfigDirectory
 [void](Assert-NoReparsePath $ConfigParent $true)
-if (Test-Path -LiteralPath $ConfigFullPath) { Stop-Safely "HYBRID_CONFIG_ALREADY_EXISTS" }
-if (Test-Path -LiteralPath $ConfigDirectory) {
-  [void](Assert-NoReparsePath $ConfigDirectory $true)
+if (-not $MaintenanceRebuild) {
+  if (Test-Path -LiteralPath $ConfigFullPath) { Stop-Safely "HYBRID_CONFIG_ALREADY_EXISTS" }
+  if (Test-Path -LiteralPath $ConfigDirectory) {
+    [void](Assert-NoReparsePath $ConfigDirectory $true)
+  } else {
+    [void][IO.Directory]::CreateDirectory($ConfigDirectory)
+    [void](Assert-NoReparsePath $ConfigDirectory $true)
+  }
+  # Seal the exact direct-child directory before any secret bytes are assembled.
+  Set-OwnerOnlyAcl $ConfigDirectory $true $LocalUser.SID
+  Assert-OwnerOnlyAcl $ConfigDirectory $LocalUser.SID
 } else {
-  [void][IO.Directory]::CreateDirectory($ConfigDirectory)
   [void](Assert-NoReparsePath $ConfigDirectory $true)
+  if (-not (Test-Path -LiteralPath $ConfigFullPath -PathType Leaf)) {
+    Stop-Safely "HYBRID_MAINTENANCE_CONFIG_REQUIRED"
+  }
+  [void](Assert-NoReparsePath $ConfigFullPath $true)
+  Assert-OwnerOnlyAcl $ConfigDirectory $LocalUser.SID
+  Assert-OwnerOnlyAcl $ConfigFullPath $LocalUser.SID
 }
-# Seal the exact direct-child directory before any secret bytes are assembled.
-Set-OwnerOnlyAcl $ConfigDirectory $true $LocalUser.SID
-Assert-OwnerOnlyAcl $ConfigDirectory $LocalUser.SID
 
-$DockerExecutable = Assert-TrustedExecutable `
-  (Join-Path $KnownProgramFiles "Docker\Docker\resources\bin\docker.exe") `
-  (Join-Path $KnownProgramFiles "Docker\Docker\resources\bin\docker.exe")
-$NodeExecutable = Assert-TrustedExecutable `
-  (Join-Path $KnownProgramFiles "nodejs\node.exe") `
-  (Join-Path $KnownProgramFiles "nodejs\node.exe")
-$CorepackExecutable = Assert-TrustedExecutable `
-  (Join-Path $KnownProgramFiles "nodejs\corepack.cmd") `
-  (Join-Path $KnownProgramFiles "nodejs\corepack.cmd")
-$TailscaleExecutable = Assert-TrustedExecutable `
-  (Join-Path $KnownProgramFiles "Tailscale\tailscale.exe") `
-  (Join-Path $KnownProgramFiles "Tailscale\tailscale.exe")
+$MaintenanceLease = $null
+if ($MaintenanceRebuild) {
+  try {
+    $ExistingTask = Get-ScheduledTask -TaskName $TaskName -TaskPath $ExactTaskPath -ErrorAction Stop
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_TASK_INVALID"
+  }
+  if ($null -eq $ExistingTask -or
+      -not $ExistingTask.TaskName.Equals($TaskName, [StringComparison]::Ordinal) -or
+      -not $ExistingTask.TaskPath.Equals($ExactTaskPath, [StringComparison]::Ordinal) -or
+      @("Ready", "Disabled", "Queued", "Running") -notcontains [string]$ExistingTask.State) {
+    Stop-Safely "HYBRID_MAINTENANCE_TASK_INVALID"
+  }
+  if (@("Queued", "Running") -contains [string]$ExistingTask.State) {
+    Stop-Safely "HYBRID_MAINTENANCE_TASK_RUNNING"
+  }
+  $MaintenanceLease = New-MaintenanceLease "gustavo-codex-runner-v1"
+}
+
+$TemporaryConfigPath = $null
+try {
+
+if ($MaintenanceRebuild) {
+  try {
+    [void](Disable-ScheduledTask -TaskName $TaskName -TaskPath $ExactTaskPath -ErrorAction Stop)
+    $QuiescedTask = Get-ScheduledTask -TaskName $TaskName -TaskPath $ExactTaskPath -ErrorAction Stop
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_TASK_INVALID"
+  }
+  if ($null -eq $QuiescedTask -or
+      -not $QuiescedTask.TaskName.Equals($TaskName, [StringComparison]::Ordinal) -or
+      -not $QuiescedTask.TaskPath.Equals($ExactTaskPath, [StringComparison]::Ordinal) -or
+      @("Ready", "Disabled", "Queued", "Running") -notcontains [string]$QuiescedTask.State) {
+    Stop-Safely "HYBRID_MAINTENANCE_TASK_INVALID"
+  }
+  if (@("Queued", "Running") -contains [string]$QuiescedTask.State) {
+    Stop-Safely "HYBRID_MAINTENANCE_TASK_RUNNING"
+  }
+  try {
+    Unregister-ScheduledTask -TaskName $TaskName -TaskPath $ExactTaskPath -Confirm:$false -ErrorAction Stop
+  } catch {
+    Stop-Safely "HYBRID_MAINTENANCE_TASK_INVALID"
+  }
+}
+
+$ExpectedDockerExecutable = Join-Path $KnownProgramFiles "Docker\Docker\resources\bin\docker.exe"
+$ExpectedNodeExecutable = Join-Path $KnownProgramFiles "nodejs\node.exe"
+$ExpectedCorepackExecutable = Join-Path $KnownProgramFiles "nodejs\corepack.cmd"
+$ExpectedTailscaleExecutable = Join-Path $KnownProgramFiles "Tailscale\tailscale.exe"
+if ($MaintenanceRebuild) {
+  $PersistedConfig = Read-ProtectedConfigValues $ConfigFullPath
+  $DockerExecutable = Assert-TrustedExecutable `
+    ([string]$PersistedConfig["GUSTAVO_DOCKER_EXECUTABLE"]) $ExpectedDockerExecutable
+  $NodeExecutable = Assert-TrustedExecutable `
+    ([string]$PersistedConfig["GUSTAVO_NODE_EXECUTABLE"]) $ExpectedNodeExecutable
+  $CorepackExecutable = Assert-TrustedExecutable `
+    ([string]$PersistedConfig["GUSTAVO_COREPACK_EXECUTABLE"]) $ExpectedCorepackExecutable
+  $TailscaleExecutable = Assert-TrustedExecutable `
+    ([string]$PersistedConfig["GUSTAVO_TAILSCALE_EXECUTABLE"]) $ExpectedTailscaleExecutable
+} else {
+  $DockerExecutable = Assert-TrustedExecutable $ExpectedDockerExecutable $ExpectedDockerExecutable
+  $NodeExecutable = Assert-TrustedExecutable $ExpectedNodeExecutable $ExpectedNodeExecutable
+  $CorepackExecutable = Assert-TrustedExecutable $ExpectedCorepackExecutable $ExpectedCorepackExecutable
+  $TailscaleExecutable = Assert-TrustedExecutable $ExpectedTailscaleExecutable $ExpectedTailscaleExecutable
+}
 $PowerShellExecutable = Assert-TrustedExecutable `
   (Join-Path $PSHOME "powershell.exe") `
   (Join-Path $PSHOME "powershell.exe")
@@ -294,6 +513,10 @@ $CorepackScript = [IO.Path]::GetFullPath(
   (Join-Path $KnownProgramFiles "nodejs\node_modules\corepack\dist\corepack.js")
 )
 [void](Assert-NoReparsePath $CorepackScript $true)
+$RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+$TsxCli = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot "node_modules\tsx\dist\cli.mjs"))
+[void](Assert-NoReparsePath $RepositoryRoot $true)
+[void](Assert-NoReparsePath $TsxCli $true)
 $System32 = [IO.Path]::GetFullPath((Join-Path $KnownWindows "System32"))
 [void](Assert-NoReparsePath $System32 $true)
 $BaseChildEnvironment = [ordered]@{
@@ -352,6 +575,18 @@ if ($OrdinaryUri.AbsoluteUri -eq $MaterializerUri.AbsoluteUri -or
   Stop-Safely "NEON_POOLED_ROLE_SEPARATION_REQUIRED"
 }
 
+if ($MaintenanceRebuild) {
+  $ContainerList = Invoke-TrustedProcess $DockerExecutable @(
+    "container", "ls", "--all", "--quiet", "--filter", "name=^/${ContainerName}$"
+  ) $DockerChildEnvironment -CaptureOutput
+  if ($ContainerList.ExitCode -ne 0) {
+    Stop-Safely "HYBRID_MAINTENANCE_CONTAINER_INSPECTION_FAILED"
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ContainerList.Stdout)) {
+    Stop-Safely "HYBRID_MAINTENANCE_CONTAINER_PRESENT"
+  }
+}
+
 # The nested directory is the entire build context. The repository, infra config,
 # Docker socket, provider secrets, and host Codex home cannot enter this image.
 # The exact argument array below is equivalent to: docker build --pull --no-cache.
@@ -382,6 +617,18 @@ $VolumeList = Invoke-TrustedProcess $DockerExecutable @(
 ) $DockerChildEnvironment -CaptureOutput
 $ExistingVolume = $VolumeList.Stdout
 if ($VolumeList.ExitCode -ne 0) { Stop-Safely "CODEX_AUTH_VOLUME_INVALID" }
+if ($MaintenanceRebuild -and $RotateCodexAuthVolume) {
+  if ($ExistingVolume.Trim() -ne $AuthVolume) {
+    Stop-Safely "CODEX_AUTH_VOLUME_INVALID"
+  }
+  $VolumeRemove = Invoke-TrustedProcess $DockerExecutable @(
+    "volume", "rm", $AuthVolume
+  ) $DockerChildEnvironment -CaptureOutput
+  if ($VolumeRemove.ExitCode -ne 0 -or $VolumeRemove.Stdout.Trim() -ne $AuthVolume) {
+    Stop-Safely "CODEX_AUTH_VOLUME_REMOVE_FAILED"
+  }
+  $ExistingVolume = ""
+}
 if ([string]::IsNullOrWhiteSpace($ExistingVolume)) {
   $VolumeCreate = Invoke-TrustedProcess $DockerExecutable @(
     "volume", "create", $AuthVolume
@@ -419,8 +666,23 @@ $ConfigLines.Add("GUSTAVO_COREPACK_EXECUTABLE=$CorepackExecutable")
 $ConfigLines.Add("GUSTAVO_TAILSCALE_EXECUTABLE=$TailscaleExecutable")
 $ConfigLines.Add("GUSTAVO_HYBRID_PORT=4318")
 $ConfigBytes = [Text.UTF8Encoding]::new($false).GetBytes(($ConfigLines -join "`r`n") + "`r`n")
+$ConfigWritePath = $ConfigFullPath
+if ($MaintenanceRebuild) {
+  do {
+    $TemporaryConfigPath = Join-Path $ConfigDirectory (
+      ".hybrid-worker.$([IO.Path]::GetRandomFileName()).tmp"
+    )
+  } while (Test-Path -LiteralPath $TemporaryConfigPath)
+  if (-not (Split-Path -Parent $TemporaryConfigPath).Equals(
+      $ConfigDirectory,
+      [StringComparison]::OrdinalIgnoreCase
+    )) {
+    Stop-Safely "HYBRID_MAINTENANCE_TEMP_PATH_INVALID"
+  }
+  $ConfigWritePath = $TemporaryConfigPath
+}
 $CreationStream = [IO.FileStream]::new(
-  $ConfigFullPath,
+  $ConfigWritePath,
   [IO.FileMode]::CreateNew,
   [IO.FileAccess]::Write,
   [IO.FileShare]::None,
@@ -432,13 +694,13 @@ try {
 } finally {
   $CreationStream.Dispose()
 }
-[void](Assert-NoReparsePath $ConfigFullPath $true)
+[void](Assert-NoReparsePath $ConfigWritePath $true)
 # The empty file inherits only trusted principals; make its final ACL explicit
 # before the first secret byte is written.
-Set-OwnerOnlyAcl $ConfigFullPath $false $LocalUser.SID
-Assert-OwnerOnlyAcl $ConfigFullPath $LocalUser.SID
+Set-OwnerOnlyAcl $ConfigWritePath $false $LocalUser.SID
+Assert-OwnerOnlyAcl $ConfigWritePath $LocalUser.SID
 $ConfigStream = [IO.FileStream]::new(
-  $ConfigFullPath,
+  $ConfigWritePath,
   [IO.FileMode]::Open,
   [IO.FileAccess]::Write,
   [IO.FileShare]::None,
@@ -451,22 +713,37 @@ try {
 } finally {
   $ConfigStream.Dispose()
 }
-[void](Assert-NoReparsePath $ConfigFullPath $true)
-Assert-OwnerOnlyAcl $ConfigFullPath $LocalUser.SID
+[void](Assert-NoReparsePath $ConfigWritePath $true)
+Assert-OwnerOnlyAcl $ConfigWritePath $LocalUser.SID
 
-# Validate the two database identities before installing the exact logon task.
-$RoleValidation = Invoke-TrustedProcess $PowerShellExecutable @(
-  "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "RemoteSigned",
-  "-File", $StartScript, "-ConfigPath", $ConfigFullPath, "-ValidateOnly"
-) $BaseChildEnvironment -CaptureOutput
-if ($RoleValidation.ExitCode -ne 0) { Stop-Safely "HYBRID_ROLE_VALIDATION_FAILED" }
+if ($MaintenanceRebuild) {
+  Invoke-MaintenanceRoleValidation $TemporaryConfigPath
+  [IO.File]::Replace($TemporaryConfigPath, $ConfigFullPath, $null)
+  $TemporaryConfigPath = $null
+  [void](Assert-NoReparsePath $ConfigFullPath $true)
+  Assert-OwnerOnlyAcl $ConfigDirectory $LocalUser.SID
+  Assert-OwnerOnlyAcl $ConfigFullPath $LocalUser.SID
+}
 
-$Action = New-ScheduledTaskAction -Execute $PowerShellExecutable -Argument (
-  "-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File `"$StartScript`" -ConfigPath `"$ConfigFullPath`""
-)
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $ExpectedIdentityName
-$Principal = New-ScheduledTaskPrincipal -UserId $ExpectedIdentityName -LogonType Interactive -RunLevel Limited
-$Settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force *> $null
+# Final validation uses the unchanged launcher authority before task registration.
+Invoke-WorkerConfigValidation $ConfigFullPath
+Register-ExactWorkerTask
 
-Write-Output "HYBRID_WORKER_SETUP_COMPLETE"
+if ($MaintenanceRebuild) {
+  Write-Output "HYBRID_WORKER_MAINTENANCE_COMPLETE"
+} else {
+  Write-Output "HYBRID_WORKER_SETUP_COMPLETE"
+}
+} finally {
+  try {
+    if ($null -ne $TemporaryConfigPath -and
+        (Test-Path -LiteralPath $TemporaryConfigPath)) {
+      [void](Assert-NoReparsePath $TemporaryConfigPath $true)
+      Remove-Item -Force -LiteralPath $TemporaryConfigPath
+    }
+  } finally {
+    if ($null -ne $MaintenanceLease) {
+      $MaintenanceLease.Dispose()
+    }
+  }
+}
