@@ -1407,6 +1407,7 @@ export function createHybridRuntimeController(
   let modelPromise: Promise<void> | undefined;
   let modelWakePending = false;
   let marketPromise: Promise<void> | undefined;
+  let heartbeatRefreshPromise: Promise<void> | undefined;
   let activeMarketWindow: string | undefined;
   let pendingMarketWindow: string | undefined;
   const workController = new AbortController();
@@ -1539,6 +1540,21 @@ export function createHybridRuntimeController(
     return marketPromise;
   };
 
+  const refreshCodexHeartbeat = (): void => {
+    if (!options.heartbeat || heartbeatRefreshPromise || workController.signal.aborted) return;
+    let refresh: Promise<void>;
+    refresh = Promise.resolve().then(() => options.heartbeat!(Object.freeze({
+      component: "CODEX",
+      status: "HEALTHY",
+      safeCode: null,
+    }), workController.signal)).catch(() => {
+      // Heartbeat refresh is best-effort; durable work remains authoritative.
+    }).finally(() => {
+      if (heartbeatRefreshPromise === refresh) heartbeatRefreshPromise = undefined;
+    });
+    heartbeatRefreshPromise = refresh;
+  };
+
   const stop = (timeoutMs = configuration.stopTimeoutMs): Promise<void> => {
     if (!Number.isSafeInteger(timeoutMs)
       || timeoutMs < 1
@@ -1562,6 +1578,7 @@ export function createHybridRuntimeController(
       // A startup stage must observe the abort and settle before the same
       // bounded authority reconciles container state under T7's lease.
       await Promise.allSettled([startPromise ?? Promise.resolve()]);
+      await Promise.allSettled([heartbeatRefreshPromise ?? Promise.resolve()]);
       if (options.heartbeat) {
         await Promise.allSettled([
           options.heartbeat(Object.freeze({
@@ -1599,6 +1616,7 @@ export function createHybridRuntimeController(
     enqueue(wake: HybridRuntimeWake): void {
       requireReady();
       const exact = exactRuntimeWake(wake);
+      refreshCodexHeartbeat();
       const work = "jobId" in exact
         ? wakeModelDrain()
         : wakeMarketWindow(exact.windowId);

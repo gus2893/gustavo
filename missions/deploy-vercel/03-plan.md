@@ -1317,7 +1317,7 @@ Yes. The shared pump and route wiring are one cancellation authority; splitting 
 ### T18 — Render account-only bridge state and the complete market dashboard
 
 **Maps to:** R3, R4, R5
-**Files touched:** `lib/server/dal/account-surfaces.ts` (modify), `app/(account)/chat/page.tsx` (modify), `components/chat/Conversation.tsx` (modify), `app/(account)/market/page.tsx` (new), `components/market/MarketStatus.tsx` (new), `tests/ui/account-surfaces.test.tsx` (modify)
+**Files touched:** `worker/hybrid/runtime.ts` (wake-heartbeat delta), `lib/server/dal/account-surfaces.ts` (modify), `app/(account)/chat/page.tsx` (modify if projection wiring requires it), `components/chat/Conversation.tsx` (modify), `app/(account)/market/page.tsx` (new), `components/market/MarketStatus.tsx` (new), `tests/infra/hybrid-worker.test.ts` (modify), `tests/ui/account-surfaces.test.tsx` (modify), `missions/deploy-vercel/prompt-update-hybrid-heartbeat-lease.md` (new)
 
 #### Red — failing test
 
@@ -1371,9 +1371,18 @@ describe("hybrid account surfaces", () => {
 
 Expected initial state: module resolution fails with `Cannot find module '../../components/market/MarketStatus'`.
 
+Additional required REDs, captured before the heartbeat/snapshot correction:
+
+- In `tests/infra/hybrid-worker.test.ts`, gate the heartbeat promise, call `runtime.enqueue()` twice after startup, and assert HTTP-facing enqueue returns synchronously while only one extra `{ component: "CODEX", status: "HEALTHY", safeCode: null }` refresh is in flight; after resolution, the next accepted wake starts exactly one new refresh. The current runtime makes zero wake-time heartbeat calls.
+- In `tests/ui/account-surfaces.test.tsx`, seed a `HEALTHY` CODEX heartbeat at database time minus 12 minutes and one millisecond and expect `OFFLINE`; seed today's `CODEX_JOBS` counter at `100/100` with a fresh healthy heartbeat and expect `QUOTA_LIMITED`. The current projection returns `AVAILABLE` in both cases.
+- In the same UI file, pause a concurrent poll commit between the poll-summary and latest-row reads and assert every `Fresh` item has the authoritative completed window. The current independent `Promise.all` snapshots can return an older latest row labeled `Fresh` under a newer completed poll.
+
 #### Green — minimum implementation
 
 - Extend the account DAL with auth-first `bridge` summary and `loadAccountMarket` that returns exactly the fixed 95 safe private DTOs after key/tenant checks.
+- Coalesce one best-effort CODEX heartbeat refresh through the existing runtime heartbeat callback for accepted wakes; do not await it from synchronous enqueue, add a timer loop, or weaken signed wake verification/receipt authority.
+- Derive bridge state from database-clock `observed_at` plus the current UTC durable `CODEX_JOBS` counter: quota at `limit_count` takes precedence, otherwise CODEX is available only at age `<=12 minutes`; stale/missing/nonhealthy state is offline.
+- Read the authoritative market poll summary, heartbeat, and all 95 latest rows inside one transaction/coherent snapshot; validate window ordering so an older row cannot become Fresh because a newer poll committed between reads.
 - Add `/market` as a server-authenticated page; unauthenticated requests stop before market, heartbeat, or quote queries.
 - Render symbol, kind, price only for success, provider observation time, receipt time, age/freshness, and safe unavailable state. Never serialize ciphertext, keys, raw provider responses, hostnames, tunnel URLs, or prompt data.
 - Render a recovered failed poll summary as unavailable/stale; never relabel its previous latest rows as fresh.
@@ -1389,6 +1398,10 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 Command: `pnpm vitest run tests/ui/account-surfaces.test.tsx -t "shows queued/offline chat state and all 95 private market statuses without public serialization"`
 
 Expected: one selected test passes, zero fail, exit code 0; the full account-surface suite passes.
+
+Command: `pnpm vitest run tests/infra/hybrid-worker.test.ts -t "refreshes the CODEX heartbeat lease on accepted wakes without delaying or adding a timer"`
+
+Expected: one selected test passes, zero fail, exit code 0; existing startup/stop heartbeat and wake-acknowledgment tests remain green.
 
 #### Reviewable as a unit?
 
@@ -1444,6 +1457,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 - Project only fixed component names, `AVAILABLE|DEGRADED|OFFLINE|UNKNOWN`, safe codes, bounded ages, pending count, and used/limit integers.
 - Map Docker/image/auth-volume unavailability to the existing bounded `PROVIDER_UNAVAILABLE` health authority and unproven container termination to `WORKER_OFFLINE`; never expose daemon text, image/container/volume names, digests, host paths, or IDs.
 - Read heartbeats and quota buckets from PostgreSQL so a Vercel process restart does not erase health state.
+- Reuse the frozen wake-refreshed lease policy: CODEX age `<=12 minutes` may be available, older/missing is offline, and the current UTC `CODEX_JOBS` counter at its fixed limit takes precedence as quota-limited. Do not add another heartbeat timer or threshold.
 - Extend the existing bearer-auth-first operator route; unauthorized requests stop before health, heartbeat, quota, cache, or database status reads.
 - Retain `Cache-Control: private, no-store`, response-size bounds, existing performance health, and generic failures.
 - Never return hostnames, ports, Funnel URL, account/conversation/job IDs, model prompt/output, quote values, secrets, or raw provider errors.
@@ -1581,6 +1595,7 @@ Expected initial state: `readFileSync("docs/VERCEL_DEPLOYMENT.md")` fails with `
 - Write one command-ordered runbook: create Free resources, link the existing Vercel team/project, set Node 24/Corepack, set secrets through dashboards/CLI stdin, migrate, bootstrap, install Docker Desktop/local worker, build and record the pinned local Codex image digest, create/sign into the exact auth volume, start Funnel, configure two QStash schedules, deploy Preview, smoke, promote, and verify domains.
 - Document daily/provider dashboard checks and application caps: QStash 900/day, Codex 100/day/one active, Finnhub 96/window/exactly 95 results, Redis TTL/key bounds, latest quote and seven-day poll bounds.
 - Document PC-offline behavior: public/history hosted, messages durable/queued, market stale, local health offline; document reconnect recovery.
+- Document that existing accepted five-minute/direct wakes refresh the DB-clock CODEX lease, two missed wake intervals make it offline at 12 minutes, current-day quota 100 is quota-limited, and there is no independent timer/poller/schedule.
 - Document that reconnect never re-polls an expired window: retained incomplete rows fail once before seven-day pruning, while already pruned rows are skipped and only the newly reserved current window may call Finnhub.
 - Document backup-before-cutover, flags-first rollback, exact schedule/task/Funnel cleanup, previous Ready promotion or exact safe-shell commit, and additive migration retention.
 - Add only blank secret names and deployment-profile examples to `infra/env.example`; state that the containerized standalone Codex uses interactive ChatGPT sign-in through the dedicated volume and remains an unsupported application backend. Document image rebuild/re-auth, exact-label reconciliation, and termination-failure shutdown without printing volume/image/container identifiers in application health.
@@ -1657,6 +1672,7 @@ Expected initial state: the message remains queued because no local hybrid E2E c
 - The disposable fixture creates distinct ordinary and materializer login roles, grants only the migration-created permission role to the latter, passes the materializer URL only to the local test worker, and proves an ordinary-role matching-binding forgery is rejected before the browser story.
 - Run one market wake, then verify 95 rows, timestamps/freshness, exact chat attribution, Main/Evaluator priority fixture, one active Codex container, and no local data copied at bootstrap.
 - Stop the local controller to verify hosted public/history plus queued/offline status; restart it and verify exactly-once drain/recovery.
+- Simulate abrupt loss without the clean OFFLINE write, advance database time past the 12-minute CODEX lease, and verify chat/health become offline; separately seed current UTC `CODEX_JOBS=100/100` with a fresh heartbeat and verify quota-limited. Accepted wake refresh must not delay the 202 or create an extra schedule/timer.
 - Seed a retained incomplete prior market window before restart; assert recovery writes one failed summary, performs zero provider calls/latest mutations for that prior window, then allows only the newly reserved current window to poll. Repeat at the post-retention boundary and assert cleanup-only behavior.
 - Capture public request URLs, post bodies, HTML, RSC, and feed payloads and assert absence of the canary, live quote fixture, ciphertext markers, tokens, and tunnel data.
 - Reuse the existing cross-process owned-resource registry for deterministic cleanup of every child/temp resource. An opt-in real-Docker fixture proves one exact labeled descendant container is removed and no repository/application-secret mount is present.
@@ -1728,6 +1744,7 @@ Expected initial state: with live verification enabled before cutover, the curre
 - Run Preview smoke, public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, container kill/wait and startup-reconciliation rehearsal, and quota boundary checks before production promotion.
 - Rehearse a retained prior market window and an already pruned one: prove no historical repoll or quota re-reservation, one bounded failed summary before retention expiry, cleanup-only afterward, and a normal current-window poll.
 - Run the regenerated focused SSE suite before cutover and retain its queue-full, active-authentication, active-revalidation, protected-load, source/iterator, response-cancel, and ordered durable reconnect proofs.
+- Verify an accepted existing wake refreshes the database-clock CODEX lease, two missed five-minute wakes age it offline at 12 minutes, quota 100 overrides fresh heartbeat, and no third schedule or persistent heartbeat timer exists.
 - Promote that exact Ready deployment, verify apex TLS and `www` redirect, then rehearse flags-first local/schedule rollback while confirming the hosted public/history surfaces remain available; restore the verified production state afterward.
 - Run the live test with the Vercel token supplied through the process environment; never write tokens or resource URLs containing credentials to disk or command arguments.
 
@@ -1774,5 +1791,6 @@ Yes. All code is already green before this task; this unit contains named extern
 - [x] Prompt-update impact is resolved: T7 is fully regenerated and T8/T15/T19/T21/T22/T23 explicitly use the container authority without weakening unchanged T1–T6 behavior.
 - [x] Market-materializer prompt-update impact is resolved: T13 defines the role-separated binding boundary; T15 provisions it locally; T21 documents it; T22 proves distinct identities; T23 provisions/verifies it without exposing the URL to Vercel.
 - [x] SSE cancellation-authority prompt-update impact is resolved: T17 owns active work through the shared stream pump and T23 reruns its focused cancellation/reconnect gate before cutover.
+- [x] Hybrid-heartbeat lease prompt-update impact is resolved: T18 coalesces refreshes and projects DB-clock/quota authority; T19 reuses the same policy; T21/T22/T23 document and verify abrupt-loss aging without an extra loop or schedule.
 
 Plan approved. Next: `mcax-execute`.

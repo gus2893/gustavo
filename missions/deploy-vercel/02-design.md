@@ -36,6 +36,7 @@
    - Vercel web functions do not run `worker/runtime.ts` persistent loops.
    - QStash calls one authenticated bounded Vercel maintenance route every 15 minutes for cache, privacy, stream, and schedule steps.
    - QStash calls the local Tailscale Funnel market wake every five minutes; direct chat sends an extra signed opaque-job wake.
+   - Every accepted signed wake coalesces one database-clock CODEX heartbeat refresh with no additional timer/polling loop. A CODEX heartbeat older than 12 minutes is offline, and the current UTC `CODEX_JOBS` quota counter overrides heartbeat status as quota-limited.
    - Neon is the correctness boundary: lost wake/pubsub messages leave durable work pending for startup/reconnect recovery.
    - SSE installs one cancellation authority before authentication, stops admission by 54 seconds, settles all admitted authentication/revalidation/body-load/subscription work, and closes by 55 seconds; reconnect uses the existing ordered `Last-Event-ID` database cursor.
 
@@ -120,6 +121,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 4. **Bounded latest-market projection with separate materialization authority.** Ninety-five encrypted mutable latest rows avoid roughly 7,500 permanent quote events/trading day. Existing append-only observations remain authoritative when actually consumed. The schema owner creates a NOLOGIN `gustavo_market_materializer` permission role, but the ordinary application role is not a member. Only a separately authenticated local login with that membership may create a body-free consumption binding; triggers reject bindings from every other `current_user`. The binding copies database-owned latest identity/version authority, and application replay still reauthorizes, decrypts, and compares the exact latest version. This role boundary is required because PostgreSQL cannot validate Node-side AES-GCM plaintext and one shared database identity cannot distinguish legitimate materialization from forged direct SQL.
 5. **Container-isolated unsupported Codex runner.** The Windows worker never spawns Codex directly. It invokes Docker with a fixed argument vector against a locally built, digest-recorded image whose Node and Codex CLI versions are pinned. Before any run or reconciliation Docker operation, the worker exclusively binds the fixed local named pipe `\\.\pipe\gustavo-codex-runner-v1` and holds that crash-releasing OS authority through actual lifecycle-promise settlement; another process fails safely without inspecting or mutating Docker state. Every job then claims the one fixed Docker name `gustavo-codex-singleton-v1`; Docker's daemon-owned name uniqueness is the durable residue and restart serializer. After `docker create` returns, every lifecycle operation uses the immutable returned container ID and verifies the fixed name, exact labels, and image before acting. There is no wall-clock or sampled-absence path that clears an ambiguous create: an interrupted or unsettled create leaves claims fail-closed until a new process first owns the named-pipe lease and exact-name reconciliation finds and removes the container, or an operator explicitly verifies the daemon helper is settled and performs the documented recovery. Each read-only container uses `--init`, `--cap-drop ALL`, `no-new-privileges`, fixed PID/memory/CPU limits, a fresh bounded tmpfs mounted at `/workspace`, fixed read-only role schemas baked into `/schemas`, and only the dedicated Codex-auth volume mounted at `/codex-home`. The repository, Windows workspace, database/Valkey/QStash/Finnhub/Tailscale secrets, Docker socket, and arbitrary host paths are never mounted or passed. All model-visible tools, including `tools.view_image`, shell, web search, apps, hooks, and multi-agent tools, are explicitly disabled. The container runs an internal wall-time supervisor and the exact noninteractive `codex exec --ephemeral --ignore-user-config --skip-git-repo-check --sandbox read-only --ask-for-approval never --json --output-schema /schemas/<role>.schema.json -C /workspace -` command with prompt bytes on stdin. One synchronous in-process owner token composes with the named-pipe lease for both run and reconcile paths; timed-out lifecycle promises retain both authorities until actual settlement. Host abort performs bounded `docker kill` plus `docker wait`; startup reconciles only while holding the named-pipe lease and only the fixed name/exact authority labels. Failure to prove container termination disables further Codex claims and reports a safe unavailable state. This limits host impact and gives the container runtime—not ad-hoc Windows process enumeration—process-tree authority; it does not turn Codex CLI into a supported application API.
 6. **Two-phase release.** Preview, resources, migration, bootstrap, local bridge/market, health, leakage scan, and rollback rehearsal must pass before production promotion.
+7. **Wake-refreshed local liveness lease.** The local host writes CODEX/market state at startup and stop, and each already-scheduled signed wake coalesces at most one in-flight CODEX heartbeat refresh using database time. This adds no persistent timer or extra QStash message and preserves Neon auto-suspend between existing wakes. Account/operator projections treat CODEX as available only while its last database timestamp is at most 12 minutes old; the durable current-UTC `CODEX_JOBS` counter at its fixed limit takes precedence as quota-limited. Abrupt PC/process loss therefore becomes offline after two missed five-minute wakes without relying on a clean stop.
 
 ### Data model
 
@@ -128,7 +130,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `bridge_model_jobs`: source event, role/kind/priority, immutable digest, bounded lease/attempt/status, output event, safe terminal code; never prompt/output text.
 - Authority triggers: one Node job per completed USER message, one Main job per generation cycle, semantic immutability with lease/status transitions only.
 - `bridge_wake_receipts`: unique QStash message IDs/times, pruned on a bound.
-- `hybrid_worker_heartbeats`: fixed components `CODEX`, `MARKET`, `TUNNEL`; no hostname/URL/secret.
+- `hybrid_worker_heartbeats`: fixed components `CODEX`, `MARKET`, `TUNNEL`; database-clock liveness lease refreshed by existing accepted wakes; no hostname/URL/secret.
 - `market_poll_windows`: five-minute counts/provider status/safe code, retained seven days.
 - `market_latest_quotes`: exactly one encrypted monotonic latest row per catalog symbol.
 - `market_observation_consumptions`: body-free exact decision/latest/observation binding, writable only while authenticated through the `gustavo_market_materializer` permission role; direct ordinary-writer binding and matching-row forgery are rejected.
@@ -186,6 +188,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `scripts/issue-invitation.ts`: canonical redemption URL mode.
 - `infra/env.example`, `docs/{OPERATIONS,PRODUCTION_CHECKLIST,SMOKE_TEST}.md`: deployment mode/runbook links.
 - `scripts/{setup-hybrid-worker,start-hybrid-worker}.ps1`, `infra/env.example`, and hybrid production tests: provision/validate the local-only materializer URL without printing or forwarding it to Vercel or the Codex container.
+- `worker/hybrid/runtime.ts`, `tests/infra/hybrid-worker.test.ts`: coalesce one database-clock CODEX heartbeat refresh per accepted wake without delaying HTTP acknowledgement or adding a timer loop.
 
 ### Off-limits files
 
@@ -254,7 +257,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `tests/bridge/codex-cli.test.ts`: safe args/stdin/schema/bounds/malformed output/no repo/tool integrations.
 - `tests/bridge/qstash.test.ts`: signatures, exact URL/body, expiry/replay/receipt-before-wake/quota.
 - `tests/market-data/finnhub-poller.test.ts`: exact 95, pacing/caps, 429/unavailable, closed session, encryption/public exclusion.
-- `tests/infra/hybrid-worker.test.ts`: startup, one active job, priority, recovery, heartbeat, loopback binding, safe logs.
+- `tests/infra/hybrid-worker.test.ts`: startup, one active job, priority, recovery, wake-coalesced heartbeat lease, loopback binding, safe logs.
 - `tests/ui/account-surfaces.test.tsx`: bridge state and auth-first 95 dashboard.
 - `tests/stream/sse-authorization.test.ts`: bounded reconnect, ordered replay, queue-full cancellation, and proof that authentication/revalidation/protected loading/source iteration settle before response completion.
 - `tests/privacy/forget-propagation.test.ts`, `tests/cache/postgres.test.ts`: one-shot maintenance preserves fences.
@@ -264,7 +267,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 
 - Canonical safe public site at `https://gustavo.lol`; `www` redirects.
 - First operator redeems one URL and receives an empty private conversation.
-- Chat shows committed/queued; later Node reply appears. Offline leaves the message and shows local processing unavailable.
+- Chat shows committed/queued; later Node reply appears. A stale 12-minute CODEX lease shows local processing unavailable, while the current UTC durable job counter at 100 shows quota-limited even if the last heartbeat was healthy.
 - `/market` lists all 95 with price when successful, timestamps/freshness, and unavailable codes.
 - Operator health separates hosted from local health without hostnames, URLs, prompts, prices, or secrets.
 
@@ -343,6 +346,11 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
   - Previous system design: “SSE has a 55-second maximum, bounded heartbeats/cleanup, and reconnects through existing ordered database replay.”
   - Revised intent: install lifecycle authority before authentication, stop admission by 54 seconds, and make one shared idempotent pump abort and await all admitted authentication/revalidation/protected-load, replay/pubsub, backpressure, source, iterator, and response work before the 55-second close. No database/decryption or Redis promise may remain detached; durable cursor and authorization semantics are unchanged.
 - 2026-08-14 SSE cancellation-authority update approved under the user's standing instruction to “Proceed with all without needed input”; T17 and the T23 verification delta require regeneration before execution resumes.
+- 2026-08-14 prompt-update: define a wake-refreshed local liveness lease after T18 review proved startup/clean-stop-only heartbeats cannot distinguish an idle live host from an abrupt PC/process loss, and cannot expose actual daily Codex quota exhaustion.
+  - Previous intent: “QStash calls the local Tailscale Funnel market wake every five minutes; direct chat sends an extra signed opaque-job wake.” Heartbeat rows were fixed safe status records but had no freshness authority.
+  - Revised intent: each already-accepted signed wake coalesces at most one database-clock CODEX heartbeat refresh, with no new timer, poller, or QStash message. A heartbeat older than 12 minutes is offline; the durable current-UTC `CODEX_JOBS` counter at its fixed limit overrides it as quota-limited.
+  - Preserved intent: wake verification/receipt/quota precedes dispatch, HTTP acknowledgment remains decoupled from model execution, lost wakes leave durable work pending, Neon may auto-suspend between existing wakes, and no hostname, URL, identifier, prompt, price, or secret enters health/account DTOs.
+- 2026-08-14 hybrid-heartbeat lease update approved under the user's standing instruction to “Proceed with all without needed input”; the T15 delta, T18, T19, T21, T22, and T23 require regeneration before affected execution resumes.
 
 ## Self-review checklist
 

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   afterAll,
+  afterEach,
   beforeAll,
   describe,
   expect,
@@ -13,6 +14,7 @@ import {
 import type { EventDatabase } from "../../lib/server/events/types";
 import { generateOpaqueToken } from "../../lib/server/auth/sessions";
 import { appendMessage } from "../../lib/server/history/messages";
+import { storeLatestMarketWindow } from "../../lib/server/market-data/latest";
 import { routeNodeReply } from "../../lib/server/node-brains/router";
 import {
   PROPOSAL_STATUSES,
@@ -43,11 +45,22 @@ import {
   submitConversationMessage,
 } from "../../components/chat/Conversation";
 import { ChallengeSummary } from "../../components/challenge/ChallengeSummary";
+import { MarketStatus } from "../../components/market/MarketStatus";
+import { MARKET_UNIVERSE } from "../../config/market-universe";
 
 const pageState = vi.hoisted(() => ({
   db: undefined as EventDatabase | undefined,
   token: undefined as string | undefined,
 }));
+
+function deferred(): {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+} {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 vi.mock("../../lib/server/db/postgres", () => ({
   getDatabase(): EventDatabase {
@@ -66,6 +79,7 @@ vi.mock("next/cache", () => ({ unstable_noStore: vi.fn() }));
 
 import ChatPage from "../../app/(account)/chat/page";
 import ChallengePage from "../../app/(challenge)/challenge/page";
+import MarketPage, { loadMarketPageData } from "../../app/(account)/market/page";
 import {
   GET as getMemory,
   POST as mutateMemory,
@@ -74,9 +88,81 @@ import { GET as getAccountExport } from "../../app/api/account/export/route";
 import {
   loadAccountChallenge,
   loadAccountConversation,
+  loadAccountMarket,
 } from "../../lib/server/dal/account-surfaces";
 
 describe("authenticated account surfaces", () => {
+  it("shows queued/offline chat state and all 95 private market statuses without public serialization", async () => {
+    const chat = renderToStaticMarkup(<Conversation
+      conversationId="018f7b22-9f76-7b4d-a4e8-1a2b3c4d5e6f"
+      messages={[]}
+      broadcasts={[]}
+      nextCursor={null}
+      bridge={{ status: "OFFLINE", pendingJobs: 1, safeCode: "LOCAL_BRIDGE_UNAVAILABLE" }}
+    />);
+    const market = renderToStaticMarkup(<MarketStatus items={MARKET_UNIVERSE.map((item) => ({
+      ...item,
+      status: "UNAVAILABLE" as const,
+      price: null,
+      sourceObservedAt: null,
+      receivedAt: "2026-08-13T13:35:00.000Z",
+      ageSeconds: null,
+      freshness: "Unavailable" as const,
+      safeCode: "LOCAL_BRIDGE_UNAVAILABLE" as const,
+    }))} />);
+
+    expect(chat).toContain("Message saved — local processing unavailable");
+    expect(chat).toContain("1 queued");
+    expect(market.match(/data-market-symbol=/g)).toHaveLength(95);
+    expect(market).toContain("AAPL");
+    expect(market).toContain("ARKK");
+    expect(market).toMatch(/Fresh|Stale|Unavailable/);
+    expect(market).not.toMatch(/ciphertext|providerKey|tunnelSecret|private operator prompt/i);
+
+    const loadMarket = vi.fn();
+    await expect(loadMarketPageData({
+      getSession: vi.fn().mockResolvedValue(null),
+      loadMarket,
+    })).rejects.toThrow("AUTHENTICATION_REQUIRED");
+    expect(loadMarket).not.toHaveBeenCalled();
+  });
+
+  it("never renders a price for unavailable data or hidden fields supplied outside the DTO", () => {
+    const unavailable = {
+      symbol: "AAPL",
+      kind: "STOCK" as const,
+      status: "UNAVAILABLE" as const,
+      price: "999999.99",
+      sourceObservedAt: null,
+      receivedAt: "2026-08-13T13:35:00.000Z",
+      ageSeconds: null,
+      freshness: "Unavailable" as const,
+      safeCode: "LOCAL_BRIDGE_UNAVAILABLE" as const,
+      ciphertext: "protected-ciphertext",
+      providerKey: "private-provider-key",
+      tunnelSecret: "private-tunnel-secret",
+      rawProviderResponse: "private-raw-response",
+      hostname: "private-hostname",
+      prompt: "private operator prompt",
+    };
+    const quotaChat = renderToStaticMarkup(<Conversation
+      conversationId="018f7b22-9f76-7b4d-a4e8-1a2b3c4d5e6f"
+      messages={[{ id: "saved", author: "USER", text: "Committed message" }]}
+      bridge={{ status: "QUOTA_LIMITED", pendingJobs: 2, safeCode: "LOCAL_BRIDGE_QUOTA_EXHAUSTED" }}
+    />);
+    const markup = renderToStaticMarkup(<MarketStatus items={[unavailable]} />);
+
+    expect(markup).toContain("Unavailable");
+    expect(markup).not.toContain("999999.99");
+    expect(markup).not.toMatch(
+      /protected-ciphertext|private-provider-key|private-tunnel-secret|private-raw-response|private-hostname|private operator prompt/i,
+    );
+    expect(quotaChat).toContain("Committed message");
+    expect(quotaChat).toContain("Message saved — local processing quota limited");
+    expect(quotaChat).toContain("2 queued");
+    expect(quotaChat).toContain('href="/market"');
+  });
+
   it("labels Node routing, Main authorship, memory controls, and simulation", () => {
     const markup = renderToStaticMarkup(
       <>
@@ -247,6 +333,8 @@ describe("production account surface integration", () => {
   let foreignConversation: ConversationFixture;
   let exactRoutingEventId: string;
   let foreignRoutingEventId: string;
+  let suiteRootKey: string;
+  let suiteRootKeyVersion: string;
   const firstText = "First private account message.";
   const nodeText = "Completed support remains intact.";
   const abandonedText = "Interleaved message with an abandoned route.";
@@ -262,6 +350,30 @@ describe("production account surface integration", () => {
     pageState.db = challenge.db;
     pageState.token = conversation.sessionToken;
     vi.stubEnv("NODE_ENV", "production");
+    await storeLatestMarketWindow({
+      db: challenge.db,
+      accountId: conversation.accountId,
+    }, {
+      windowId: "2026-08-13T13:30Z",
+      receivedAt: "2026-08-13T13:34:59.000Z",
+      items: [{
+        symbol: "AAPL",
+        kind: "STOCK",
+        status: "SUCCESS",
+        price: "225.10",
+        sourceObservedAt: "2026-08-13T13:34:59.000Z",
+        safeCode: null,
+      }],
+    });
+    await challenge.db.query(
+      `insert into market_poll_windows (window_id,window_started_at)
+       values ('2026-08-13T13:35Z','2026-08-13T13:35:00Z')`,
+    );
+    await challenge.db.query(
+      `update market_poll_windows
+          set status='FAILED',provider_status='ERROR',safe_code='PROVIDER_ERROR'
+        where window_id='2026-08-13T13:35Z'`,
+    );
     const foreignUser = await appendMessage({
       db: challenge.db,
       accountId: foreign.accountId,
@@ -435,7 +547,14 @@ describe("production account surface integration", () => {
       highWaterSequence: highWater.sequence,
       projection,
     });
+    suiteRootKey = process.env.GUSTAVO_EVENT_ROOT_KEY_V1!;
+    suiteRootKeyVersion = process.env.GUSTAVO_EVENT_ROOT_KEY_VERSION!;
   }, 60_000);
+
+  afterEach(() => {
+    process.env.GUSTAVO_EVENT_ROOT_KEY_V1 = suiteRootKey;
+    process.env.GUSTAVO_EVENT_ROOT_KEY_VERSION = suiteRootKeyVersion;
+  });
 
   afterAll(() => {
     pageState.db = undefined;
@@ -483,6 +602,8 @@ describe("production account surface integration", () => {
     expect(firstMarkup).toContain(mainText);
     expect(firstMarkup).toContain("Main Brain broadcasts");
     expect(firstMarkup).toContain("Load newer messages");
+    expect(firstMarkup).toContain('href="/market"');
+    expect(firstMarkup).toContain("Message saved — local processing unavailable");
 
     const newerMarkup = renderToStaticMarkup(await ChatPage({
       searchParams: Promise.resolve({ after: first.nextCursor! }),
@@ -493,6 +614,292 @@ describe("production account surface integration", () => {
     expect(newerMarkup).toMatch(
       /<form aria-label="Send a message" method="post"><fieldset disabled=""/u,
     );
+  }, 30_000);
+
+  it("loads the account-scoped bridge summary through the event account authority", async () => {
+    const projection = await loadAccountConversation(
+      challenge.db,
+      conversation.sessionToken,
+    );
+    expect(projection.bridge).toMatchObject({
+      status: "OFFLINE",
+      safeCode: "LOCAL_BRIDGE_UNAVAILABLE",
+    });
+    expect(projection.bridge.pendingJobs).toBeGreaterThan(0);
+  }, 30_000);
+
+  it("ages the database-clock CODEX lease and gives today's durable quota precedence", async () => {
+    const fixture = await createConversationFixture("account-bridge-lease");
+    await fixture.db.query(
+      `insert into hybrid_worker_heartbeats (component,status,safe_code)
+       values ('CODEX','HEALTHY',null)`,
+    );
+    await fixture.db.query(
+      "alter table hybrid_worker_heartbeats disable trigger hybrid_worker_heartbeats_are_bounded",
+    );
+    try {
+      await fixture.db.query(
+        `update hybrid_worker_heartbeats
+            set observed_at=clock_timestamp()-interval '12 minutes 1 millisecond',
+                updated_at=clock_timestamp()-interval '12 minutes 1 millisecond'
+          where component='CODEX'`,
+      );
+    } finally {
+      await fixture.db.query(
+        "alter table hybrid_worker_heartbeats enable trigger hybrid_worker_heartbeats_are_bounded",
+      );
+    }
+
+    const stale = await loadAccountConversation(fixture.db, fixture.sessionToken);
+    expect(stale.bridge).toEqual({
+      status: "OFFLINE", pendingJobs: 0, safeCode: "LOCAL_BRIDGE_UNAVAILABLE",
+    });
+
+    await fixture.db.query(
+      `update hybrid_worker_heartbeats
+          set status='HEALTHY',safe_code=null
+        where component='CODEX'`,
+    );
+    await fixture.db.query(
+      `insert into deployment_quota_counters (
+         quota_name,bucket_date,used_count,limit_count
+       ) values (
+         'CODEX_JOBS',(clock_timestamp() at time zone 'UTC')::date,100,100
+       )`,
+    );
+    const exhausted = await loadAccountConversation(fixture.db, fixture.sessionToken);
+    expect(exhausted.bridge).toEqual({
+      status: "QUOTA_LIMITED",
+      pendingJobs: 0,
+      safeCode: "LOCAL_BRIDGE_QUOTA_EXHAUSTED",
+    });
+  }, 30_000);
+
+  it("authorizes and decrypts only the tenant's latest rows and keeps recovered failures stale", async () => {
+    const dto = await loadAccountMarket(
+      challenge.db,
+      conversation.sessionToken,
+      new Date("2026-08-13T13:35:10.000Z"),
+    );
+    expect(dto.items).toHaveLength(95);
+    expect(dto.items.map(({ symbol }) => symbol)).toEqual(
+      MARKET_UNIVERSE.map(({ symbol }) => symbol),
+    );
+    expect(dto.items[0]).toMatchObject({
+      symbol: "AAPL",
+      status: "SUCCESS",
+      price: "225.10",
+      sourceObservedAt: "2026-08-13T13:34:59.000Z",
+      receivedAt: "2026-08-13T13:34:59.000Z",
+      ageSeconds: 11,
+      freshness: "Stale",
+      safeCode: "PROVIDER_ERROR",
+    });
+    expect(dto.items.slice(1).every((item) => (
+      item.status === "UNAVAILABLE" && item.price === null
+        && item.freshness === "Unavailable"
+    ))).toBe(true);
+    expect(JSON.stringify(dto)).not.toMatch(
+      /ciphertext|dataKey|providerKey|rawProvider|hostname|tunnel|prompt/i,
+    );
+
+    const marketMarkup = renderToStaticMarkup(await MarketPage());
+    expect(marketMarkup.match(/data-market-symbol=/g)).toHaveLength(95);
+    expect(marketMarkup).toContain("$225.10");
+    expect(marketMarkup).toContain("Stale");
+    expect(marketMarkup).not.toMatch(
+      /ciphertext|dataKey|providerKey|rawProvider|hostname|tunnel|prompt/i,
+    );
+
+    const foreign = await loadAccountMarket(
+      challenge.db,
+      foreignConversation.sessionToken,
+      new Date("2026-08-13T13:35:10.000Z"),
+    );
+    expect(foreign.items).toHaveLength(95);
+    expect(foreign.items.find(({ symbol }) => symbol === "AAPL")).toMatchObject({
+      status: "UNAVAILABLE",
+      price: null,
+    });
+  }, 30_000);
+
+  it("keeps the previous completed quote fresh while a newer market window is pending", async () => {
+    const fixture = await createConversationFixture("account-market-pending-window");
+    const completedWindow = "2026-08-14T11:00Z";
+    await storeLatestMarketWindow({ db: fixture.db, accountId: fixture.accountId }, {
+      windowId: completedWindow,
+      receivedAt: "2026-08-14T11:04:59.000Z",
+      items: [{
+        symbol: "AAPL",
+        kind: "STOCK",
+        status: "SUCCESS",
+        price: "227.00",
+        sourceObservedAt: "2026-08-14T11:04:59.000Z",
+        safeCode: null,
+      }],
+    });
+    await fixture.db.query(
+      "alter table market_poll_windows disable trigger market_poll_windows_are_semantically_immutable",
+    );
+    try {
+      await fixture.db.query(
+        `update market_poll_windows
+            set status='COMPLETED',provider_status='OPEN',calls_used=96,result_count=95,
+                completed_at='2026-08-14T11:04:59.500Z',updated_at=clock_timestamp()
+          where window_id=$1`,
+        [completedWindow],
+      );
+    } finally {
+      await fixture.db.query(
+        "alter table market_poll_windows enable trigger market_poll_windows_are_semantically_immutable",
+      );
+    }
+    await fixture.db.query(
+      `insert into market_poll_windows (window_id,window_started_at)
+       values ('2026-08-14T11:05Z','2026-08-14T11:05:00.000Z')`,
+    );
+    await fixture.db.query(
+      `insert into hybrid_worker_heartbeats (component,status,safe_code)
+       values ('MARKET','HEALTHY',null)`,
+    );
+
+    const dto = await loadAccountMarket(
+      fixture.db,
+      fixture.sessionToken,
+      new Date("2026-08-14T11:05:01.000Z"),
+    );
+    expect(dto.items.find(({ symbol }) => symbol === "AAPL")).toMatchObject({
+      status: "SUCCESS",
+      price: "227.00",
+      ageSeconds: 2,
+      freshness: "Fresh",
+      safeCode: null,
+    });
+  }, 30_000);
+
+  it("keeps market latest, poll, and heartbeat on one coherent transaction snapshot", async () => {
+    const fixture = await createConversationFixture("account-market-snapshot");
+    const oldWindow = "2026-08-14T10:00Z";
+    const newWindow = "2026-08-14T10:05Z";
+    await storeLatestMarketWindow({ db: fixture.db, accountId: fixture.accountId }, {
+      windowId: oldWindow,
+      receivedAt: "2026-08-14T10:04:59.000Z",
+      items: [{
+        symbol: "AAPL",
+        kind: "STOCK",
+        status: "SUCCESS",
+        price: "226.00",
+        sourceObservedAt: "2026-08-14T10:04:59.000Z",
+        safeCode: null,
+      }],
+    });
+    await fixture.db.query(
+      "alter table market_poll_windows disable trigger market_poll_windows_are_semantically_immutable",
+    );
+    try {
+      await fixture.db.query(
+        `update market_poll_windows
+            set status='COMPLETED',provider_status='OPEN',calls_used=96,result_count=95,
+                completed_at='2026-08-14T10:04:59.500Z',
+                updated_at=clock_timestamp()
+          where window_id=$1`,
+        [oldWindow],
+      );
+    } finally {
+      await fixture.db.query(
+        "alter table market_poll_windows enable trigger market_poll_windows_are_semantically_immutable",
+      );
+    }
+    await fixture.db.query(
+      `insert into hybrid_worker_heartbeats (component,status,safe_code)
+       values ('MARKET','HEALTHY',null)`,
+    );
+
+    const latestReady = deferred();
+    const releaseLatest = deferred();
+    let newPollCommitted = false;
+    let observedLatestWindow: string | undefined;
+    let observedPollWindow: string | undefined;
+    const commitNewPoll = async () => {
+      if (newPollCommitted) return;
+      newPollCommitted = true;
+      await fixture.db.query(
+        `insert into market_poll_windows (
+           window_id,window_started_at,status,provider_status,calls_used,result_count,
+           completed_at,created_at,updated_at,prune_after
+         ) values (
+           $1,'2026-08-14T10:05:00.000Z','COMPLETED','OPEN',96,95,
+           '2026-08-14T10:09:59.000Z','2026-08-14T10:05:00.000Z',
+           '2026-08-14T10:09:59.000Z','2026-08-21T10:04:59.999Z'
+         )`,
+        [newWindow],
+      );
+    };
+
+    const database: EventDatabase = {
+      async query<Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        parameters: readonly unknown[] = [],
+      ): Promise<Row[]> {
+        if (sql.includes("/* account-market-poll-summary */")) {
+          await latestReady.promise;
+          await commitNewPoll();
+          releaseLatest.resolve();
+        }
+        const rows = await fixture.db.query<Row>(sql, parameters);
+        if (sql.includes("/* account-market-poll-summary */")) {
+          observedPollWindow = (rows[0] as { readonly window_id?: string } | undefined)?.window_id;
+        }
+        return rows;
+      },
+      one: (sql, parameters = []) => fixture.db.one(sql, parameters),
+      transaction: (work) => fixture.db.transaction(async (transaction) => {
+        let coherent = false;
+        let readLatest = false;
+        const observed: EventDatabase = {
+          async query<Row extends Record<string, unknown> = Record<string, unknown>>(
+            sql: string,
+            parameters: readonly unknown[] = [],
+          ): Promise<Row[]> {
+            if (/set transaction isolation level repeatable read/u.test(sql)) coherent = true;
+            const rows = await transaction.query<Row>(sql, parameters);
+            if (sql.includes("/* account-market-poll-summary */")) {
+              observedPollWindow = (rows[0] as {
+                readonly window_id?: string;
+              } | undefined)?.window_id;
+              if (coherent) await commitNewPoll();
+            }
+            if (sql.includes("/* market-latest-metadata */")) {
+              readLatest = true;
+              observedLatestWindow = (rows[0] as {
+                readonly window_id?: string;
+              } | undefined)?.window_id;
+            }
+            return rows;
+          },
+          one: (sql, parameters = []) => transaction.one(sql, parameters),
+          transaction: (nested) => nested(observed),
+        };
+        const result = await work(observed);
+        if (readLatest && !coherent) {
+          latestReady.resolve();
+          await releaseLatest.promise;
+        }
+        return result;
+      }),
+    };
+
+    const dto = await loadAccountMarket(
+      database,
+      fixture.sessionToken,
+      new Date("2026-08-14T10:04:59.500Z"),
+    );
+    const aapl = dto.items.find(({ symbol }) => symbol === "AAPL");
+    expect(aapl).toMatchObject({ status: "SUCCESS", price: "226.00" });
+    if (aapl?.freshness === "Fresh") {
+      expect(observedLatestWindow).toBe(observedPollWindow);
+    }
+    expect(newPollCommitted).toBe(true);
   }, 30_000);
 
   it("allows only a canonical same-conversation Node route to cause a Node response", async () => {
@@ -611,8 +1018,13 @@ describe("production account surface integration", () => {
       .rejects.toThrow("SESSION_INVALID");
     await expect(loadAccountChallenge(audit(challenge.db), invalidToken))
       .rejects.toThrow("SESSION_INVALID");
+    await expect(loadAccountMarket(audit(challenge.db), invalidToken))
+      .rejects.toThrow("SESSION_INVALID");
     expect(sql.some((statement) => /from sessions/u.test(statement))).toBe(true);
-    expect(sql.some((statement) => /from conversations|challenge_stages|deliveries/u.test(statement)))
+    expect(sql.some((statement) => (
+      /from conversations|challenge_stages|deliveries|market_latest_quotes|market_poll_windows|hybrid_worker_heartbeats/u
+        .test(statement)
+    )))
       .toBe(false);
   });
 

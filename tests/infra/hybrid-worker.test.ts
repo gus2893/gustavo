@@ -1490,6 +1490,54 @@ describe("hybrid worker host boundary", () => {
     }, expect.any(AbortSignal));
   });
 
+  it("refreshes the CODEX heartbeat lease on accepted wakes without delaying or adding a timer", async () => {
+    const refreshOne = deferred();
+    const refreshTwo = deferred();
+    const interval = vi.spyOn(globalThis, "setInterval");
+    let codexHeartbeats = 0;
+    const heartbeat = vi.fn(async (value: { readonly component: string }) => {
+      if (value.component !== "CODEX") return;
+      codexHeartbeats += 1;
+      if (codexHeartbeats === 2) await refreshOne.promise;
+      if (codexHeartbeats === 3) await refreshTwo.promise;
+    });
+    const runtime = createHybridRuntimeController({
+      container: readyContainer(),
+      recoverMarket: vi.fn().mockResolvedValue(undefined),
+      drainModel: vi.fn().mockResolvedValue(undefined),
+      pollMarket: vi.fn().mockResolvedValue(undefined),
+      closeResources: vi.fn().mockResolvedValue(undefined),
+      heartbeat,
+    });
+
+    try {
+      await runtime.start();
+      expect(runtime.enqueue({
+        jobId: "018f7b22-9f76-7b4d-a4e8-1a2b3c4d5e6f",
+      })).toBeUndefined();
+      expect(runtime.enqueue({ windowId: "2026-08-13T13:30Z" })).toBeUndefined();
+      await vi.waitFor(() => expect(heartbeat).toHaveBeenCalledTimes(3));
+      expect(heartbeat).toHaveBeenLastCalledWith({
+        component: "CODEX", status: "HEALTHY", safeCode: null,
+      }, expect.any(AbortSignal));
+
+      refreshOne.resolve();
+      await refreshOne.promise;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(runtime.enqueue({
+        jobId: "018f7b22-9f76-7b4d-a4e8-1a2b3c4d5e70",
+      })).toBeUndefined();
+      await vi.waitFor(() => expect(codexHeartbeats).toBe(3));
+      expect(interval).not.toHaveBeenCalled();
+      refreshTwo.resolve();
+      await runtime.stop();
+    } finally {
+      refreshOne.resolve();
+      refreshTwo.resolve();
+      interval.mockRestore();
+    }
+  });
+
   it("installs an owner-only, digest-pinned, materializer-separated Windows worker", () => {
     const setup = readFileSync("scripts/setup-hybrid-worker.ps1", "utf8");
     const start = readFileSync("scripts/start-hybrid-worker.ps1", "utf8");

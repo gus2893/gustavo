@@ -1,4 +1,5 @@
 import Decimal from "decimal.js";
+import { MARKET_UNIVERSE } from "../../../config/market-universe";
 import { authenticateSession } from "../auth/sessions";
 import {
   loadProjectionCheckpoint,
@@ -8,6 +9,10 @@ import { replayStoredLedgerEvents } from "../challenge/projection";
 import { readEventBodies } from "../events/store";
 import type { EventDatabase, JsonValue } from "../events/types";
 import { listMessages } from "../history/messages";
+import {
+  loadLatestMarket,
+  type LatestMarketItem,
+} from "../market-data/latest";
 import {
   NODE_REPLY_MODES,
   type NodeReplyMode,
@@ -44,6 +49,44 @@ export interface AccountConversationDto {
   readonly messages: readonly AccountConversationMessageDto[];
   readonly broadcasts: readonly AccountConversationBroadcastDto[];
   readonly nextCursor: string | null;
+  readonly bridge: AccountBridgeSummaryDto;
+}
+
+export type AccountBridgeStatus = "AVAILABLE" | "OFFLINE" | "QUOTA_LIMITED";
+
+export type AccountBridgeSafeCode =
+  | "LOCAL_BRIDGE_UNAVAILABLE"
+  | "LOCAL_BRIDGE_QUOTA_EXHAUSTED";
+
+export interface AccountBridgeSummaryDto {
+  readonly status: AccountBridgeStatus;
+  readonly pendingJobs: number;
+  readonly safeCode: AccountBridgeSafeCode | null;
+}
+
+export type AccountMarketFreshness = "Fresh" | "Stale" | "Unavailable";
+
+export type AccountMarketSafeCode =
+  | NonNullable<LatestMarketItem["safeCode"]>
+  | "RESULT_COUNT_INVALID"
+  | "CALL_LIMIT_EXCEEDED"
+  | "WINDOW_CONFLICT"
+  | "LOCAL_BRIDGE_UNAVAILABLE";
+
+export interface AccountMarketItemDto {
+  readonly symbol: string;
+  readonly kind: "STOCK" | "ETF";
+  readonly status: LatestMarketItem["status"];
+  readonly price: string | null;
+  readonly sourceObservedAt: string | null;
+  readonly receivedAt: string | null;
+  readonly ageSeconds: number | null;
+  readonly freshness: AccountMarketFreshness;
+  readonly safeCode: AccountMarketSafeCode | null;
+}
+
+export interface AccountMarketDto {
+  readonly items: readonly AccountMarketItemDto[];
 }
 
 export type AccountChallengeStageStatus =
@@ -144,9 +187,49 @@ interface TerminalRow extends Record<string, unknown> {
   readonly type: string;
 }
 
+interface BridgeSummaryRow extends Record<string, unknown> {
+  readonly pending_jobs: number;
+  readonly lease_healthy: boolean;
+  readonly quota_exhausted: boolean;
+}
+
+interface MarketPollSummaryRow extends Record<string, unknown> {
+  readonly window_id: string;
+  readonly status: "PENDING" | "COMPLETED" | "FAILED";
+  readonly safe_code: AccountMarketSafeCode | null;
+  readonly completed_at: Date | null;
+  readonly latest_completed_window_id: string | null;
+}
+
+interface MarketHeartbeatRow extends Record<string, unknown> {
+  readonly status: "HEALTHY" | "DEGRADED" | "OFFLINE";
+}
+
 function requiredToken(token: string): string {
   if (typeof token !== "string" || token.length === 0) throw new Error("SESSION_REQUIRED");
   return token;
+}
+
+function bridgeSummary(row: BridgeSummaryRow | undefined): AccountBridgeSummaryDto {
+  const pendingJobs = row?.pending_jobs ?? 0;
+  if (!Number.isSafeInteger(pendingJobs) || pendingJobs < 0) {
+    throw new Error("ACCOUNT_SURFACE_BRIDGE_INTEGRITY_FAILURE");
+  }
+  if (row?.quota_exhausted === true) {
+    return Object.freeze({
+      status: "QUOTA_LIMITED",
+      pendingJobs,
+      safeCode: "LOCAL_BRIDGE_QUOTA_EXHAUSTED",
+    });
+  }
+  if (row?.lease_healthy === true) {
+    return Object.freeze({ status: "AVAILABLE", pendingJobs, safeCode: null });
+  }
+  return Object.freeze({
+    status: "OFFLINE",
+    pendingJobs,
+    safeCode: "LOCAL_BRIDGE_UNAVAILABLE",
+  });
 }
 
 function objectBody(value: JsonValue): Record<string, JsonValue> {
@@ -237,6 +320,36 @@ export async function loadAccountConversation(
   after?: string,
 ): Promise<AccountConversationDto> {
   const session = await authenticateSession(database, requiredToken(token));
+  const bridgeRows = await database.query<BridgeSummaryRow>(
+    `with database_clock as materialized (
+       select clock_timestamp() observed_now
+     )
+     select count(job.job_id)::integer pending_jobs,
+            coalesce(
+              heartbeat.status='HEALTHY'
+              and heartbeat.observed_at between
+                database_clock.observed_now-interval '12 minutes'
+                and database_clock.observed_now,
+              false
+            ) lease_healthy,
+            coalesce(quota.used_count>=quota.limit_count,false) quota_exhausted
+       from (values (1)) singleton(value)
+       cross join database_clock
+       left join hybrid_worker_heartbeats heartbeat on heartbeat.component='CODEX'
+       left join deployment_quota_counters quota
+         on quota.quota_name='CODEX_JOBS'
+        and quota.bucket_date=(database_clock.observed_now at time zone 'UTC')::date
+       left join events source on source.account_id=$1::text
+       left join bridge_model_jobs job on job.source_event_id=source.id
+        and job.role='NODE' and job.status in ('PENDING','CLAIMED')
+      group by database_clock.observed_now,heartbeat.status,heartbeat.observed_at,
+               quota.used_count,quota.limit_count`,
+    [session.accountId],
+  );
+  if (bridgeRows.length !== 1) {
+    throw new Error("ACCOUNT_SURFACE_BRIDGE_INTEGRITY_FAILURE");
+  }
+  const bridge = bridgeSummary(bridgeRows[0]);
   const conversations = await database.query<AssignedConversationRow>(
     `select conversation.id::text,node.id::text node_brain_id,conversation.status
        from conversations conversation
@@ -335,6 +448,113 @@ export async function loadAccountConversation(
     messages: Object.freeze(messages),
     broadcasts: Object.freeze(broadcasts),
     nextCursor: page.nextCursor,
+    bridge,
+  });
+}
+
+function marketAgeSeconds(observedAt: string, now: Date): number {
+  const observed = new Date(observedAt).getTime();
+  if (!Number.isFinite(observed) || !Number.isFinite(now.getTime())) {
+    throw new Error("ACCOUNT_SURFACE_MARKET_TIME_INVALID");
+  }
+  return Math.max(0, Math.floor((now.getTime() - observed) / 1_000));
+}
+
+/** Authenticates before tenant/key-authorized latest-market reads and safe DTO projection. */
+export async function loadAccountMarket(
+  database: EventDatabase,
+  token: string,
+  now = new Date(),
+): Promise<AccountMarketDto> {
+  const session = await authenticateSession(database, requiredToken(token));
+  return database.transaction(async (transaction) => {
+    await transaction.query("set transaction isolation level repeatable read");
+    const pollRows = await transaction.query<MarketPollSummaryRow>(
+      `/* account-market-poll-summary */
+       select current_window.window_id,current_window.status,
+              current_window.safe_code,current_window.completed_at,
+              (
+                select completed.window_id
+                  from market_poll_windows completed
+                 where completed.status='COMPLETED'
+                 order by completed.window_started_at desc,completed.window_id desc
+                 limit 1
+              ) latest_completed_window_id
+         from market_poll_windows current_window
+        order by current_window.window_started_at desc,current_window.window_id desc
+        limit 1`,
+    );
+    const heartbeatRows = await transaction.query<MarketHeartbeatRow>(
+      `select status from hybrid_worker_heartbeats where component='MARKET'`,
+    );
+    const latest = await loadLatestMarket(
+      { db: transaction, accountId: session.accountId },
+      MARKET_UNIVERSE.map(({ symbol }) => symbol),
+    );
+    if (pollRows.length > 1 || heartbeatRows.length > 1) {
+      throw new Error("ACCOUNT_SURFACE_MARKET_INTEGRITY_FAILURE");
+    }
+    const poll = pollRows[0];
+    const heartbeat = heartbeatRows[0];
+    const bySymbol = new Map(latest.map((item) => [item.symbol, item]));
+    const missingSafeCode: AccountMarketSafeCode = poll?.status === "FAILED"
+      && poll.safe_code !== null
+      ? poll.safe_code
+      : heartbeat?.status === "HEALTHY"
+        ? "SYMBOL_UNAVAILABLE"
+        : "LOCAL_BRIDGE_UNAVAILABLE";
+    const missingReceivedAt = poll?.completed_at?.toISOString() ?? null;
+    const items = MARKET_UNIVERSE.map((catalog): AccountMarketItemDto => {
+      const item = bySymbol.get(catalog.symbol);
+      if (!item) {
+        return Object.freeze({
+          ...catalog,
+          status: "UNAVAILABLE",
+          price: null,
+          sourceObservedAt: null,
+          receivedAt: missingReceivedAt,
+          ageSeconds: null,
+          freshness: "Unavailable",
+          safeCode: missingSafeCode,
+        });
+      }
+      if (item.status !== "SUCCESS" || item.sourceObservedAt === null) {
+        return Object.freeze({
+          symbol: item.symbol,
+          kind: item.kind,
+          status: item.status,
+          price: null,
+          sourceObservedAt: null,
+          receivedAt: item.receivedAt,
+          ageSeconds: null,
+          freshness: "Unavailable",
+          safeCode: item.safeCode,
+        });
+      }
+      const ageSeconds = marketAgeSeconds(item.sourceObservedAt, now);
+      const authoritativeCompletedWindow = poll?.status === "PENDING"
+        ? poll.latest_completed_window_id
+        : poll?.status === "COMPLETED" ? poll.window_id : null;
+      const matchingCompletedWindow = authoritativeCompletedWindow === item.windowId;
+      const recoveredFailure = poll?.status === "FAILED";
+      return Object.freeze({
+        symbol: item.symbol,
+        kind: item.kind,
+        status: item.status,
+        price: item.price,
+        sourceObservedAt: item.sourceObservedAt,
+        receivedAt: item.receivedAt,
+        ageSeconds,
+        freshness: matchingCompletedWindow && ageSeconds < 300 ? "Fresh" : "Stale",
+        safeCode: recoveredFailure
+          ? poll.safe_code
+          : matchingCompletedWindow ? null : "RESULT_COUNT_INVALID",
+      });
+    });
+    if (items.length !== MARKET_UNIVERSE.length) {
+      throw new Error("ACCOUNT_SURFACE_MARKET_INTEGRITY_FAILURE");
+    }
+    return Object.freeze({ items: Object.freeze(items) });
   });
 }
 

@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import type {
+  AccountBridgeSummaryDto,
   AccountConversationBroadcastDto,
   AccountConversationMessageDto,
 } from "../../lib/server/dal/account-surfaces";
@@ -74,6 +75,7 @@ export interface ConversationProps {
   readonly nextCursor?: string | null;
   readonly status?: "ready" | "loading" | "error";
   readonly proposalDisclosure?: boolean;
+  readonly bridge?: AccountBridgeSummaryDto;
 }
 
 const AUTHOR_LABELS: Readonly<Record<ConversationAuthor, string>> = Object.freeze({
@@ -89,6 +91,7 @@ export function Conversation({
   nextCursor = null,
   status = "ready",
   proposalDisclosure = false,
+  bridge,
 }: ConversationProps) {
   const [hydrated, setHydrated] = useState(false);
   const [mutationStatus, setMutationStatus] = useState("");
@@ -102,7 +105,21 @@ export function Conversation({
       <header>
         <h1>Your Node Brain</h1>
         <p>One continuous private chat with your stable Node Brain.</p>
+        <nav aria-label="Account navigation"><a href="/market">Market dashboard</a></nav>
       </header>
+
+      {bridge === undefined ? null : (
+        <section aria-label="Local processing status">
+          <p role="status">
+            {bridge.status === "AVAILABLE"
+              ? "Local processing available"
+              : bridge.status === "QUOTA_LIMITED"
+                ? "Message saved — local processing quota limited"
+                : "Message saved — local processing unavailable"}
+          </p>
+          <p>{bridge.pendingJobs} queued</p>
+        </section>
+      )}
 
       {proposalDisclosure && (
         <p>
