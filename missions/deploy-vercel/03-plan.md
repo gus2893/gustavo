@@ -880,6 +880,49 @@ describe("latest market projection", () => {
 });
 ```
 
+The regenerated authority RED is in the same file and uses two transaction-scoped roles created by migration 0022:
+
+```ts
+it("permits only the separate materializer role to bind an exact consumed latest version", async () => {
+  const fixture = await createConversationFixture("latest-market-role-boundary");
+  await storeLatestMarketWindow(fixture, {
+    windowId: "2026-08-13T13:30Z",
+    items: [{
+      symbol: "AAPL", kind: "STOCK", status: "SUCCESS", price: "225.10",
+      sourceObservedAt: "2026-08-13T13:30:00.000Z", safeCode: null,
+    }],
+  });
+  const [latest] = await loadLatestMarket(fixture, ["AAPL"]);
+  const commandEventId = await appendConsumptionCommand(
+    fixture, "AAPL", latest!.latestContextDigest, "role-boundary",
+  );
+  const ordinary = fixture.db;
+  const materializer = databaseWithTransactionRole(fixture.db, "gustavo_market_materializer");
+
+  await expect(materializeMarketObservation(
+    { ...fixture, db: ordinary }, { commandEventId },
+  )).rejects.toThrow("MARKET_MATERIALIZER_ROLE_REQUIRED");
+  await expect(materializeMarketObservation(
+    { ...fixture, db: materializer }, { commandEventId },
+  )).resolves.toMatchObject({ commandEventId, symbol: "AAPL" });
+  await expect(forgeMatchingBindingAndObservation(ordinary, {
+    accountId: fixture.accountId,
+    commandEventId,
+    latestContextDigest: latest!.latestContextDigest,
+    price: "999.99",
+  })).rejects.toThrow("MARKET_MATERIALIZER_ROLE_REQUIRED");
+});
+
+it("rejects sub-millisecond observation authority and replays only the decrypted latest", async () => {
+  await expect(insertMaterializerObservation({
+    observedAt: "2026-08-13T13:30:00.000001Z",
+    receivedAt: "2026-08-13T13:30:00.000001Z",
+  })).rejects.toThrow("MARKET_OBSERVATION_TIMESTAMP_PRECISION_INVALID");
+  await expect(replayAfterStoredObservationCorruption("999.99"))
+    .rejects.toThrow("MARKET_CONSUMPTION_REPLAY_INVALID");
+});
+```
+
 Expected initial state: module resolution fails with `Cannot find module '../../lib/server/market-data/latest'`.
 
 #### Green — minimum implementation
@@ -888,7 +931,9 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 - Store one monotonic row per `(account_id, symbol)`; newer source time wins, equal-window exact replay is idempotent, and conflicting replay fails.
 - Store unavailable states without a price body and keep seven days of bounded poll summaries.
 - Implement `materializeMarketObservation` that re-authorizes/decrypts a latest row and appends canonical `market_observations` only when an existing decision command names that exact latest version.
-- Add triggers that reject noncatalog symbols, plaintext columns, cross-account keys, stale overwrites, and observation creation without decision provenance.
+- Migration 0022 creates the NOLOGIN role `gustavo_market_materializer`, which alone may insert `market_observation_consumptions`. The normal application/schema identity is not a member in production. Materialization must run through a separately authenticated database handle and verify `current_user` inside the same transaction; absence/wrong role fails without fallback.
+- Add triggers that reject noncatalog symbols, plaintext columns, cross-account keys, stale overwrites, observation creation without materializer-role decision provenance, and non-millisecond T13 observation timestamps.
+- Binding rows copy exact database-owned latest identity/version authority rather than accepting a caller-authored semantic digest. Replay re-locks the command/account/key/body/latest rows, decrypts the exact latest payload, and compares every canonical observation field before returning.
 
 #### Refactor
 
@@ -983,7 +1028,7 @@ Yes. It wires T11–T13 without adding HTTP or UI behavior.
 ### T15 — Expose a loopback-only signed wake server and recoverable local controller
 
 **Maps to:** R3, R4, R5, R7
-**Files touched:** `worker/hybrid/wake-server.ts` (new), `worker/hybrid/runtime.ts` (modify), `scripts/setup-hybrid-worker.ps1` (new), `scripts/start-hybrid-worker.ps1` (new), `tests/infra/hybrid-worker.test.ts` (new)
+**Files touched:** `worker/hybrid/wake-server.ts` (new), `worker/hybrid/runtime.ts` (modify), `scripts/setup-hybrid-worker.ps1` (new), `scripts/start-hybrid-worker.ps1` (new), `infra/env.example` (modify), `tests/infra/hybrid-worker.test.ts` (new)
 
 #### Red — failing test
 
@@ -1012,7 +1057,10 @@ describe("hybrid worker host boundary", () => {
     expect(setup).toContain("docker image inspect");
     expect(setup).toContain("@openai/codex@0.146.0");
     expect(start).toContain("tailscale funnel --bg");
+    expect(setup).toContain("GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL");
+    expect(start).toContain("gustavo_market_materializer");
     expect(start).not.toMatch(/0\.0\.0\.0|OPENAI_API_KEY|--dangerously-bypass-approvals-and-sandbox/);
+    expect(start).not.toMatch(/GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL=.*\S/);
   });
 });
 ```
@@ -1025,6 +1073,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 - Runtime startup verifies Docker Desktop, the exact locally recorded image digest, the dedicated auth volume, and absence of stale exact-label containers before it drains expired/pending work. It permits one active Codex container, coalesces additional wakes, and can run one market window independently of model work.
 - Runtime stop aborts wake acceptance, kills/waits the exact active container, stops any poll/follow-up/pool/server, and proves no exact-label container remains inside a fixed 25-second host bound. Unproven termination leaves the CODEX component offline and blocks further claims.
 - Setup script validates a dedicated Windows account, Docker Desktop Personal, Node 24, pnpm 11, Tailscale sign-in, and owner-only local configuration before building the nested Dockerfile with `--pull --no-cache`. It records the resulting immutable local image digest, creates only the exact `gustavo-codex-auth-v1` volume, and performs interactive ChatGPT device authentication inside a one-shot container before creating the exact task.
+- Setup requires a second pooled Neon URL whose login is a member only of `gustavo_market_materializer`, stores it solely in the owner-only local worker configuration, and proves the ordinary `DATABASE_URL` cannot assume that role. Start validates `current_user`/membership in a short transaction before accepting work; missing/misgranted credentials leave market materialization offline with no ordinary-role fallback.
 - The setup/start scripts never copy the repository, host Codex home, database/provider secrets, or Docker socket into the Codex image/volume. Start refuses a digest mismatch or unrelated container label/name.
 - Start script launches the loopback service first, then `tailscale funnel --bg http://127.0.0.1:<validated-port>`; logs contain safe codes/job IDs only.
 
@@ -1425,6 +1474,7 @@ describe("hybrid deployment runbook", () => {
       "900 messages/day", "100 jobs/day",
       "96 calls/window", "95 results/window", "SIMULATION ONLY — NOT A REAL TRADE",
       "GUSTAVO_HYBRID_BRIDGE_ENABLED=false", "GUSTAVO_MARKET_POLLER_ENABLED=false",
+      "GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL", "gustavo_market_materializer",
       "tailscale funnel reset", "a0c90dc15390e5accbb42869965e5347f7576b3f",
     ]) expect(combined).toContain(required);
     expect(combined).toContain("local bridge unavailable");
@@ -1444,6 +1494,7 @@ Expected initial state: `readFileSync("docs/VERCEL_DEPLOYMENT.md")` fails with `
 - Document PC-offline behavior: public/history hosted, messages durable/queued, market stale, local health offline; document reconnect recovery.
 - Document backup-before-cutover, flags-first rollback, exact schedule/task/Funnel cleanup, previous Ready promotion or exact safe-shell commit, and additive migration retention.
 - Add only blank secret names and deployment-profile examples to `infra/env.example`; state that the containerized standalone Codex uses interactive ChatGPT sign-in through the dedicated volume and remains an unsupported application backend. Document image rebuild/re-auth, exact-label reconciliation, and termination-failure shutdown without printing volume/image/container identifiers in application health.
+- Document creating the local-only Neon materializer login, granting only `gustavo_market_materializer`, copying its pooled URL into the protected worker configuration, rotation/revocation, and safe degradation. Explicitly forbid setting `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL` in Vercel or forwarding it to Codex/Finnhub/QStash.
 
 #### Refactor
 
@@ -1464,7 +1515,7 @@ Yes. It is an operations/documentation slice with one static contract test.
 ### T22 — Prove the fresh hybrid production story in one browser test
 
 **Maps to:** R1, R2, R3, R4, R5, R6, R7
-**Files touched:** `tests/e2e/gustavo-hybrid-production.spec.ts` (new)
+**Files touched:** `tests/e2e/fixtures.ts` (modify), `tests/e2e/gustavo-hybrid-production.spec.ts` (new)
 
 #### Red — failing test
 
@@ -1472,11 +1523,17 @@ File: `tests/e2e/gustavo-hybrid-production.spec.ts`
 
 ```ts
 import { expect, test } from "@playwright/test";
-import { e2eBaseURL, issueInvitation } from "./fixtures";
+import {
+  assertMarketMaterializerIsolation, e2eBaseURL, issueInvitation,
+} from "./fixtures";
 
 const PRIVATE_CANARY = "private-hybrid-canary-813";
 
 test("fresh operator chat, 95-symbol market, offline recovery, and public redaction", async ({ page, request }) => {
+  await expect(assertMarketMaterializerIsolation()).resolves.toEqual({
+    materializerAccepted: true,
+    ordinaryForgeryRejected: true,
+  });
   const invitation = await issueInvitation(request);
   await page.goto(`${e2eBaseURL()}/join?token=${encodeURIComponent(invitation)}`);
   await page.getByLabel("Display name").fill("Gustavo Operator");
@@ -1507,6 +1564,7 @@ Expected initial state: the message remains queued because no local hybrid E2E c
 
 - In the spec's isolated test process, start the production hybrid runtime with an injected fake container transport that emits strict NODE/MAIN/EVALUATOR JSON and a fake Finnhub transport that returns 95 deterministic personal-use fixtures. The fake implements the production run/wait/kill/inspect state machine but never bypasses its argument/label/output validation.
 - Use the existing disposable PostgreSQL/Next fixture; do not add a production fixture endpoint, fake production provider, or test-mode bypass.
+- The disposable fixture creates distinct ordinary and materializer login roles, grants only the migration-created permission role to the latter, passes the materializer URL only to the local test worker, and proves an ordinary-role matching-binding forgery is rejected before the browser story.
 - Run one market wake, then verify 95 rows, timestamps/freshness, exact chat attribution, Main/Evaluator priority fixture, one active Codex container, and no local data copied at bootstrap.
 - Stop the local controller to verify hosted public/history plus queued/offline status; restart it and verify exactly-once drain/recovery.
 - Capture public request URLs, post bodies, HTML, RSC, and feed payloads and assert absence of the canary, live quote fixture, ciphertext markers, tokens, and tunnel data.
@@ -1573,6 +1631,7 @@ Expected initial state: with live verification enabled before cutover, the curre
 
 - Confirm the selected plans are Vercel Hobby, Neon Free, Upstash Redis Free, QStash Free, Tailscale Free personal, and Finnhub Free personal; record plan names and nonsecret resource IDs in the runbook.
 - Create a fresh Neon database in the selected US East region, create empty Upstash Redis/QStash resources, and set only secret-store environment values. Never upload local PostgreSQL, Valkey, backups, accounts, memories, or market data.
+- Create a separate Neon materializer login, grant it only the migration-created `gustavo_market_materializer` NOLOGIN role, and store its pooled URL only in the protected local worker configuration. Verify the ordinary/Vercel role cannot insert consumption bindings and that no Vercel environment contains `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL`.
 - Link the existing Vercel team/project, set Node 24.x and `ENABLE_EXPERIMENTAL_COREPACK=1`, push the reviewed mission branch, deploy Preview, run migrations/bootstrap, and redeem the single invitation.
 - Install/sign in the isolated local worker account, Docker Desktop, the pinned local Codex image/auth volume, Tailscale, and Finnhub key; verify the recorded image digest and internal timeout, start the exact loopback/Funnel controller, and create only the 15-minute maintenance and five-minute market QStash schedules.
 - Run Preview smoke, public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, container kill/wait and startup-reconciliation rehearsal, and quota boundary checks before production promotion.
@@ -1619,5 +1678,6 @@ Yes. All code is already green before this task; this unit contains named extern
 - [x] Failure behavior covers offline local worker, lost wake, expired lease, malformed model output, provider 429, unsupported symbol, Redis loss, SSE reconnect, quota exhaustion, and rollback.
 - [x] The final task verifies the full suite, typecheck, build, validator, browser story, live Preview/production state, diff hygiene, and resource cleanup.
 - [x] Prompt-update impact is resolved: T7 is fully regenerated and T8/T15/T19/T21/T22/T23 explicitly use the container authority without weakening unchanged T1–T6 behavior.
+- [x] Market-materializer prompt-update impact is resolved: T13 defines the role-separated binding boundary; T15 provisions it locally; T21 documents it; T22 proves distinct identities; T23 provisions/verifies it without exposing the URL to Vercel.
 
 Plan approved. Next: `mcax-execute`.

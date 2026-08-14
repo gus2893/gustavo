@@ -1,6 +1,6 @@
 # Design: deploy-vercel
 **Approval status:** approved
-**Last reviewed:** 2026-08-13
+**Last reviewed:** 2026-08-14
 
 ## R — Requirements
 
@@ -28,6 +28,7 @@
    - Stocks: `AAPL, MSFT, NVDA, AMZN, GOOGL, GOOG, META, TSLA, BRK.B, AVGO, JPM, LLY, V, XOM, MA, UNH, COST, WMT, NFLX, ORCL, HD, PG, JNJ, BAC, ABBV, KO, CRM, CVX, MRK, AMD, PLTR, CSCO, ACN, MCD, IBM, GE, CAT, GS, MS, AXP, BX, TMO, ISRG, LIN, ABT, DIS, NOW, QCOM, TXN, AMGN, DHR, PEP, PM, INTU, BKNG, RTX, AMAT, SPGI, NEE, LOW, UPS, HON, PFE, C, MU, SBUX, COP, SCHW, GILD, ADP, DE, BLK, PANW, LRCX, KLAC`.
    - ETFs: `SPY, QQQ, DIA, IWM, VTI, VO, VB, VOO, IVV, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XLB, XLRE, ARKK`.
    - Keep one encrypted latest row per symbol plus bounded poll summaries. Create an append-only `market_observations` row only when a decision consumes a quote.
+   - Ordinary application/database writers cannot author latest-to-observation consumption bindings. A separate local-only Neon login inherits only the `gustavo_market_materializer` NOLOGIN role and is the sole database identity permitted to create those bindings; its credential never enters Vercel.
    - Render prices/status only after operator authentication; public routes never load them.
 
 5. **R5 — Use free-tier-compatible background dispatch** → Story 5 / AC1–AC5 and Story 6 / AC1–AC4.
@@ -94,6 +95,7 @@
 - R4's exact catalog is the launch universe. Expansion requires a prompt/design update.
 - QStash Free remains 1,000 messages/day and 10 schedules; the app reserves 100 messages/day headroom.
 - Local-computer outage is expected degraded operation, not a hosted outage.
+- Neon Free supports separate login roles and pooled connection strings per role. The operator creates one local-only materializer login, grants it only the migration-created `gustavo_market_materializer` role, and keeps its independently generated credential outside Vercel and the repository.
 
 ## S — System design
 
@@ -114,7 +116,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 1. **Outbound-first durable bridge.** Vercel commits a job and sends only its opaque ID. Direct prompt tunneling was rejected because it leaks protected content to another transport and loses work offline.
 2. **QStash one-shot maintenance.** Bounded signed calls replace always-on cloud/home DB polling, preserving Neon auto-suspend. Vercel Hobby Cron is too infrequent.
 3. **Signed wake, not signed execution.** Funnel verifies QStash signature, canonical URL/body, age, and unique message ID, records the receipt, then merely wakes a DB scan. Claims independently re-authorize source events.
-4. **Bounded latest-market projection.** Ninety-five encrypted mutable latest rows avoid roughly 7,500 permanent quote events/trading day. Existing append-only observations remain authoritative when actually consumed.
+4. **Bounded latest-market projection with separate materialization authority.** Ninety-five encrypted mutable latest rows avoid roughly 7,500 permanent quote events/trading day. Existing append-only observations remain authoritative when actually consumed. The schema owner creates a NOLOGIN `gustavo_market_materializer` permission role, but the ordinary application role is not a member. Only a separately authenticated local login with that membership may create a body-free consumption binding; triggers reject bindings from every other `current_user`. The binding copies database-owned latest identity/version authority, and application replay still reauthorizes, decrypts, and compares the exact latest version. This role boundary is required because PostgreSQL cannot validate Node-side AES-GCM plaintext and one shared database identity cannot distinguish legitimate materialization from forged direct SQL.
 5. **Container-isolated unsupported Codex runner.** The Windows worker never spawns Codex directly. It invokes Docker with a fixed argument vector against a locally built, digest-recorded image whose Node and Codex CLI versions are pinned. Before any run or reconciliation Docker operation, the worker exclusively binds the fixed local named pipe `\\.\pipe\gustavo-codex-runner-v1` and holds that crash-releasing OS authority through actual lifecycle-promise settlement; another process fails safely without inspecting or mutating Docker state. Every job then claims the one fixed Docker name `gustavo-codex-singleton-v1`; Docker's daemon-owned name uniqueness is the durable residue and restart serializer. After `docker create` returns, every lifecycle operation uses the immutable returned container ID and verifies the fixed name, exact labels, and image before acting. There is no wall-clock or sampled-absence path that clears an ambiguous create: an interrupted or unsettled create leaves claims fail-closed until a new process first owns the named-pipe lease and exact-name reconciliation finds and removes the container, or an operator explicitly verifies the daemon helper is settled and performs the documented recovery. Each read-only container uses `--init`, `--cap-drop ALL`, `no-new-privileges`, fixed PID/memory/CPU limits, a fresh bounded tmpfs mounted at `/workspace`, fixed read-only role schemas baked into `/schemas`, and only the dedicated Codex-auth volume mounted at `/codex-home`. The repository, Windows workspace, database/Valkey/QStash/Finnhub/Tailscale secrets, Docker socket, and arbitrary host paths are never mounted or passed. All model-visible tools, including `tools.view_image`, shell, web search, apps, hooks, and multi-agent tools, are explicitly disabled. The container runs an internal wall-time supervisor and the exact noninteractive `codex exec --ephemeral --ignore-user-config --skip-git-repo-check --sandbox read-only --ask-for-approval never --json --output-schema /schemas/<role>.schema.json -C /workspace -` command with prompt bytes on stdin. One synchronous in-process owner token composes with the named-pipe lease for both run and reconcile paths; timed-out lifecycle promises retain both authorities until actual settlement. Host abort performs bounded `docker kill` plus `docker wait`; startup reconciles only while holding the named-pipe lease and only the fixed name/exact authority labels. Failure to prove container termination disables further Codex claims and reports a safe unavailable state. This limits host impact and gives the container runtime—not ad-hoc Windows process enumeration—process-tree authority; it does not turn Codex CLI into a supported application API.
 6. **Two-phase release.** Preview, resources, migration, bootstrap, local bridge/market, health, leakage scan, and rollback rehearsal must pass before production promotion.
 
@@ -128,6 +130,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `hybrid_worker_heartbeats`: fixed components `CODEX`, `MARKET`, `TUNNEL`; no hostname/URL/secret.
 - `market_poll_windows`: five-minute counts/provider status/safe code, retained seven days.
 - `market_latest_quotes`: exactly one encrypted monotonic latest row per catalog symbol.
+- `market_observation_consumptions`: body-free exact decision/latest/observation binding, writable only while authenticated through the `gustavo_market_materializer` permission role; direct ordinary-writer binding and matching-row forgery are rejected.
 - `deployment_quota_counters`: fixed daily QStash/Codex/Finnhub counters.
 
 ### Role execution
@@ -142,6 +145,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - QStash wakes the local endpoint every five minutes. The worker verifies signature/replay/quota, calls market status, and skips quotes when closed.
 - When open, it schedules one quote start every three seconds with a sub-three-second timeout. Every catalog entry becomes `SUCCESS`, `UNAVAILABLE`, `RATE_LIMITED`, or `PROVIDER_ERROR`; finalization fills any missing result.
 - One short Neon transaction encrypts/upserts all latest rows, writes summary/heartbeat, then closes. No DB connection remains open while polling.
+- Latest polling and reads use the ordinary bounded `DATABASE_URL`. Explicit decision consumption uses a separate bounded `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL`, verifies `current_user` membership inside the transaction, creates the exact binding/observation, and closes immediately. Failure or absence of that local-only credential leaves the quote unmaterialized with a safe unavailable state; it never falls back to the ordinary role.
 - `/market` authenticates before reading/decrypting and renders source time, receipt time, age, freshness, and explicit unavailable state for all 95.
 
 ### Cloud maintenance and SSE
@@ -178,6 +182,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - `app/api/feed/stream/route.ts`: Vercel duration/reconnect hardening.
 - `scripts/issue-invitation.ts`: canonical redemption URL mode.
 - `infra/env.example`, `docs/{OPERATIONS,PRODUCTION_CHECKLIST,SMOKE_TEST}.md`: deployment mode/runbook links.
+- `scripts/{setup-hybrid-worker,start-hybrid-worker}.ps1`, `infra/env.example`, and hybrid production tests: provision/validate the local-only materializer URL without printing or forwarding it to Vercel or the Codex container.
 
 ### Off-limits files
 
@@ -192,7 +197,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 ### External dependencies
 
 - Vercel Hobby: existing project/domains, Node 24, `ENABLE_EXPERIMENTAL_COREPACK=1`.
-- Neon Free: fresh pooled `DATABASE_URL`; no data import.
+- Neon Free: fresh pooled ordinary `DATABASE_URL` plus a separately credentialed pooled `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL` for the local worker only; the materializer login receives only the migration-created NOLOGIN permission role, and no data is imported.
 - Upstash Redis Free: TLS URL mapped to `VALKEY_URL`.
 - QStash Free: two schedules plus direct wakes, verified with current/next signing keys, app cap 900/day.
 - Tailscale Funnel: background HTTPS proxy to a loopback-only wake server.
@@ -208,6 +213,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - The in-container supervisor bounds Codex independently; host abort kills and waits for the exact labeled container. Unproven termination disables further claims, and partial output never commits.
 - Redis loss recovers from PostgreSQL; SSE reconnects through DB replay.
 - Secrets enter only environment/secret stores, never argv URLs, logs, browser artifacts, or repository files.
+- Missing, misgranted, or ordinary-role materializer credentials fail before binding or plaintext observation creation. No code path retries through `DATABASE_URL`, and tests prove an ordinary direct writer cannot forge a matching binding plus observation.
 
 ## O — Outputs
 
@@ -318,6 +324,11 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
   - Revised intent: gateway-observed bounded input/output counts remain concrete for limit enforcement and the deployment's incremental cost remains known zero; a separate frozen metering discriminator is `REPORTED` with bounded CLI counts or `UNKNOWN`. T7 preserves optional reported counts. Legacy providers may omit the discriminator and retain existing behavior.
   - Fixed adapter deadlines are Node 90 seconds, Evaluator 180 seconds, and Main 300 seconds, all within T7's container ceiling; output-token limits remain request-scoped and are enforced before any delta/completion is exposed.
 - 2026-08-13 Codex-metering contract update approved under the user's standing instruction to proceed autonomously; T8 and the minimum gateway/runner contract tests were regenerated before production edits.
+- 2026-08-14 prompt-update: add a separate local-only PostgreSQL materializer role after `debug-t13-latest-authority.md` proved that one shared database identity cannot distinguish legitimate Node-decrypted materialization from a direct writer forging both the binding digest and observation.
+  - Previous intent: T13 would reauthorize/decrypt the exact latest row in Node and insert a body-free binding plus observation through the same `DATABASE_URL` identity used by ordinary application SQL; triggers would validate a caller-supplied semantic digest.
+  - Revised intent: the schema creates a NOLOGIN `gustavo_market_materializer` permission role; a separately authenticated local-only login is its sole member and sole binding writer. Ordinary application/Vercel identities cannot author bindings, while Node still decrypts and compares the exact latest version before materialization and replay.
+  - Preserved intent: exactly 95 encrypted latest rows, no plaintext latest projection, observations only on explicit decision consumption, exact idempotent provenance, free Neon operation, privacy erasure, and no public quote redistribution remain unchanged.
+- 2026-08-14 market-materializer role update approved under the user's standing instruction to “Proceed with all without needed input”; T13, T15, T21, T22, and T23 require regeneration before their affected execution resumes.
 
 ## Self-review checklist
 
