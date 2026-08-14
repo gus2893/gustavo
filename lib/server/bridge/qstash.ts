@@ -10,13 +10,15 @@ const MAX_WAKE_BODY_BYTES = 256;
 const MAX_SIGNATURE_LENGTH = 8_192;
 const JOB_WAKE_KEYS = Object.freeze(["jobId"] as const);
 const WINDOW_WAKE_KEYS = Object.freeze(["windowId"] as const);
+const MARKET_CURRENT_WAKE_KEYS = Object.freeze(["kind"] as const);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const WINDOW_ID_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$/u;
 const MESSAGE_ID_PATTERN = /^[\x21-\x7e]{1,200}$/u;
 
 export type OpaqueQStashWake =
   | { readonly jobId: string }
-  | { readonly windowId: string };
+  | { readonly windowId: string }
+  | { readonly kind: "MARKET_CURRENT" };
 
 export interface AcceptQStashWakeOptions {
   readonly database: EventDatabase;
@@ -86,11 +88,20 @@ function parseWindowWake(value: unknown): OpaqueQStashWake {
   return Object.freeze({ windowId: body.windowId });
 }
 
+function parseMarketCurrentWake(value: unknown): OpaqueQStashWake {
+  const body = exactObject(value, MARKET_CURRENT_WAKE_KEYS);
+  if (body.kind !== "MARKET_CURRENT") throw new Error("QSTASH_WAKE_BODY_INVALID");
+  return Object.freeze({ kind: "MARKET_CURRENT" });
+}
+
 function parseOpaqueWake(value: unknown): OpaqueQStashWake {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const keys = Object.keys(value);
     if (keys.length === 1 && keys[0] === JOB_WAKE_KEYS[0]) return parseJobWake(value);
     if (keys.length === 1 && keys[0] === WINDOW_WAKE_KEYS[0]) return parseWindowWake(value);
+    if (keys.length === 1 && keys[0] === MARKET_CURRENT_WAKE_KEYS[0]) {
+      return parseMarketCurrentWake(value);
+    }
   }
   throw new Error("QSTASH_WAKE_BODY_INVALID");
 }

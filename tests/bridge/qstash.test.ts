@@ -13,6 +13,7 @@ const CURRENT_SIGNING_KEY = "current-signing-key-with-at-least-32-bytes";
 const NEXT_SIGNING_KEY = "next-signing-key-with-at-least-32-bytes";
 const JOB_ID = "018f7b22-9f76-7b4d-a4e8-1a2b3c4d5e6f";
 const WINDOW_ID = "2026-08-13T13:30Z";
+const MARKET_CURRENT_BODY = JSON.stringify({ kind: "MARKET_CURRENT" });
 
 function encoded(value: unknown): string {
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
@@ -88,6 +89,46 @@ function options(
 }
 
 describe("QStash wake authority", () => {
+  it("accepts only the exact signed MARKET_CURRENT body after receipt and quota commit", async () => {
+    const fixture = await createConversationFixture("qstash-market-current");
+    const now = new Date();
+    const wake = vi.fn(async (message: OpaqueQStashWake) => {
+      expect(message).toEqual({ kind: "MARKET_CURRENT" });
+      await expect(fixture.db.one(
+        "select count(*)::int count from bridge_wake_receipts",
+      )).resolves.toEqual({ count: 1 });
+      await expect(fixture.db.one(
+        `select used_count
+           from deployment_quota_counters
+          where quota_name='QSTASH_MESSAGES'
+            and bucket_date=(clock_timestamp() at time zone 'UTC')::date`,
+      )).resolves.toEqual({ used_count: 1 });
+    });
+
+    await expect(acceptQStashWake(signedRequest({
+      body: MARKET_CURRENT_BODY,
+      messageId: "msg-market-current",
+      now,
+    }), options(fixture.db, now, wake))).resolves.toEqual({ accepted: true });
+    expect(wake).toHaveBeenCalledOnce();
+
+    const forbiddenBodies = [
+      { kind: "market_current" },
+      { kind: "MARKET-CURRENT" },
+      { kind: "MARKET_CURRENT", version: 1 },
+      { kind: "MARKET_CURRENT", windowId: WINDOW_ID },
+      { kind: "MARKET_CURRENT", jobId: JOB_ID },
+    ];
+    for (const [index, body] of forbiddenBodies.entries()) {
+      await expect(acceptQStashWake(signedRequest({
+        body: JSON.stringify(body),
+        messageId: `msg-market-current-invalid-${index}`,
+        now,
+      }), options(fixture.db, now, wake))).rejects.toThrow("QSTASH_WAKE_BODY_INVALID");
+    }
+    expect(wake).toHaveBeenCalledOnce();
+  }, 30_000);
+
   it("rejects declared and streamed oversized bodies before verification or database work", async () => {
     const fixture = await createConversationFixture("qstash-body-bound");
     const now = new Date();

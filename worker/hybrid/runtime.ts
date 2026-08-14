@@ -1269,7 +1269,8 @@ export interface HybridContainerController {
 
 export type HybridRuntimeWake =
   | { readonly jobId: string }
-  | { readonly windowId: string };
+  | { readonly windowId: string }
+  | { readonly kind: "MARKET_CURRENT" };
 
 export interface HybridRuntimeControllerOptions {
   readonly container: HybridContainerController;
@@ -1278,6 +1279,8 @@ export interface HybridRuntimeControllerOptions {
   /** Drains durable model authority; T7 remains the container singleton boundary. */
   readonly drainModel: (signal: AbortSignal) => Promise<void>;
   readonly pollMarket: (windowId: string, signal: AbortSignal) => Promise<void>;
+  /** Uses a short PostgreSQL lifecycle; host and delivery clocks are never authoritative. */
+  readonly deriveCurrentMarketWindow?: (signal: AbortSignal) => Promise<string>;
   /** Closes follow-up work, database pools, and the outer server/tunnel seam. */
   readonly closeResources: (signal: AbortSignal) => Promise<void>;
   /** Stops new HTTP acceptance synchronously before asynchronous teardown begins. */
@@ -1328,6 +1331,8 @@ function runtimeConfiguration(
     || typeof options.recoverMarket !== "function"
     || typeof options.drainModel !== "function"
     || typeof options.pollMarket !== "function"
+    || options.deriveCurrentMarketWindow !== undefined
+      && typeof options.deriveCurrentMarketWindow !== "function"
     || typeof options.closeResources !== "function"
     || options.stopAccepting !== undefined && typeof options.stopAccepting !== "function"
     || options.verifyMarketMaterializer !== undefined
@@ -1362,6 +1367,9 @@ function exactRuntimeWake(value: HybridRuntimeWake): HybridRuntimeWake {
     && typeof value.windowId === "string") {
     marketWindowStart(value.windowId);
     return Object.freeze({ windowId: value.windowId });
+  }
+  if (keys[0] === "kind" && "kind" in value && value.kind === "MARKET_CURRENT") {
+    return Object.freeze({ kind: "MARKET_CURRENT" });
   }
   throw new Error("HYBRID_WAKE_INVALID");
 }
@@ -1408,8 +1416,10 @@ export function createHybridRuntimeController(
   let modelWakePending = false;
   let marketPromise: Promise<void> | undefined;
   let heartbeatRefreshPromise: Promise<void> | undefined;
-  let activeMarketWindow: string | undefined;
-  let pendingMarketWindow: string | undefined;
+  let activeMarketWake: Extract<HybridRuntimeWake, { readonly windowId: string } | {
+    readonly kind: "MARKET_CURRENT";
+  }> | undefined;
+  let pendingMarketWake: typeof activeMarketWake;
   const workController = new AbortController();
 
   const requireReady = () => {
@@ -1513,32 +1523,56 @@ export function createHybridRuntimeController(
     return modelPromise;
   };
 
-  const wakeMarketWindow = (windowId: string): Promise<void> => {
+  const wakeMarket = (
+    wake: NonNullable<typeof activeMarketWake>,
+  ): Promise<void> => {
     try {
       requireReady();
-      marketWindowStart(windowId);
+      if ("windowId" in wake) marketWindowStart(wake.windowId);
+      else if (!options.deriveCurrentMarketWindow) {
+        throw new Error("HYBRID_MARKET_WINDOW_DERIVATION_UNAVAILABLE");
+      }
     } catch (error) {
       return Promise.reject(error);
     }
     if (marketPromise) {
-      if (windowId !== activeMarketWindow) pendingMarketWindow = windowId;
+      const matches = (candidate: typeof activeMarketWake): boolean => candidate !== undefined
+        && ("windowId" in wake
+          ? "windowId" in candidate && candidate.windowId === wake.windowId
+          : "kind" in candidate && candidate.kind === wake.kind);
+      const alreadyQueued = "kind" in wake
+        ? matches(pendingMarketWake)
+        : matches(activeMarketWake) || matches(pendingMarketWake);
+      if (!alreadyQueued) pendingMarketWake = wake;
       return marketPromise;
     }
-    activeMarketWindow = windowId;
+    activeMarketWake = wake;
     marketPromise = (async () => {
-      while (activeMarketWindow && !workController.signal.aborted) {
-        const currentWindow = activeMarketWindow;
-        await options.pollMarket(currentWindow, workController.signal);
-        activeMarketWindow = pendingMarketWindow;
-        pendingMarketWindow = undefined;
+      while (activeMarketWake && !workController.signal.aborted) {
+        const currentWake = activeMarketWake;
+        const windowId = "windowId" in currentWake
+          ? currentWake.windowId
+          : await options.deriveCurrentMarketWindow!(workController.signal);
+        marketWindowStart(windowId);
+        await options.pollMarket(windowId, workController.signal);
+        activeMarketWake = pendingMarketWake;
+        pendingMarketWake = undefined;
       }
     })().finally(() => {
-      activeMarketWindow = undefined;
-      pendingMarketWindow = undefined;
+      activeMarketWake = undefined;
+      pendingMarketWake = undefined;
       marketPromise = undefined;
     });
     return marketPromise;
   };
+
+  const wakeMarketWindow = (windowId: string): Promise<void> => (
+    wakeMarket(Object.freeze({ windowId }))
+  );
+
+  const wakeMarketCurrent = (): Promise<void> => (
+    wakeMarket(Object.freeze({ kind: "MARKET_CURRENT" }))
+  );
 
   const refreshCodexHeartbeat = (): void => {
     if (!options.heartbeat || heartbeatRefreshPromise || workController.signal.aborted) return;
@@ -1619,7 +1653,7 @@ export function createHybridRuntimeController(
       refreshCodexHeartbeat();
       const work = "jobId" in exact
         ? wakeModelDrain()
-        : wakeMarketWindow(exact.windowId);
+        : "windowId" in exact ? wakeMarketWindow(exact.windowId) : wakeMarketCurrent();
       void work.catch(() => {
         // Durable job/window authority remains pending or terminalized by its
         // worker path. HTTP acknowledgement is intentionally decoupled.
@@ -1629,7 +1663,7 @@ export function createHybridRuntimeController(
       const exact = exactRuntimeWake(wake);
       return "jobId" in exact
         ? wakeModelDrain()
-        : wakeMarketWindow(exact.windowId);
+        : "windowId" in exact ? wakeMarketWindow(exact.windowId) : wakeMarketCurrent();
     },
     wakeModelDrain,
     wakeMarketWindow,

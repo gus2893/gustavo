@@ -1370,6 +1370,105 @@ describe("hybrid worker host boundary", () => {
     await runtime.stop();
   });
 
+  it("database-current market trigger returns synchronously and coalesces one market lane", async () => {
+    const deriveGate = deferred();
+    const pollGate = deferred();
+    const deriveCurrentMarketWindow = vi.fn(async () => {
+      await deriveGate.promise;
+      return "2026-08-13T13:30Z";
+    });
+    const pollMarket = vi.fn(async () => { await pollGate.promise; });
+    const runtime = createHybridRuntimeController({
+      container: readyContainer(),
+      recoverMarket: vi.fn().mockResolvedValue(undefined),
+      drainModel: vi.fn().mockResolvedValue(undefined),
+      pollMarket,
+      deriveCurrentMarketWindow,
+      closeResources: vi.fn().mockResolvedValue(undefined),
+    });
+    await runtime.start();
+    const server = await startHybridWakeServer({
+      host: "127.0.0.1",
+      port: 0,
+      publicWakeUrl: "https://bridge.example.test/wake",
+      verify: vi.fn(async () => ({ kind: "MARKET_CURRENT" } as const)),
+      wake: (verified) => runtime.enqueue(verified),
+    });
+
+    const inject = () => server.inject({
+      method: "POST",
+      path: "/wake",
+      body: '{"kind":"MARKET_CURRENT"}',
+      headers: { "content-type": "application/json" },
+    });
+    await expect(inject()).resolves.toMatchObject({ statusCode: 202 });
+    await expect(inject()).resolves.toMatchObject({ statusCode: 202 });
+    expect(deriveCurrentMarketWindow).toHaveBeenCalledOnce();
+    expect(pollMarket).not.toHaveBeenCalled();
+
+    deriveGate.resolve();
+    await vi.waitFor(() => expect(pollMarket).toHaveBeenCalledOnce());
+    expect(deriveCurrentMarketWindow).toHaveBeenCalledOnce();
+    expect(pollMarket).toHaveBeenCalledWith(
+      "2026-08-13T13:30Z",
+      expect.any(AbortSignal),
+    );
+    pollGate.resolve();
+    await vi.waitFor(() => expect(runtime.status().marketActive).toBe(false));
+    await server.stop();
+    await runtime.stop();
+  });
+
+  it("database-current market trigger retains one pending serial follow-up while active", async () => {
+    const firstPollGate = deferred();
+    const secondPollGate = deferred();
+    const windows: string[] = [];
+    let activePolls = 0;
+    let maximumActivePolls = 0;
+    const deriveCurrentMarketWindow = vi.fn()
+      .mockResolvedValueOnce("2026-08-13T13:30Z")
+      .mockResolvedValueOnce("2026-08-13T13:35Z");
+    const pollMarket = vi.fn(async (windowId: string) => {
+      windows.push(windowId);
+      activePolls += 1;
+      maximumActivePolls = Math.max(maximumActivePolls, activePolls);
+      try {
+        if (windowId === "2026-08-13T13:30Z") await firstPollGate.promise;
+        else await secondPollGate.promise;
+      } finally {
+        activePolls -= 1;
+      }
+    });
+    const runtime = createHybridRuntimeController({
+      container: readyContainer(),
+      recoverMarket: vi.fn().mockResolvedValue(undefined),
+      drainModel: vi.fn().mockResolvedValue(undefined),
+      pollMarket,
+      deriveCurrentMarketWindow,
+      closeResources: vi.fn().mockResolvedValue(undefined),
+    });
+    await runtime.start();
+
+    runtime.enqueue({ kind: "MARKET_CURRENT" });
+    await vi.waitFor(() => expect(pollMarket).toHaveBeenCalledOnce());
+    runtime.enqueue({ kind: "MARKET_CURRENT" });
+    runtime.enqueue({ kind: "MARKET_CURRENT" });
+    runtime.enqueue({ kind: "MARKET_CURRENT" });
+    expect(deriveCurrentMarketWindow).toHaveBeenCalledOnce();
+    expect(windows).toEqual(["2026-08-13T13:30Z"]);
+
+    firstPollGate.resolve();
+    await vi.waitFor(() => expect(pollMarket).toHaveBeenCalledTimes(2));
+    expect(deriveCurrentMarketWindow).toHaveBeenCalledTimes(2);
+    expect(windows).toEqual(["2026-08-13T13:30Z", "2026-08-13T13:35Z"]);
+    expect(maximumActivePolls).toBe(1);
+
+    secondPollGate.resolve();
+    await vi.waitFor(() => expect(runtime.status().marketActive).toBe(false));
+    expect(pollMarket).toHaveBeenCalledTimes(2);
+    await runtime.stop();
+  });
+
   it("drains durable model work once during startup before accepting current wakes", async () => {
     const startupDrainGate = deferred();
     const order: string[] = [];

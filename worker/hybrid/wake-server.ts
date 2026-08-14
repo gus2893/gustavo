@@ -18,6 +18,7 @@ import {
   createFinnhubHttpClient,
   pollFinnhubWindow,
 } from "../../lib/server/market-data/finnhub";
+import { marketWindowStart } from "../../lib/server/market-data/session";
 import { createCodexCliProvider } from "../../lib/server/models/codex-cli";
 import { createModelGateway } from "../../lib/server/models/gateway";
 import {
@@ -911,6 +912,22 @@ async function writeRuntimeHeartbeat(
   ));
 }
 
+export async function deriveDatabaseCurrentMarketWindow(
+  database: EventDatabase,
+): Promise<string> {
+  const row = await database.one<{ readonly windowId: string } & Record<string, unknown>>(
+    `select to_char(
+       date_bin(
+         interval '5 minutes',market_poll_reservation_now(),
+         timestamptz '1970-01-01 00:00:00+00'
+       ) at time zone 'UTC',
+       'YYYY-MM-DD"T"HH24:MI"Z"'
+     ) "windowId"`,
+  );
+  marketWindowStart(row.windowId);
+  return row.windowId;
+}
+
 function abortableSleep(milliseconds: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.reject(new Error("MARKET_POLL_ABORTED"));
   return new Promise<void>((resolveSleep, reject) => {
@@ -1088,6 +1105,16 @@ export async function runConfiguredHybridWorker(): Promise<void> {
     recoverMarket,
     drainModel,
     pollMarket: pollWindow,
+    deriveCurrentMarketWindow: async (signal) => {
+      if (signal.aborted) throw new Error("MARKET_POLL_ABORTED");
+      const windowId = await withFreshDatabase(
+        databaseUrl,
+        "gustavo-hybrid-market-window",
+        (database) => database.transaction(deriveDatabaseCurrentMarketWindow),
+      );
+      if (signal.aborted) throw new Error("MARKET_POLL_ABORTED");
+      return windowId;
+    },
     closeResources: async () => undefined,
     verifyMarketMaterializer: (signal) => verifyMaterializerDatabase(
       databaseUrl, materializerUrl, signal,

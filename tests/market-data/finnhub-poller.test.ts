@@ -25,6 +25,7 @@ import {
   runMarketPollWindow,
   writeMarketHeartbeat,
 } from "../../worker/hybrid/market-poller";
+import { deriveDatabaseCurrentMarketWindow } from "../../worker/hybrid/wake-server";
 import { createConversationFixture } from "../helpers/postgres";
 
 const EXPECTED_STOCKS = "AAPL, MSFT, NVDA, AMZN, GOOGL, GOOG, META, TSLA, BRK.B, AVGO, JPM, LLY, V, XOM, MA, UNH, COST, WMT, NFLX, ORCL, HD, PG, JNJ, BAC, ABBV, KO, CRM, CVX, MRK, AMD, PLTR, CSCO, ACN, MCD, IBM, GE, CAT, GS, MS, AXP, BX, TMO, ISRG, LIN, ABT, DIS, NOW, QCOM, TXN, AMGN, DHR, PEP, PM, INTU, BKNG, RTX, AMAT, SPGI, NEE, LOW, UPS, HON, PFE, C, MU, SBUX, COP, SCHW, GILD, ADP, DE, BLK, PANW, LRCX, KLAC".split(", ");
@@ -2482,6 +2483,76 @@ describe("local market poller", () => {
       "select symbol from market_latest_quotes where account_id=$1",
       [fixture.accountId],
     )).toHaveLength(95);
+  }, 30_000);
+
+  it("database-current market trigger skips a crossed bucket before provider or quota work", async () => {
+    const fixture = await createConversationFixture("market-current-boundary");
+    const databaseCurrent = (await databaseMarketWindowIds(fixture.db)).current;
+    const databaseCurrentStart = new Date(`${databaseCurrent.slice(0, -1)}:00.000Z`);
+    const priorDatabaseTime = new Date(databaseCurrentStart.getTime() - 4 * 60_000);
+    await fixture.db.query(
+      "create table market_current_test_clock (observed_at timestamptz not null)",
+    );
+    await fixture.db.query(
+      "insert into market_current_test_clock (observed_at) values ($1)",
+      [priorDatabaseTime],
+    );
+    await fixture.db.query(
+      `create or replace function market_poll_reservation_now() returns timestamptz
+       language sql volatile as $$ select observed_at from market_current_test_clock $$`,
+    );
+    const derivedWindow = await fixture.db.transaction(deriveDatabaseCurrentMarketWindow);
+    await fixture.db.query(
+      `create or replace function market_poll_reservation_now() returns timestamptz
+       language sql volatile as $$ select clock_timestamp() $$`,
+    );
+    const poll = vi.fn(async (windowId: string) => ({
+      windowId,
+      callsUsed: 96,
+      items: MARKET_UNIVERSE.map(({ symbol, kind }) => ({
+        symbol,
+        kind,
+        status: "PROVIDER_ERROR" as const,
+        price: null,
+        sourceObservedAt: null,
+        safeCode: "PROVIDER_ERROR" as const,
+      })),
+    }));
+    const store = vi.fn((database: EventDatabase, window: PersistableMarketPollWindow) => (
+      persistMarketPollWindow(database, fixture.accountId, window)
+    ));
+    const run = (windowId: string) => runMarketPollWindow({
+      withDatabase: <Result>(work: (database: EventDatabase) => Promise<Result>) => (
+        fixture.db.transaction(work)
+      ),
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store,
+      heartbeat: writeMarketHeartbeat,
+    });
+
+    await expect(run(derivedWindow)).resolves.toEqual({
+      disposition: "SKIPPED",
+      windowId: derivedWindow,
+    });
+    expect(poll).not.toHaveBeenCalled();
+    expect(store).not.toHaveBeenCalled();
+    expect(await fixture.db.query(
+      "select * from deployment_quota_counters where quota_name='FINNHUB_CALLS'",
+    )).toEqual([]);
+    expect(await fixture.db.query(
+      "select symbol from market_latest_quotes where account_id=$1",
+      [fixture.accountId],
+    )).toEqual([]);
+
+    const currentWindow = await fixture.db.transaction(deriveDatabaseCurrentMarketWindow);
+    await expect(run(currentWindow)).resolves.toMatchObject({
+      status: "COMPLETED",
+      windowId: currentWindow,
+    });
+    expect(currentWindow).not.toBe(derivedWindow);
+    expect(poll).toHaveBeenCalledOnce();
+    expect(store).toHaveBeenCalledOnce();
   }, 30_000);
 
   it("rolls back an old bucket when database time advances across a blocked quota reservation", async () => {

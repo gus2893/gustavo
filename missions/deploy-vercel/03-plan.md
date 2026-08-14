@@ -1549,6 +1549,38 @@ Yes. It adds one fail-closed operator bootstrap command and a narrow output mode
 
 ---
 
+### T20A — Accept a static scheduled market trigger and derive the window from PostgreSQL
+
+**Maps to:** R3, R4, R5, R7
+**Files touched:** `lib/server/bridge/qstash.ts` (modify), `worker/hybrid/runtime.ts` (modify), `worker/hybrid/wake-server.ts` (modify), `tests/bridge/qstash.test.ts` (modify), `tests/infra/hybrid-worker.test.ts` (modify), `tests/market-data/finnhub-poller.test.ts` (modify)
+
+#### Red — failing tests
+
+- In `tests/bridge/qstash.test.ts`, sign the exact body `{"kind":"MARKET_CURRENT"}` for the canonical Funnel URL and expect it to pass the existing verification/receipt/quota boundary. The current parser rejects it.
+- In `tests/infra/hybrid-worker.test.ts`, enqueue the accepted static trigger and assert the HTTP-facing call returns synchronously while the market lane performs one database-current poll. Duplicate accepted triggers coalesce and do not create another lane.
+- In `tests/market-data/finnhub-poller.test.ts`, force the database clock across a five-minute boundary between derivation and reservation. Assert the old derived bucket is skipped with zero provider call/quota/latest mutation; the next trigger derives the new exact database bucket and polls normally.
+
+#### Green — minimum implementation
+
+- Extend the exact opaque wake union with only frozen `{kind:"MARKET_CURRENT"}`; reject every extra field, casing/version variant, and mixed job/window/kind body.
+- Preserve T6 ordering: exact URL/body/JWT verification, signed-`jti` replay receipt, and QStash daily quota commit all precede synchronous runtime admission.
+- Add no timestamp to the recurring schedule body and trust neither QStash delivery time nor the PC wall clock for the market window.
+- In the local production composition, use one short database lifecycle to derive the canonical current five-minute `windowId` from PostgreSQL time, disconnect, then call the existing T14 reserve → provider → store flow.
+- Keep dynamic `{windowId}` support only for existing internal/adversarial one-shot paths. Reservation remains authoritative and must skip if the database bucket advances before it commits; never re-poll history.
+- Coalesce the fixed trigger in the one existing market lane, retain the non-awaited 202 path and wake-refreshed CODEX heartbeat, and add no timer, relay route, schedule, or provider fallback.
+
+#### Verify
+
+Command: `pnpm vitest run tests/bridge/qstash.test.ts tests/infra/hybrid-worker.test.ts tests/market-data/finnhub-poller.test.ts -t "MARKET_CURRENT|database-current market trigger"`
+
+Expected: all selected static-trigger, coalescing, and boundary cases pass; full T6/T14/T15 related suites and TypeScript remain green.
+
+#### Reviewable as a unit?
+
+Yes. It closes one recurring-wake authority gap without changing the market reservation/provider/store transaction boundaries.
+
+---
+
 ### T21 — Document exact free-tier setup, operation, degraded mode, and rollback
 
 **Maps to:** R1, R2, R5, R6, R7
@@ -1574,7 +1606,7 @@ describe("hybrid deployment runbook", () => {
       "Vercel Hobby", "Neon Free", "Upstash Redis Free", "QStash Free",
       "Tailscale Free", "Finnhub Free", "Docker Desktop Personal",
       "gustavo-codex-auth-v1", "@openai/codex@0.146.0",
-      "900 messages/day", "100 jobs/day",
+      "1,000 messages/day", "900 messages/day application cap", "100 jobs/day",
       "96 calls/window", "95 results/window", "SIMULATION ONLY — NOT A REAL TRADE",
       "GUSTAVO_HYBRID_BRIDGE_ENABLED=false", "GUSTAVO_MARKET_POLLER_ENABLED=false",
       "GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL", "gustavo_market_materializer",
@@ -1592,11 +1624,12 @@ Expected initial state: `readFileSync("docs/VERCEL_DEPLOYMENT.md")` fails with `
 
 #### Green — minimum implementation
 
-- Write one command-ordered runbook: create Free resources, link the existing Vercel team/project, set Node 24/Corepack, set secrets through dashboards/CLI stdin, migrate, bootstrap, install Docker Desktop/local worker, build and record the pinned local Codex image digest, create/sign into the exact auth volume, start Funnel, configure two QStash schedules, deploy Preview, smoke, promote, and verify domains.
-- Document daily/provider dashboard checks and application caps: QStash 900/day, Codex 100/day/one active, Finnhub 96/window/exactly 95 results, Redis TTL/key bounds, latest quote and seven-day poll bounds.
+- Write one command-ordered runbook: create Free resources, link the existing Vercel team/project, set Node 24/Corepack, set secrets through dashboards/CLI stdin, migrate, bootstrap, install Docker Desktop/local worker, build and record the pinned local Codex image digest, create/sign into the exact auth volume, start Funnel, configure two QStash schedules, deploy and smoke Preview, create a staged production deployment with `vercel --prod --skip-domain`, smoke that production-authority URL, promote that exact staged deployment with `vercel promote <url> --yes`, and verify domains.
+- Document daily/provider dashboard checks and application caps: QStash Free provider ceiling 1,000/day with Gustavo capped at 900/day, Codex 100/day/one active, Finnhub 96/window/exactly 95 results, Redis TTL/key bounds, latest quote and seven-day poll bounds.
 - Document PC-offline behavior: public/history hosted, messages durable/queued, market stale, local health offline; document reconnect recovery.
 - Document that existing accepted five-minute/direct wakes refresh the DB-clock CODEX lease, two missed wake intervals make it offline at 12 minutes, current-day quota 100 is quota-limited, and there is no independent timer/poller/schedule.
 - Document that reconnect never re-polls an expired window: retained incomplete rows fail once before seven-day pruning, while already pruned rows are skipped and only the newly reserved current window may call Finnhub.
+- Configure the five-minute schedule with the exact fixed signed `MARKET_CURRENT` body. Explain that QStash does not supply a timestamp: after verification/receipt/quota, the local worker derives PostgreSQL's current bucket and T14 reservation rechecks it before provider work.
 - Document backup-before-cutover, flags-first rollback, exact schedule/task/Funnel cleanup, previous Ready promotion or exact safe-shell commit, and additive migration retention.
 - Add only blank secret names and deployment-profile examples to `infra/env.example`; state that the containerized standalone Codex uses interactive ChatGPT sign-in through the dedicated volume and remains an unsupported application backend. Document image rebuild/re-auth, exact-label reconciliation, and termination-failure shutdown without printing volume/image/container identifiers in application health.
 - Document creating the local-only Neon materializer login, granting only `gustavo_market_materializer`, copying its pooled URL into the protected worker configuration, rotation/revocation, and safe degradation. Explicitly forbid setting `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL` in Vercel or forwarding it to Codex/Finnhub/QStash.
@@ -1670,6 +1703,7 @@ Expected initial state: the message remains queued because no local hybrid E2E c
 - In the spec's isolated test process, start the production hybrid runtime with an injected fake container transport that emits strict NODE/MAIN/EVALUATOR JSON and a fake Finnhub transport that returns 95 deterministic personal-use fixtures. The fake implements the production run/wait/kill/inspect state machine but never bypasses its argument/label/output validation.
 - Use the existing disposable PostgreSQL/Next fixture; do not add a production fixture endpoint, fake production provider, or test-mode bypass.
 - The disposable fixture creates distinct ordinary and materializer login roles, grants only the migration-created permission role to the latter, passes the materializer URL only to the local test worker, and proves an ordinary-role matching-binding forgery is rejected before the browser story.
+- The five-minute QStash fixture sends the fixed `MARKET_CURRENT` body; assert the local worker derives the current window from database time after receipt/quota and that no dynamic schedule timestamp or hosted relay exists.
 - Run one market wake, then verify 95 rows, timestamps/freshness, exact chat attribution, Main/Evaluator priority fixture, one active Codex container, and no local data copied at bootstrap.
 - Stop the local controller to verify hosted public/history plus queued/offline status; restart it and verify exactly-once drain/recovery.
 - Simulate abrupt loss without the clean OFFLINE write, advance database time past the 12-minute CODEX lease, and verify chat/health become offline; separately seed current UTC `CODEX_JOBS=100/100` with a fresh heartbeat and verify quota-limited. Accepted wake refresh must not delay the 202 or create an extra schedule/timer.
@@ -1693,7 +1727,7 @@ Yes. This task adds only end-to-end proof and test-owned dependencies over the c
 
 ---
 
-### T23 — Provision Free resources, repair Preview, promote production, and run the final gate
+### T23 — Provision Free resources, repair Preview, stage exact production, promote, and run the final gate
 
 **Maps to:** R1, R2, R3, R4, R5, R6, R7
 **Files touched:** `tests/deployment/vercel-hybrid.test.ts` (modify), `docs/VERCEL_DEPLOYMENT.md` (modify with nonsecret resource/deployment identifiers and command results), external state in the named Vercel/Neon/Upstash/QStash/Tailscale/Finnhub accounts
@@ -1739,13 +1773,14 @@ Expected initial state: with live verification enabled before cutover, the curre
 - Confirm the selected plans are Vercel Hobby, Neon Free, Upstash Redis Free, QStash Free, Tailscale Free personal, and Finnhub Free personal; record plan names and nonsecret resource IDs in the runbook.
 - Create a fresh Neon database in the selected US East region, create empty Upstash Redis/QStash resources, and set only secret-store environment values. Never upload local PostgreSQL, Valkey, backups, accounts, memories, or market data.
 - Create a separate Neon materializer login, grant it only the migration-created `gustavo_market_materializer` NOLOGIN role, and store its pooled URL only in the protected local worker configuration. Verify the ordinary/Vercel role cannot insert consumption bindings and that no Vercel environment contains `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL`.
-- Link the existing Vercel team/project, set Node 24.x and `ENABLE_EXPERIMENTAL_COREPACK=1`, push the reviewed mission branch, deploy Preview, run migrations/bootstrap, and redeem the single invitation.
+- Link the existing Vercel team/project, set Node 24.x and `ENABLE_EXPERIMENTAL_COREPACK=1`, push the reviewed mission branch, deploy Preview for the early hosted gate, then create a production-environment deployment with `vercel --prod --skip-domain`; run migrations/bootstrap against that staged authority and redeem the single invitation.
 - Install/sign in the isolated local worker account, Docker Desktop, the pinned local Codex image/auth volume, Tailscale, and Finnhub key; verify the recorded image digest and internal timeout, start the exact loopback/Funnel controller, and create only the 15-minute maintenance and five-minute market QStash schedules.
-- Run Preview smoke, public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, container kill/wait and startup-reconciliation rehearsal, and quota boundary checks before production promotion.
+- Run Preview smoke first. Then run the public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, container kill/wait and startup-reconciliation rehearsal, and quota boundary checks against the staged production deployment URL before promotion.
 - Rehearse a retained prior market window and an already pruned one: prove no historical repoll or quota re-reservation, one bounded failed summary before retention expiry, cleanup-only afterward, and a normal current-window poll.
 - Run the regenerated focused SSE suite before cutover and retain its queue-full, active-authentication, active-revalidation, protected-load, source/iterator, response-cancel, and ordered durable reconnect proofs.
 - Verify an accepted existing wake refreshes the database-clock CODEX lease, two missed five-minute wakes age it offline at 12 minutes, quota 100 overrides fresh heartbeat, and no third schedule or persistent heartbeat timer exists.
-- Promote that exact Ready deployment, verify apex TLS and `www` redirect, then rehearse flags-first local/schedule rollback while confirming the hosted public/history surfaces remain available; restore the verified production state afterward.
+- Verify the live five-minute schedule body is exactly `MARKET_CURRENT`; the local worker derives the PostgreSQL window and a forced boundary crossing skips rather than polling an old window.
+- Promote that exact staged Ready deployment without rebuild using `vercel promote <staged-production-url> --yes`, verify apex TLS and `www` redirect, then rehearse flags-first local/schedule rollback while confirming the hosted public/history surfaces remain available; restore the verified production state afterward.
 - Run the live test with the Vercel token supplied through the process environment; never write tokens or resource URLs containing credentials to disk or command arguments.
 
 #### Refactor
@@ -1770,7 +1805,7 @@ Expected: every command exits 0; full unit/integration and focused Playwright su
 
 #### Reviewable as a unit?
 
-Yes. All code is already green before this task; this unit contains named external resource creation, Preview evidence, promotion, smoke evidence, and reversible cutover only.
+Yes. All code is already green before this task; this unit contains named external resource creation, Preview evidence, staged-production evidence, exact no-rebuild promotion, smoke evidence, and reversible cutover only.
 
 ## Plan self-review
 
@@ -1792,5 +1827,7 @@ Yes. All code is already green before this task; this unit contains named extern
 - [x] Market-materializer prompt-update impact is resolved: T13 defines the role-separated binding boundary; T15 provisions it locally; T21 documents it; T22 proves distinct identities; T23 provisions/verifies it without exposing the URL to Vercel.
 - [x] SSE cancellation-authority prompt-update impact is resolved: T17 owns active work through the shared stream pump and T23 reruns its focused cancellation/reconnect gate before cutover.
 - [x] Hybrid-heartbeat lease prompt-update impact is resolved: T18 coalesces refreshes and projects DB-clock/quota authority; T19 reuses the same policy; T21/T22/T23 document and verify abrupt-loss aging without an extra loop or schedule.
+- [x] Staged-production promotion prompt-update impact is resolved: T21 documents Preview as an early gate plus `--prod --skip-domain` staged smoke and no-rebuild promotion; T23 executes and records both deployment gates before domain assignment.
+- [x] Static market-wake prompt-update impact is resolved: T20A implements the fixed signed `MARKET_CURRENT` trigger plus PostgreSQL window derivation; T21/T22/T23 document and verify the exact schedule body and no historical polling.
 
 Plan approved. Next: `mcax-execute`.
