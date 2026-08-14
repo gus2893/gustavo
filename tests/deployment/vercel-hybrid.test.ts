@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { createOperatorHealthHandler } from "../../app/api/operator/health/route";
 import {
@@ -9,6 +9,14 @@ import {
 } from "../../lib/server/bridge/health";
 import { postgresPoolPolicy } from "../../lib/server/db/postgres";
 import type { EventDatabase } from "../../lib/server/events/types";
+import {
+  bootstrapProduction,
+  readProductionBootstrapEnvironment,
+} from "../../scripts/bootstrap-production";
+import {
+  createInvitationRedemptionUrl,
+  issueInvitationRedemptionUrl,
+} from "../../scripts/issue-invitation";
 import { runProductionMigrations } from "../../scripts/migrate-production";
 import { testContext } from "../helpers/postgres";
 
@@ -795,5 +803,430 @@ describe("Vercel PostgreSQL policy", () => {
     policy.attach({ marker: "pool" } as never);
     expect(attach).toHaveBeenCalledOnce();
     expect(attach).toHaveBeenCalledWith({ marker: "pool" });
+  });
+});
+
+type BootstrapTestDatabase = Awaited<ReturnType<typeof testContext>>["db"];
+
+function migrationNames(): string[] {
+  return readdirSync("db/migrations")
+    .filter((name) => /^\d{4}_[a-z0-9]+(?:_[a-z0-9]+)*\.sql$/u.test(name))
+    .sort();
+}
+
+async function installExactMigrationLedger(db: BootstrapTestDatabase): Promise<void> {
+  await db.query(`create table schema_migrations (
+    name text primary key,
+    checksum_sha256 char(64) not null
+  )`);
+  for (const name of migrationNames()) {
+    const checksum = createHash("sha256")
+      .update(readFileSync(`db/migrations/${name}`, "utf8").replace(/\r\n?/gu, "\n"), "utf8")
+      .digest("hex");
+    await db.query(
+      "insert into schema_migrations (name,checksum_sha256) values ($1,$2)",
+      [name, checksum],
+    );
+  }
+}
+
+function migratedApplicationTables(): string[] {
+  const names = new Set<string>();
+  for (const migration of migrationNames()) {
+    const sql = readFileSync(`db/migrations/${migration}`, "utf8");
+    for (const match of sql.matchAll(/^create table ([a-z0-9_]+)/gmu)) names.add(match[1]!);
+  }
+  return [...names].sort();
+}
+
+function runBootstrapTransaction(
+  db: BootstrapTestDatabase,
+  issueInvitation: () => Promise<{ readonly redemptionUrl: string; readonly expiresAt: string }>,
+  write: (value: string) => void = vi.fn(),
+): Promise<void> {
+  return db.transaction((transaction) => bootstrapProduction({
+    databaseUrl: "postgresql://secret.invalid/gustavo",
+    canonicalOrigin: "https://gustavo.lol",
+    query: (sql, parameters) => transaction.query(sql, parameters),
+    issueInvitation,
+    write,
+  }));
+}
+
+describe("fresh production bootstrap", () => {
+  it("seeds authority only and prints one secret-free expiring redemption URL", async () => {
+    const write = vi.fn();
+    const issueInvitation = vi.fn().mockResolvedValue({
+      redemptionUrl: "https://gustavo.lol/join?token=opaque-once",
+      expiresAt: "2026-08-14T12:00:00.000Z",
+    });
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("production-bootstrap-preflight")) return [{ safe_code: null }];
+      if (sql.includes("from accounts")) return [];
+      if (sql.includes("from events")) return [];
+      if (sql.includes("from conversations")) return [];
+      if (sql.includes("from memory_records")) return [];
+      if (sql.includes("from market_latest_quotes")) return [];
+      return [];
+    });
+
+    await bootstrapProduction({
+      databaseUrl: "postgresql://secret.invalid/gustavo",
+      canonicalOrigin: "https://gustavo.lol",
+      query,
+      issueInvitation,
+      write,
+    });
+
+    expect(issueInvitation).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledOnce();
+    expect(write.mock.calls[0][0]).toBe("https://gustavo.lol/join?token=opaque-once\n");
+    expect(write.mock.calls[0][0]).not.toMatch(
+      /postgresql|DATABASE_URL|encryption|opaque-once.*opaque-once/i,
+    );
+  });
+
+  it("rejects every non-production authority before querying or issuing", async () => {
+    const validEnvironment = {
+      DATABASE_URL: "postgresql://secret.invalid/gustavo",
+      GUSTAVO_APP_ORIGIN: "https://gustavo.lol",
+      GUSTAVO_DEPLOYMENT_PROFILE: "public-production-v1",
+      GUSTAVO_EVENT_ROOT_KEY_VERSION: "1",
+      GUSTAVO_EVENT_ROOT_KEY_V1: Buffer.alloc(32, 7).toString("base64"),
+    };
+
+    expect(readProductionBootstrapEnvironment(validEnvironment)).toEqual({
+      databaseUrl: validEnvironment.DATABASE_URL,
+      canonicalOrigin: "https://gustavo.lol",
+      deploymentProfile: "public-production-v1",
+    });
+
+    for (const environment of [
+      { ...validEnvironment, DATABASE_URL: "" },
+      { ...validEnvironment, GUSTAVO_APP_ORIGIN: "https://www.gustavo.lol" },
+      { ...validEnvironment, GUSTAVO_DEPLOYMENT_PROFILE: "local-mvp-v1" },
+      { ...validEnvironment, GUSTAVO_EVENT_ROOT_KEY_VERSION: "2" },
+      { ...validEnvironment, GUSTAVO_EVENT_ROOT_KEY_V1: "" },
+    ]) {
+      expect(() => readProductionBootstrapEnvironment(environment)).toThrow(
+        /PRODUCTION_BOOTSTRAP_ENV_INVALID/,
+      );
+    }
+
+    const query = vi.fn().mockResolvedValue([{ safe_code: null }]);
+    const issueInvitation = vi.fn();
+    const write = vi.fn();
+    await expect(bootstrapProduction({
+      databaseUrl: validEnvironment.DATABASE_URL,
+      canonicalOrigin: "http://localhost:3000",
+      deploymentProfile: "local-mvp-v1",
+      query,
+      issueInvitation,
+      write,
+    })).rejects.toThrow("PRODUCTION_BOOTSTRAP_AUTHORITY_INVALID");
+    expect(query).not.toHaveBeenCalled();
+    expect(issueInvitation).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("checks the full migration, empty private data, and exact fixed seed authority", async () => {
+    const query = vi.fn().mockResolvedValue([{ safe_code: null }]);
+    const issueInvitation = vi.fn().mockResolvedValue({
+      redemptionUrl: "https://gustavo.lol/join?token=opaque-once",
+      expiresAt: "2026-08-15T12:00:00.000Z",
+    });
+
+    await bootstrapProduction({
+      databaseUrl: "postgresql://secret.invalid/gustavo",
+      canonicalOrigin: "https://gustavo.lol",
+      deploymentProfile: "public-production-v1",
+      query,
+      issueInvitation,
+      write: vi.fn(),
+    });
+
+    expect(query).toHaveBeenCalledTimes(3);
+    const [advisorySql] = query.mock.calls[0]!;
+    const [lockSql] = query.mock.calls[1]!;
+    const [sql, parameters] = query.mock.calls[2]!;
+    expect(advisorySql).toMatch(/^select pg_advisory_xact_lock/iu);
+    expect(lockSql).toMatch(/^lock table /iu);
+    for (const relation of [
+      "schema_migrations",
+      "accounts",
+      "conversations",
+      "events",
+      "memory_records",
+      "market_latest_quotes",
+      "bridge_model_jobs",
+      "invitations",
+    ]) expect(sql).toContain(relation);
+    for (const authority of [
+      "00000000-0000-4000-8000-000000001200",
+      "00000000-0000-4000-8000-000000001201",
+      "gustavo-main",
+      "memory-graph-worker",
+      "privacy-forget-production",
+      "privacy-worker-test",
+      "market_symbol_catalog",
+    ]) expect(sql).toContain(authority);
+    expect(parameters[0]).toHaveLength(24);
+    expect(parameters[0].at(-1)).toMatch(
+      /^0022_hybrid_deployment\.sql:[a-f0-9]{64}$/u,
+    );
+    expect(parameters[1]).toHaveLength(95);
+    expect(parameters[3]).toEqual(migratedApplicationTables());
+    for (const table of migratedApplicationTables()) expect(lockSql).toContain(table);
+    expect(sql).not.toMatch(/\b(delete|insert|truncate|update)\b/i);
+  });
+
+  it("executes the fail-closed preflight against a freshly migrated PostgreSQL schema", async () => {
+    const { db } = await testContext();
+    await installExactMigrationLedger(db);
+    const issueInvitation = vi.fn().mockResolvedValue({
+      redemptionUrl: `https://gustavo.lol/join?token=${"a".repeat(43)}`,
+      expiresAt: "2026-08-15T12:00:00.000Z",
+    });
+    const write = vi.fn();
+    await runBootstrapTransaction(db, issueInvitation, write);
+    expect(issueInvitation).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledOnce();
+
+    await db.query(
+      "insert into accounts (id,display_name) values ($1,'unsafe local account')",
+      ["00000000-0000-4000-8000-000000009999"],
+    );
+    await expect(runBootstrapTransaction(db, issueInvitation, write))
+      .rejects.toThrow("PRODUCTION_DATABASE_NOT_EMPTY");
+    expect(issueInvitation).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledOnce();
+  }, 20_000);
+
+  it("fails closed for every unsafe database state without mutation or invitation output", async () => {
+    for (const safeCode of [
+      "SCHEMA_NOT_FULLY_MIGRATED",
+      "PRODUCTION_DATABASE_NOT_EMPTY",
+      "PRODUCTION_AUTHORITY_INVALID",
+    ]) {
+      const query = vi.fn().mockResolvedValue([{ safe_code: safeCode }]);
+      const issueInvitation = vi.fn();
+      const write = vi.fn();
+      await expect(bootstrapProduction({
+        databaseUrl: "postgresql://secret.invalid/gustavo",
+        canonicalOrigin: "https://gustavo.lol",
+        deploymentProfile: "public-production-v1",
+        query,
+        issueInvitation,
+        write,
+      })).rejects.toThrow(safeCode);
+      expect(issueInvitation).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+    }
+  });
+
+  it("builds one canonical opaque redemption URL without duplicating the token", () => {
+    const token = "a".repeat(43);
+    const redemptionUrl = createInvitationRedemptionUrl("https://gustavo.lol", token);
+    expect(redemptionUrl).toBe(`https://gustavo.lol/join?token=${token}`);
+    expect(redemptionUrl.match(new RegExp(token, "g"))).toHaveLength(1);
+    expect(() => createInvitationRedemptionUrl("http://localhost:3000", token))
+      .toThrow("INVITATION_CANONICAL_ORIGIN_INVALID");
+  });
+
+  it.each([
+    "http://localhost:3000",
+    "https://www.gustavo.lol",
+  ])("rejects invitation URL origin %s before creating invitation authority", async (origin) => {
+    const { db } = await testContext();
+    const before = await db.one<{ invitations: string; events: string }>(
+      `select (select count(*)::text from invitations) invitations,
+              (select count(*)::text from events) events`,
+    );
+
+    await expect(issueInvitationRedemptionUrl(
+      { db, operator: { id: "gustavo-operator", role: "OPERATOR" } },
+      { expiresAt: new Date("2030-01-01T00:00:00.000Z") },
+      origin,
+    )).rejects.toThrow("INVITATION_CANONICAL_ORIGIN_INVALID");
+
+    expect(await db.one<{ invitations: string; events: string }>(
+      `select (select count(*)::text from invitations) invitations,
+              (select count(*)::text from events) events`,
+    )).toEqual(before);
+  }, 20_000);
+
+  it("rejects the materializer authority when it is itself a member of another role", async () => {
+    const { db } = await testContext();
+    await installExactMigrationLedger(db);
+    const parentRole = `bootstrap_parent_${randomUUID().replaceAll("-", "")}`;
+    const issueInvitation = vi.fn().mockResolvedValue({
+      redemptionUrl: `https://gustavo.lol/join?token=${"a".repeat(43)}`,
+      expiresAt: "2030-01-01T00:00:00.000Z",
+    });
+    await db.query(`create role ${parentRole} nologin`);
+    try {
+      await db.query(`grant ${parentRole} to gustavo_market_materializer`);
+      await expect(runBootstrapTransaction(db, issueInvitation))
+        .rejects.toThrow("PRODUCTION_AUTHORITY_INVALID");
+      expect(issueInvitation).not.toHaveBeenCalled();
+    } finally {
+      await db.query(`revoke ${parentRole} from gustavo_market_materializer`);
+      await db.query(`drop role ${parentRole}`);
+    }
+  }, 20_000);
+
+  it("rejects omitted historical market, Challenge, and hybrid runtime state", async () => {
+    const { db } = await testContext();
+    await installExactMigrationLedger(db);
+    await db.query(
+      "insert into market_instrument_allowlist(symbol,asset_class) values ('AAPL','US_STOCK')",
+    );
+    await db.query(
+      `insert into market_data_sources(provider,license_id,licensed,redistribution)
+       values ('bootstrap-fixture','fixture-v1',true,'INTERNAL_ONLY')`,
+    );
+    await db.query(
+      `insert into market_observations (
+         id,symbol,asset_class,price,observed_at,received_at,provider,license_id,
+         raw_source_ref,feed_status,delay_seconds,redistribution,session_state
+       ) values ($1,'AAPL','US_STOCK','100.00','2026-08-14T12:00:00Z',
+         '2026-08-14T12:00:01Z','bootstrap-fixture','fixture-v1','historical:1',
+         'REALTIME',0,'INTERNAL_ONLY','OPEN')`,
+      [randomUUID()],
+    );
+    await db.query(
+      `insert into challenge_stages (
+         id,challenge_portfolio_id,profile_version_id,stage_profile_id,ordinal,created_at
+       ) values ($1,'00000000-0000-4000-8000-000000001200',
+         '00000000-0000-4000-8000-000000001201',
+         '00000000-0000-4000-8000-000000001211',1,clock_timestamp())`,
+      [randomUUID()],
+    );
+    await db.query(
+      "insert into hybrid_worker_heartbeats(component,status) values ('CODEX','HEALTHY')",
+    );
+    const issueInvitation = vi.fn().mockResolvedValue({
+      redemptionUrl: `https://gustavo.lol/join?token=${"a".repeat(43)}`,
+      expiresAt: "2030-01-01T00:00:00.000Z",
+    });
+
+    await expect(runBootstrapTransaction(db, issueInvitation))
+      .rejects.toThrow("PRODUCTION_DATABASE_NOT_EMPTY");
+    expect(issueInvitation).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("rejects semantic corruption of cache and privacy seed authorities", async () => {
+    const { db } = await testContext();
+    await installExactMigrationLedger(db);
+    const frozenPrivacy = await db.one<{ digest: string }>(
+      `select recall_manifest_digest(coalesce(jsonb_agg(jsonb_build_object(
+         'projectionType',projection_type,'ordinal',ordinal,'relationName',relation_name,
+         'forgetBehavior',forget_behavior,'rebuildBehavior',rebuild_behavior,
+         'forgetExecutor',forget_executor,'rebuildExecutor',rebuild_executor
+       ) order by ordinal),'[]'::jsonb)) digest from privacy_projection_registry`,
+    );
+    expect(frozenPrivacy.digest)
+      .toBe("4d9149750a281db78a84426c190559b791248a707945cd0b4cce27a151250ade");
+    await db.query("update cache_outbox_backfill_state set completed=false");
+    await db.query(
+      "alter table privacy_projection_registry disable trigger privacy_projection_registry_is_immutable",
+    );
+    try {
+      await db.query(
+        `update privacy_projection_registry set rebuild_behavior='REBUILD',
+           rebuild_executor='REBUILD_TYPED' where projection_type='CONSOLIDATION_RUN'`,
+      );
+    } finally {
+      await db.query(
+        "alter table privacy_projection_registry enable trigger privacy_projection_registry_is_immutable",
+      );
+    }
+    const issueInvitation = vi.fn().mockResolvedValue({
+      redemptionUrl: `https://gustavo.lol/join?token=${"a".repeat(43)}`,
+      expiresAt: "2030-01-01T00:00:00.000Z",
+    });
+
+    await expect(runBootstrapTransaction(db, issueInvitation))
+      .rejects.toThrow("PRODUCTION_AUTHORITY_INVALID");
+    expect(issueInvitation).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("serializes two real bootstrap transactions so exactly one invitation commits", async () => {
+    const { db } = await testContext();
+    await installExactMigrationLedger(db);
+    const outputs: string[] = [];
+    const run = async (): Promise<void> => {
+      let buffered: string | undefined;
+      await db.transaction((transaction) => bootstrapProduction({
+        databaseUrl: "postgresql://secret.invalid/gustavo",
+        canonicalOrigin: "https://gustavo.lol",
+        query: (sql, parameters) => transaction.query(sql, parameters),
+        issueInvitation: () => issueInvitationRedemptionUrl(
+          { db: transaction, operator: { id: "gustavo-operator", role: "OPERATOR" } },
+          { expiresAt: new Date("2030-01-01T00:00:00.000Z") },
+          "https://gustavo.lol",
+        ),
+        write: (value) => { buffered = value; },
+      }));
+      if (buffered) outputs.push(buffered);
+    };
+
+    const settled = await Promise.allSettled([run(), run()]);
+    expect(settled.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+    expect(settled.filter(({ status }) => status === "rejected")).toHaveLength(1);
+    expect(outputs).toHaveLength(1);
+    expect(await db.one<{ invitations: string; events: string }>(
+      `select (select count(*)::text from invitations) invitations,
+              (select count(*)::text from events where type='invitation.issued') events`,
+    )).toEqual({ invitations: "1", events: "1" });
+  }, 20_000);
+
+  it("holds checked table locks through invitation settlement against non-cooperating writes", async () => {
+    const { db } = await testContext();
+    await installExactMigrationLedger(db);
+    let markIssueEntered!: () => void;
+    let releaseIssue!: () => void;
+    const issueEntered = new Promise<void>((resolve) => { markIssueEntered = resolve; });
+    const issueReleased = new Promise<void>((resolve) => { releaseIssue = resolve; });
+    const bootstrap = db.transaction((transaction) => bootstrapProduction({
+      databaseUrl: "postgresql://secret.invalid/gustavo",
+      canonicalOrigin: "https://gustavo.lol",
+      query: (sql, parameters) => transaction.query(sql, parameters),
+      issueInvitation: async () => {
+        markIssueEntered();
+        await issueReleased;
+        return {
+          redemptionUrl: `https://gustavo.lol/join?token=${"a".repeat(43)}`,
+          expiresAt: "2030-01-01T00:00:00.000Z",
+        };
+      },
+      write: vi.fn(),
+    }));
+    await issueEntered;
+    try {
+      await expect(db.transaction(async (writer) => {
+        await writer.query("set local lock_timeout='100ms'");
+        await writer.query(
+          "insert into hybrid_worker_heartbeats(component,status) values ('CODEX','HEALTHY')",
+        );
+      })).rejects.toThrow(/lock timeout/iu);
+    } finally {
+      releaseIssue();
+    }
+    await bootstrap;
+  }, 20_000);
+
+  it("uses an exact package command and a safe unambiguous CLI failure channel", () => {
+    const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    const source = readFileSync("scripts/bootstrap-production.ts", "utf8");
+    expect(packageJson.scripts["production:bootstrap"])
+      .toBe("tsx scripts/bootstrap-production.ts");
+    expect(source).toContain('process.stderr.write("PRODUCTION_BOOTSTRAP_FAILED\\n")');
+    expect(source).toContain("process.exitCode = 1");
+    expect(source).not.toMatch(/process\.exit\s*\(/);
+    expect(source).not.toMatch(/process\.argv\[(?:2|3|4)\]/);
+    expect(source).not.toMatch(/console\.(?:log|error)/);
   });
 });
