@@ -1,3 +1,27 @@
+do $$
+begin
+  if not exists (
+    select 1 from pg_roles where rolname='gustavo_market_materializer'
+  ) then
+    create role gustavo_market_materializer
+      nologin noinherit nosuperuser nocreatedb nocreaterole
+      noreplication nobypassrls connection limit 0;
+  else
+    alter role gustavo_market_materializer
+      with nologin noinherit nosuperuser nocreatedb nocreaterole
+           noreplication nobypassrls connection limit 0 password null;
+  end if;
+  if exists (
+    select 1
+      from pg_auth_members membership
+      join pg_roles member_role on member_role.oid=membership.member
+     where member_role.rolname='gustavo_market_materializer'
+  ) then
+    raise exception 'MARKET_MATERIALIZER_ROLE_MEMBERSHIP_INVALID';
+  end if;
+end;
+$$;
+
 create table market_symbol_catalog (
   ordinal smallint not null unique check (ordinal between 1 and 95),
   symbol text primary key check (symbol ~ '^[A-Z][A-Z0-9.-]{0,14}$'),
@@ -625,7 +649,7 @@ create table market_latest_quotes (
   ),
   source_observed_at timestamptz,
   received_at timestamptz not null,
-  data_key_id uuid references aggregate_data_keys(id),
+  data_key_id uuid references aggregate_data_keys(id) on delete set null,
   ciphertext bytea check (
     ciphertext is null or octet_length(ciphertext) between 1 and 65536
   ),
@@ -651,7 +675,12 @@ create table market_latest_quotes (
   primary key (account_id, symbol),
   check (source_observed_at is null or received_at>=source_observed_at),
   check (
-    (status='SUCCESS' and source_observed_at is not null and data_key_id is not null
+    status<>'SUCCESS'
+    or source_observed_at=date_trunc('milliseconds',source_observed_at)
+  ),
+  check (status<>'SUCCESS' or received_at=date_trunc('milliseconds',received_at)),
+  check (
+    (status='SUCCESS' and source_observed_at is not null
       and ciphertext is not null and octet_length(ciphertext)>0
       and envelope_iv is not null and envelope_auth_tag is not null
       and envelope_encoding='canonical-json-v1'
@@ -667,6 +696,7 @@ language plpgsql as $$
 declare
   prior_window_started_at timestamptz;
   next_window_started_at timestamptz;
+  key_erasure_shape market_latest_quotes%rowtype;
 begin
   if tg_op='DELETE' then
     raise exception 'MARKET_LATEST_QUOTE_IMMUTABLE';
@@ -696,6 +726,21 @@ begin
   ) then
     raise exception 'MARKET_LATEST_CONTEXT_INVALID';
   end if;
+  if new.status='SUCCESS' and new.data_key_id is null then
+    if tg_op='UPDATE' and old.data_key_id is not null
+      and pg_trigger_depth()>1
+      and not exists (
+        select 1 from aggregate_data_keys data_key where data_key.id=old.data_key_id
+      )
+    then
+      key_erasure_shape:=new;
+      key_erasure_shape.data_key_id:=old.data_key_id;
+      if key_erasure_shape is not distinct from old then
+        return new;
+      end if;
+    end if;
+    raise exception 'MARKET_LATEST_KEY_REQUIRED';
+  end if;
   if new.data_key_id is not null and not exists (
     select 1 from aggregate_data_keys data_key
     where data_key.id=new.data_key_id
@@ -709,6 +754,13 @@ begin
     if next_window_started_at<=prior_window_started_at then
       raise exception 'MARKET_LATEST_STALE';
     end if;
+    if new.status='SUCCESS' and old.status='SUCCESS'
+      and new.source_observed_at<=old.source_observed_at
+    then
+      raise exception 'MARKET_LATEST_STALE';
+    end if;
+  elsif tg_op='UPDATE' and new is distinct from old then
+    raise exception 'MARKET_LATEST_WINDOW_CONFLICT';
   end if;
   return new;
 end;
@@ -721,6 +773,332 @@ for each row execute function validate_market_latest_quote();
 create trigger market_latest_quotes_truncate_is_immutable
 before truncate on market_latest_quotes
 for each statement execute function reject_deployment_authority_truncate();
+
+create function bind_market_consumption_event_body_digest() returns trigger
+language plpgsql as $$
+declare
+  command events%rowtype;
+  supplied_digest text;
+begin
+  select * into command from events where id=new.event_id;
+  if command.type<>'market.observation.consumption.requested' then
+    return new;
+  end if;
+  supplied_digest:=right(command.idempotency_key,64);
+  if command.aggregate_id<>concat('market-latest:',command.account_id)
+    or command.account_id is null
+    or command.actor_type<>'SYSTEM'
+    or command.actor_id<>'gustavo-decision-orchestrator'
+    or command.visibility<>'PRIVATE_ACCOUNT'
+    or command.policy_version<>'decision-window-policy-v1'
+    or command.causation_id is not null
+    or command.correlation_id<>command.id
+    or command.idempotency_key !~ '^market-consumption-command:[A-Za-z0-9._:-]{1,120}:[a-f0-9]{64}$'
+    or supplied_digest !~ '^[a-f0-9]{64}$'
+    or new.aggregate_id<>command.aggregate_id
+    or new.data_key_id is null
+  then
+    raise exception 'MARKET_CONSUMPTION_COMMAND_INVALID';
+  end if;
+  new.body_digest:=supplied_digest;
+  return new;
+end;
+$$;
+
+create trigger market_consumption_event_body_digest_binding
+before insert on encrypted_event_bodies
+for each row execute function bind_market_consumption_event_body_digest();
+
+create table market_observation_consumptions (
+  command_event_id uuid primary key references events(id),
+  account_id uuid not null references accounts(id),
+  symbol text not null references market_symbol_catalog(symbol),
+  latest_context_digest char(64) not null check (
+    latest_context_digest ~ '^[a-f0-9]{64}$'
+  ),
+  command_body_digest char(64) not null check (
+    command_body_digest ~ '^[a-f0-9]{64}$'
+  ),
+  observation_id uuid not null unique,
+  latest_window_id text not null check (
+    latest_window_id ~ '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$'
+  ),
+  latest_data_key_id uuid references aggregate_data_keys(id) on delete set null,
+  latest_source_observed_at timestamptz not null check (
+    latest_source_observed_at=date_trunc('milliseconds',latest_source_observed_at)
+  ),
+  latest_received_at timestamptz not null check (
+    latest_received_at=date_trunc('milliseconds',latest_received_at)
+  ),
+  request_digest char(64) not null check (request_digest ~ '^[a-f0-9]{64}$'),
+  created_at timestamptz not null default clock_timestamp(),
+  unique (account_id,symbol,latest_context_digest),
+  foreign key (observation_id) references market_observations(id)
+    deferrable initially deferred
+);
+
+alter table market_observations
+  add column account_id uuid references accounts(id),
+  add column latest_context_digest char(64) check (
+    latest_context_digest is null or latest_context_digest ~ '^[a-f0-9]{64}$'
+  ),
+  add column decision_command_event_id uuid,
+  add constraint market_observation_consumption_shape check (
+    (provider='finnhub' and account_id is not null
+      and latest_context_digest is not null and decision_command_event_id is not null)
+    or (provider<>'finnhub' and account_id is null
+      and latest_context_digest is null and decision_command_event_id is null)
+  ),
+  add constraint market_observation_consumption_command_fk
+    foreign key (decision_command_event_id)
+    references market_observation_consumptions(command_event_id)
+    deferrable initially deferred;
+
+create unique index market_observations_finnhub_latest_idx
+  on market_observations(account_id,symbol,latest_context_digest)
+  where provider='finnhub';
+
+create function market_consumption_request_digest(
+  target_account_id uuid,
+  target_command_event_id uuid,
+  target_symbol text,
+  target_latest_context_digest text
+) returns char(64)
+language sql immutable strict as $$
+  select recall_manifest_digest(jsonb_build_object(
+    'accountId',target_account_id::text,
+    'commandEventId',target_command_event_id::text,
+    'latestContextDigest',target_latest_context_digest,
+    'symbol',target_symbol
+  ))::char(64);
+$$;
+
+create function validate_market_observation_consumption() returns trigger
+language plpgsql as $$
+declare
+  command events%rowtype;
+  command_body encrypted_event_bodies%rowtype;
+  latest market_latest_quotes%rowtype;
+begin
+  if current_user<>'gustavo_market_materializer' then
+    raise exception 'MARKET_MATERIALIZER_ROLE_REQUIRED';
+  end if;
+  select * into command from events where id=new.command_event_id;
+  select * into command_body from encrypted_event_bodies
+   where event_id=new.command_event_id;
+  select * into latest from market_latest_quotes
+   where account_id=new.account_id and symbol=new.symbol
+   for share;
+  if command.id is null or command_body.event_id is null or latest.account_id is null
+    or command.aggregate_id<>'market-latest:'||new.account_id::text
+    or command.account_id<>new.account_id::text
+    or command.actor_type<>'SYSTEM'
+    or command.actor_id<>'gustavo-decision-orchestrator'
+    or command.type<>'market.observation.consumption.requested'
+    or command.visibility<>'PRIVATE_ACCOUNT'
+    or command.policy_version<>'decision-window-policy-v1'
+    or command.causation_id is not null or command.correlation_id<>command.id
+    or command_body.aggregate_id<>command.aggregate_id
+    or command_body.data_key_id is null
+    or command_body.data_key_id<>latest.data_key_id
+    or not exists (
+      select 1 from aggregate_data_keys data_key
+       where data_key.id=command_body.data_key_id
+         and data_key.aggregate_id=command.aggregate_id
+    )
+    or not exists (
+      select 1 from transactional_outbox outbox
+       where outbox.event_id=command.id
+         and outbox.topic='market.observation.consumption.requested'
+         and outbox.payload=jsonb_build_object('eventId',command.id::text)
+    )
+    or latest.status<>'SUCCESS' or latest.data_key_id is null
+    or latest.context_digest<>new.latest_context_digest
+    or command_body.body_digest<>recall_manifest_digest(jsonb_build_object(
+      'latestContextDigest',latest.context_digest,
+      'symbol',latest.symbol
+    ))
+    or right(command.idempotency_key,65)<>concat(':',command_body.body_digest)
+  then
+    raise exception 'MARKET_CONSUMPTION_AUTHORITY_INVALID';
+  end if;
+  new.latest_context_digest:=latest.context_digest;
+  new.command_body_digest:=command_body.body_digest;
+  new.latest_window_id:=latest.window_id;
+  new.latest_data_key_id:=latest.data_key_id;
+  new.latest_source_observed_at:=latest.source_observed_at;
+  new.latest_received_at:=latest.received_at;
+  new.request_digest:=market_consumption_request_digest(
+    new.account_id,new.command_event_id,new.symbol,latest.context_digest
+  );
+  return new;
+end;
+$$;
+
+create trigger market_observation_consumptions_validate
+before insert on market_observation_consumptions
+for each row execute function validate_market_observation_consumption();
+
+create function reject_market_observation_consumption_mutation() returns trigger
+language plpgsql as $$
+declare
+  key_erasure_shape market_observation_consumptions%rowtype;
+begin
+  if tg_op='UPDATE' and old.latest_data_key_id is not null
+    and new.latest_data_key_id is null and pg_trigger_depth()>1
+    and not exists (
+      select 1 from aggregate_data_keys data_key
+       where data_key.id=old.latest_data_key_id
+    )
+  then
+    key_erasure_shape:=new;
+    key_erasure_shape.latest_data_key_id:=old.latest_data_key_id;
+    if key_erasure_shape is not distinct from old then
+      return new;
+    end if;
+  end if;
+  raise exception 'IMMUTABLE_MARKET_OBSERVATION_CONSUMPTION';
+end;
+$$;
+
+create trigger market_observation_consumptions_are_immutable
+before update or delete on market_observation_consumptions
+for each row execute function reject_market_observation_consumption_mutation();
+
+create trigger market_observation_consumptions_truncate_is_immutable
+before truncate on market_observation_consumptions
+for each statement execute function reject_deployment_authority_truncate();
+
+create function market_materializer_writer_is_scoped() returns boolean
+language sql stable as $$
+  select current_user='gustavo_market_materializer'
+    or (
+      coalesce((
+        select not role.rolsuper from pg_roles role where role.rolname=current_user
+      ),false)
+      and pg_has_role(current_user,'gustavo_market_materializer','MEMBER')
+    );
+$$;
+
+create function require_market_observation_consumption() returns trigger
+language plpgsql as $$
+declare
+  consumption market_observation_consumptions%rowtype;
+  expected_asset_class text;
+begin
+  if market_materializer_writer_is_scoped() and new.provider<>'finnhub' then
+    raise exception 'MARKET_MATERIALIZER_WRITE_SCOPE_INVALID';
+  end if;
+  if new.provider='finnhub' then
+    if new.observed_at<>date_trunc('milliseconds',new.observed_at)
+      or new.received_at<>date_trunc('milliseconds',new.received_at)
+    then
+      raise exception 'MARKET_OBSERVATION_TIMESTAMP_PRECISION_INVALID';
+    end if;
+    select binding.* into consumption
+    from market_observation_consumptions binding
+    where binding.observation_id=new.id
+      and binding.command_event_id=new.decision_command_event_id
+      and binding.account_id=new.account_id
+      and binding.symbol=new.symbol
+      and binding.latest_context_digest=new.latest_context_digest;
+    if consumption.command_event_id is null then
+      raise exception 'MARKET_OBSERVATION_PROVENANCE_REQUIRED';
+    end if;
+    select case when catalog.kind='STOCK' then 'US_STOCK' else 'US_ETF' end
+      into expected_asset_class
+      from market_symbol_catalog catalog where catalog.symbol=new.symbol;
+    if new.asset_class<>expected_asset_class
+      or new.observed_at<>consumption.latest_source_observed_at
+      or new.received_at<>consumption.latest_received_at
+      or new.license_id<>'finnhub-free-personal'
+      or new.raw_source_ref<>concat('latest:',consumption.latest_context_digest)
+      or new.feed_status<>'REALTIME' or new.delay_seconds<>0
+      or new.redistribution<>'ACCOUNT_ONLY' or new.session_state<>'OPEN'
+    then
+      raise exception 'MARKET_OBSERVATION_SEMANTICS_INVALID';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger market_observations_require_consumption
+before insert on market_observations
+for each row execute function require_market_observation_consumption();
+
+create function constrain_market_materializer_allowlist_insert() returns trigger
+language plpgsql as $$
+begin
+  if market_materializer_writer_is_scoped() and not exists (
+    select 1 from market_symbol_catalog catalog
+     where catalog.symbol=new.symbol
+       and new.asset_class=case when catalog.kind='STOCK' then 'US_STOCK' else 'US_ETF' end
+       and new.enabled
+  ) then
+    raise exception 'MARKET_MATERIALIZER_WRITE_SCOPE_INVALID';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger market_materializer_allowlist_insert_scope
+before insert on market_instrument_allowlist
+for each row execute function constrain_market_materializer_allowlist_insert();
+
+create function constrain_market_materializer_source_insert() returns trigger
+language plpgsql as $$
+begin
+  if market_materializer_writer_is_scoped() and (
+    new.provider<>'finnhub'
+    or new.license_id<>'finnhub-free-personal'
+    or not new.licensed
+    or new.redistribution<>'ACCOUNT_ONLY'
+  ) then
+    raise exception 'MARKET_MATERIALIZER_WRITE_SCOPE_INVALID';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger market_materializer_source_insert_scope
+before insert on market_data_sources
+for each row execute function constrain_market_materializer_source_insert();
+
+do $$
+begin
+  execute format(
+    'grant usage on schema %I to gustavo_market_materializer',
+    current_schema()
+  );
+end;
+$$;
+
+grant select on accounts,entitlements,events,encrypted_event_bodies,
+  aggregate_data_keys,transactional_outbox,market_symbol_catalog,
+  market_poll_windows,market_latest_quotes,market_observation_consumptions,
+  market_instrument_allowlist,market_data_sources,market_observations
+to gustavo_market_materializer;
+
+grant insert on market_observation_consumptions,market_instrument_allowlist,
+  market_data_sources,market_observations
+to gustavo_market_materializer;
+
+revoke all on market_observation_consumptions,market_instrument_allowlist,
+  market_data_sources,market_observations
+from public;
+
+-- PostgreSQL row-locking SELECTs also require UPDATE privilege. Grant only
+-- columns whose semantic mutation is blocked by existing FK/immutability
+-- authority so the role can hold authorization/key/latest/binding locks.
+grant update (id) on accounts,entitlements,aggregate_data_keys
+to gustavo_market_materializer;
+
+grant update (updated_at) on market_latest_quotes
+to gustavo_market_materializer;
+
+grant update (command_event_id) on market_observation_consumptions
+to gustavo_market_materializer;
 
 create table deployment_quota_counters (
   quota_name text not null check (
