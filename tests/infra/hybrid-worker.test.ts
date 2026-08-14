@@ -74,6 +74,24 @@ function readyContainer(
 }
 
 describe("hybrid worker host boundary", () => {
+  it("exports one configured production assembly used by entrypoint and T22", async () => {
+    const module = await import("../../worker/hybrid/wake-server") as unknown as {
+      readonly createConfiguredHybridWorkerAssembly?: unknown;
+    };
+    const wakeServer = readFileSync("worker/hybrid/wake-server.ts", "utf8");
+    const productionStart = wakeServer.indexOf("export async function runConfiguredHybridWorker");
+    const productionAssembly = wakeServer.indexOf(
+      "createConfiguredHybridWorkerAssembly(",
+      productionStart,
+    );
+    const t22 = readFileSync("tests/e2e/gustavo-hybrid-production.spec.ts", "utf8");
+
+    expect.soft(module.createConfiguredHybridWorkerAssembly).toBeTypeOf("function");
+    expect.soft(productionStart).toBeGreaterThan(-1);
+    expect.soft(productionAssembly).toBeGreaterThan(productionStart);
+    expect.soft(t22).toContain("createConfiguredHybridWorkerAssembly");
+  });
+
   it("binds loopback and verifies a bounded POST before wake", async () => {
     const order: string[] = [];
     const verify = vi.fn(async (_request: Request) => {
@@ -376,7 +394,11 @@ describe("hybrid worker host boundary", () => {
 
     const source = readFileSync("worker/hybrid/wake-server.ts", "utf8");
     expect(source.indexOf('process.once("SIGINT"')).toBeLessThan(
-      source.indexOf("startHybridWorkerHost({"),
+      source.indexOf("const host = await assembly.start()"),
+    );
+    expect(source).toContain("dependencies.startHost ?? startHybridWorkerHost");
+    expect(source.indexOf("dependencies.startHost ?? startHybridWorkerHost")).toBeLessThan(
+      source.indexOf("hostPromise ??= startHost({"),
     );
   });
 

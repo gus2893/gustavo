@@ -18,6 +18,7 @@ import {
   createFinnhubHttpClient,
   pollFinnhubWindow,
 } from "../../lib/server/market-data/finnhub";
+import type { FinnhubHttpClient } from "../../lib/server/market-data/finnhub";
 import { marketWindowStart } from "../../lib/server/market-data/session";
 import { createCodexCliProvider } from "../../lib/server/models/codex-cli";
 import { createModelGateway } from "../../lib/server/models/gateway";
@@ -658,16 +659,59 @@ interface CommandResult {
   readonly stdout: string;
 }
 
-function requiredEnvironment(name: string): string {
-  const value = process.env[name];
+export interface ConfiguredHybridDatabaseLifecycleInput {
+  readonly applicationName: string;
+  readonly connectionString: string;
+  readonly transaction: boolean;
+}
+
+export type ConfiguredHybridDatabaseLifecycle = <Result>(
+  input: ConfiguredHybridDatabaseLifecycleInput,
+  work: (database: EventDatabase) => Promise<Result>,
+) => Promise<Result>;
+
+export interface ConfiguredHybridMarketClock {
+  readonly now: () => number;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly wallNow: () => number;
+}
+
+export interface ConfiguredHybridWorkerDependencies {
+  readonly createFinnhubClient?: () => FinnhubHttpClient;
+  readonly createMarketClock?: (signal: AbortSignal) => ConfiguredHybridMarketClock;
+  readonly databaseLifecycle?: ConfiguredHybridDatabaseLifecycle;
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly log?: (entry: HybridWakeLogEntry) => void;
+  readonly onControlStop?: () => void;
+  readonly reconcileCodex?: typeof reconcileCodexContainers;
+  readonly runCodex?: typeof runIsolatedCodex;
+  readonly runDockerCommand?: (
+    executable: string,
+    args: readonly string[],
+    signal: AbortSignal,
+  ) => Promise<CommandResult>;
+  readonly startHost?: (
+    options: HybridWorkerHostOptions,
+  ) => Promise<HybridWorkerHost>;
+}
+
+export interface ConfiguredHybridWorkerAssembly {
+  readonly controlStopped: Promise<void>;
+  readonly runtime: HybridRuntimeController;
+  readonly verify: (request: Request) => Promise<HybridRuntimeWake>;
+  start(): Promise<HybridWorkerHost>;
+}
+
+function requiredEnvironment(name: string, environment: NodeJS.ProcessEnv = process.env): string {
+  const value = environment[name];
   if (!value || value !== value.trim() || value.includes("\0")) {
     throw new Error("HYBRID_ENVIRONMENT_INVALID");
   }
   return value;
 }
 
-function configuredPort(): number {
-  const raw = requiredEnvironment("GUSTAVO_HYBRID_PORT");
+function configuredPort(environment: NodeJS.ProcessEnv = process.env): number {
+  const raw = requiredEnvironment("GUSTAVO_HYBRID_PORT", environment);
   if (!/^[0-9]{4,5}$/u.test(raw)) throw new Error("HYBRID_ENVIRONMENT_INVALID");
   const port = Number(raw);
   if (!Number.isSafeInteger(port) || port < 1_024 || port > MAX_PORT) {
@@ -703,6 +747,13 @@ async function withFreshDatabase<Result>(
     await pool.end().catch(() => undefined);
   }
 }
+
+const configuredDatabaseLifecycle: ConfiguredHybridDatabaseLifecycle = async (
+  input,
+  work,
+) => withFreshDatabase(input.connectionString, input.applicationName, (database) => (
+  input.transaction ? database.transaction(work) : work(database)
+));
 
 function runCommand(
   executable: string,
@@ -895,10 +946,14 @@ async function writeRuntimeHeartbeat(
   databaseUrl: string,
   heartbeat: HybridRuntimeHeartbeat,
   signal: AbortSignal,
+  databaseLifecycle: ConfiguredHybridDatabaseLifecycle = configuredDatabaseLifecycle,
 ): Promise<void> {
   if (signal.aborted) throw new Error("HYBRID_HEARTBEAT_ABORTED");
-  await withFreshDatabase(databaseUrl, "gustavo-hybrid-heartbeat", (database) => (
-    database.transaction(async (transaction) => {
+  await databaseLifecycle({
+    connectionString: databaseUrl,
+    applicationName: "gustavo-hybrid-heartbeat",
+    transaction: true,
+  }, async (transaction) => {
       if (signal.aborted) throw new Error("HYBRID_HEARTBEAT_ABORTED");
       await transaction.query(
         `insert into hybrid_worker_heartbeats (component,status,safe_code)
@@ -908,8 +963,7 @@ async function writeRuntimeHeartbeat(
                observed_at=clock_timestamp(),updated_at=clock_timestamp()`,
         [heartbeat.component, heartbeat.status, heartbeat.safeCode],
       );
-    })
-  ));
+  });
 }
 
 export async function deriveDatabaseCurrentMarketWindow(
@@ -951,30 +1005,51 @@ function safeWorkerLog(entry: HybridWakeLogEntry): void {
   process.stdout.write(`${JSON.stringify({ code: entry.code, ...identity })}\n`);
 }
 
-/** Production assembly used only by the dedicated local Windows account. */
-export async function runConfiguredHybridWorker(): Promise<void> {
-  const databaseUrl = requiredEnvironment("DATABASE_URL");
-  const materializerUrl = requiredEnvironment("GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL");
-  const image = requiredEnvironment("GUSTAVO_HYBRID_IMAGE_DIGEST");
-  const dockerExecutable = requiredEnvironment("GUSTAVO_DOCKER_EXECUTABLE");
-  const publicWakeUrl = canonicalPublicWakeUrl(
-    requiredEnvironment("GUSTAVO_HYBRID_PUBLIC_WAKE_URL"),
+/** Shared production composition; tests may replace only transport and lifecycle boundaries. */
+export function createConfiguredHybridWorkerAssembly(
+  dependencies: ConfiguredHybridWorkerDependencies = {},
+): ConfiguredHybridWorkerAssembly {
+  const environment = dependencies.environment ?? process.env;
+  const databaseUrl = requiredEnvironment("DATABASE_URL", environment);
+  const materializerUrl = requiredEnvironment(
+    "GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL",
+    environment,
   );
-  const currentSigningKey = requiredEnvironment("QSTASH_CURRENT_SIGNING_KEY");
-  const nextSigningKey = requiredEnvironment("QSTASH_NEXT_SIGNING_KEY");
-  const controlNonce = validControlNonce(requiredEnvironment("GUSTAVO_HYBRID_CONTROL_NONCE"));
+  const image = requiredEnvironment("GUSTAVO_HYBRID_IMAGE_DIGEST", environment);
+  const dockerExecutable = requiredEnvironment("GUSTAVO_DOCKER_EXECUTABLE", environment);
+  const publicWakeUrl = canonicalPublicWakeUrl(
+    requiredEnvironment("GUSTAVO_HYBRID_PUBLIC_WAKE_URL", environment),
+  );
+  const currentSigningKey = requiredEnvironment("QSTASH_CURRENT_SIGNING_KEY", environment);
+  const nextSigningKey = requiredEnvironment("QSTASH_NEXT_SIGNING_KEY", environment);
+  const controlNonce = validControlNonce(requiredEnvironment(
+    "GUSTAVO_HYBRID_CONTROL_NONCE",
+    environment,
+  ));
   if (!CODEX_IMAGE_PATTERN.test(image) || !isAbsolute(dockerExecutable)) {
     throw new Error("HYBRID_ENVIRONMENT_INVALID");
   }
+  const databaseLifecycle = dependencies.databaseLifecycle ?? configuredDatabaseLifecycle;
+  const dockerCommand = dependencies.runDockerCommand ?? runCommand;
+  const reconcileCodex = dependencies.reconcileCodex ?? reconcileCodexContainers;
+  const runCodex = dependencies.runCodex ?? runIsolatedCodex;
+  const createFinnhubClient = dependencies.createFinnhubClient ?? createFinnhubHttpClient;
+  const createMarketClock = dependencies.createMarketClock ?? ((signal: AbortSignal) => ({
+    sleep: (milliseconds: number) => abortableSleep(milliseconds, signal),
+    now: Date.now,
+    wallNow: Date.now,
+  }));
+  const startHost = dependencies.startHost ?? startHybridWorkerHost;
+  const log = dependencies.log ?? safeWorkerLog;
 
   let absenceProvenByLeasedReconcile = false;
   const container: HybridContainerController = Object.freeze({
     async verifyReady(signal: AbortSignal): Promise<void> {
-      const daemon = await runCommand(dockerExecutable, ["version", "--format", "{{.Server.Version}}"], signal);
-      const inspected = await runCommand(
+      const daemon = await dockerCommand(dockerExecutable, ["version", "--format", "{{.Server.Version}}"], signal);
+      const inspected = await dockerCommand(
         dockerExecutable, ["image", "inspect", "--format", "{{.Id}}", image], signal,
       );
-      const volume = await runCommand(
+      const volume = await dockerCommand(
         dockerExecutable, ["volume", "inspect", "--format", "{{.Name}}", AUTH_VOLUME], signal,
       );
       if (daemon.exitCode !== 0 || daemon.stdout.length === 0
@@ -985,12 +1060,12 @@ export async function runConfiguredHybridWorker(): Promise<void> {
     },
     async reconcile(signal: AbortSignal): Promise<void> {
       absenceProvenByLeasedReconcile = false;
-      await reconcileCodexContainers({ image, dockerExecutable, signal });
+      await reconcileCodex({ image, dockerExecutable, signal });
       absenceProvenByLeasedReconcile = true;
     },
     async stop(signal: AbortSignal): Promise<void> {
       absenceProvenByLeasedReconcile = false;
-      await reconcileCodexContainers({ image, dockerExecutable, signal });
+      await reconcileCodex({ image, dockerExecutable, signal });
       absenceProvenByLeasedReconcile = true;
     },
     async proveAbsent(signal: AbortSignal): Promise<boolean> {
@@ -1000,12 +1075,15 @@ export async function runConfiguredHybridWorker(): Promise<void> {
 
   const withOrdinaryDatabase = <Result>(
     work: (database: EventDatabase) => Promise<Result>,
-  ) => withFreshDatabase(databaseUrl, "gustavo-hybrid-market", (database) => (
-    database.transaction(work)
-  ));
+  ) => databaseLifecycle({
+    connectionString: databaseUrl,
+    applicationName: "gustavo-hybrid-market",
+    transaction: true,
+  }, work);
 
   const pollWindow = async (windowId: string, signal: AbortSignal): Promise<void> => {
-    const client = createFinnhubHttpClient();
+    const client = createFinnhubClient();
+    const clock = createMarketClock(signal);
     await runMarketPollWindow({
       withDatabase: withOrdinaryDatabase,
       reserve: (database) => reserveMarketPollWindow(database, windowId),
@@ -1017,9 +1095,9 @@ export async function runConfiguredHybridWorker(): Promise<void> {
           fetchQuote: (symbol, requestSignal) => client.fetchQuote(
             symbol, AbortSignal.any([signal, requestSignal]),
           ),
-          sleep: (milliseconds) => abortableSleep(milliseconds, signal),
-          now: Date.now,
-          wallNow: Date.now,
+          sleep: clock.sleep,
+          now: clock.now,
+          wallNow: clock.wallNow,
           timeoutMs: 2_500,
         });
         if (signal.aborted) throw new Error("MARKET_POLL_ABORTED");
@@ -1061,10 +1139,14 @@ export async function runConfiguredHybridWorker(): Promise<void> {
   };
 
   const drainModel = async (signal: AbortSignal): Promise<void> => {
-    await withFreshDatabase(databaseUrl, "gustavo-hybrid-model", async (database) => {
+    await databaseLifecycle({
+      connectionString: databaseUrl,
+      applicationName: "gustavo-hybrid-model",
+      transaction: false,
+    }, async (database) => {
       const provider = createCodexCliProvider({
         model: "gpt-5.6-sol",
-        run: (request) => runIsolatedCodex({
+        run: (request) => runCodex({
           role: request.role,
           prompt: request.prompt,
           image,
@@ -1107,11 +1189,11 @@ export async function runConfiguredHybridWorker(): Promise<void> {
     pollMarket: pollWindow,
     deriveCurrentMarketWindow: async (signal) => {
       if (signal.aborted) throw new Error("MARKET_POLL_ABORTED");
-      const windowId = await withFreshDatabase(
-        databaseUrl,
-        "gustavo-hybrid-market-window",
-        (database) => database.transaction(deriveDatabaseCurrentMarketWindow),
-      );
+      const windowId = await databaseLifecycle({
+        connectionString: databaseUrl,
+        applicationName: "gustavo-hybrid-market-window",
+        transaction: true,
+      }, deriveDatabaseCurrentMarketWindow);
       if (signal.aborted) throw new Error("MARKET_POLL_ABORTED");
       return windowId;
     },
@@ -1120,12 +1202,16 @@ export async function runConfiguredHybridWorker(): Promise<void> {
       databaseUrl, materializerUrl, signal,
     ),
     heartbeat: (heartbeat, signal) => writeRuntimeHeartbeat(
-      databaseUrl, heartbeat, signal,
+      databaseUrl, heartbeat, signal, databaseLifecycle,
     ),
   });
   const verify = async (request: Request): Promise<HybridRuntimeWake> => {
     let verifiedWake: HybridRuntimeWake | undefined;
-    await withFreshDatabase(databaseUrl, "gustavo-hybrid-wake", (database) => (
+    await databaseLifecycle({
+      connectionString: databaseUrl,
+      applicationName: "gustavo-hybrid-wake",
+      transaction: false,
+    }, (database) => (
       acceptQStashWake(request, {
         database,
         expectedUrl: publicWakeUrl,
@@ -1144,26 +1230,46 @@ export async function runConfiguredHybridWorker(): Promise<void> {
   const controlStop = new Promise<void>((resolveStop) => {
     controlStopResolve = resolveStop;
   });
+  let hostPromise: Promise<HybridWorkerHost> | undefined;
+  return Object.freeze({
+    runtime,
+    verify,
+    controlStopped: controlStop,
+    start(): Promise<HybridWorkerHost> {
+      hostPromise ??= startHost({
+        runtime,
+        port: configuredPort(environment),
+        publicWakeUrl,
+        verify,
+        controlNonce,
+        onControlStop: () => {
+          controlStopResolve();
+          dependencies.onControlStop?.();
+        },
+        log,
+      });
+      return hostPromise;
+    },
+  });
+}
+
+/** Production entrypoint used only by the dedicated local Windows account. */
+export async function runConfiguredHybridWorker(
+  dependencies: ConfiguredHybridWorkerDependencies = {},
+): Promise<void> {
+  const assembly = createConfiguredHybridWorkerAssembly(dependencies);
   // Install process shutdown authority before recovery can block. The host's
   // authenticated control socket is then bound in STARTING state.
   const signalStop = new Promise<void>((resolveSignal) => {
     process.once("SIGINT", resolveSignal);
     process.once("SIGTERM", resolveSignal);
   });
-  const host = await startHybridWorkerHost({
-    runtime,
-    port: configuredPort(),
-    publicWakeUrl,
-    verify,
-    controlNonce,
-    onControlStop: controlStopResolve,
-    log: safeWorkerLog,
-  });
+  const host = await assembly.start();
   const startup = host.ready.then(
     () => "READY" as const,
     () => "FAILED" as const,
   );
-  const requested = Promise.race([controlStop, signalStop]).then(() => "STOP" as const);
+  const requested = Promise.race([assembly.controlStopped, signalStop]).then(() => "STOP" as const);
   const first = await Promise.race([startup, requested]);
   if (first === "READY") await requested;
   await host.stop();

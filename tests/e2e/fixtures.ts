@@ -1,8 +1,9 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { chmod, lstat, readFile, readdir, rm, rmdir, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -27,7 +28,14 @@ import {
 } from "../../lib/server/challenge/orders";
 import { INITIAL_PROFILE } from "../../lib/server/challenge/profile";
 import { replayStoredLedgerEvents } from "../../lib/server/challenge/projection";
+import { canonicalContentDigest } from "../../lib/server/events/integrity";
 import { appendEvent } from "../../lib/server/events/store";
+import type { EventDatabase } from "../../lib/server/events/types";
+import {
+  loadLatestMarket,
+  materializeMarketObservation,
+  storeLatestMarketWindow,
+} from "../../lib/server/market-data/latest";
 import {
   commitMainBaseline,
   openDecisionWindow,
@@ -38,10 +46,13 @@ const execFileAsync = promisify(execFile);
 const E2E_DATABASE_PREFIX = "gustavo-e2e-postgres-";
 const E2E_BACKUP_PREFIX = "gustavo-e2e-backup-";
 const E2E_VALKEY_CONTAINER_PREFIX = "gustavo-e2e-valkey-";
+const E2E_CODEX_CONTAINER_PREFIX = "gustavo-e2e-codex-";
+const E2E_HYBRID_CHILD_PREFIX = "gustavo-e2e-hybrid-child-";
 const E2E_OWNERSHIP_PREFIX = "gustavo-e2e-ownership-";
 const E2E_OWNERSHIP_ENV = "GUSTAVO_E2E_OWNERSHIP_REGISTRY";
 const E2E_VALKEY_IMAGE = "valkey/valkey:8.1.3-bookworm";
 const E2E_VALKEY_OWNER_LABEL = "com.gustavo.e2e.registry";
+const E2E_CODEX_OWNER_LABEL = "com.gustavo.e2e.registry";
 const TEST_PROVIDER = "gustavo-e2e-licensed";
 const TEST_LICENSE = "e2e-license-v1";
 
@@ -50,7 +61,21 @@ interface E2eRuntime {
   ownershipDirectory: string;
   postgresBin: string;
   admin: Pool;
+  qstash: HttpServer;
   web: ChildProcess;
+}
+
+interface HostedWakePublication {
+  readonly accepted: true;
+  readonly bodyKind: "JOB";
+  readonly destinationVariable: "GUSTAVO_HYBRID_WAKE_URL";
+  readonly jobId: string;
+  readonly url: string;
+}
+
+interface QStashFixtureState {
+  marketSchedulePaused: boolean;
+  readonly publications: HostedWakePublication[];
 }
 
 export interface OwnedChildStatus {
@@ -95,14 +120,23 @@ export interface ScheduledBroadcastFixture {
   readonly protectedText?: never;
 }
 
+export interface HybridE2eDatabaseURLs {
+  readonly admin: string;
+  readonly materializer: string;
+  readonly ordinary: string;
+}
+
 export type FixtureOwnership = Readonly<{
-  kind: "BACKUP" | "VALKEY";
+  kind: "BACKUP" | "CHILD" | "CONTAINER" | "FILE" | "VALKEY";
   value: string;
 }>;
 
 export interface FixtureOwnershipOperations {
   readonly removeValkey?: (name: string) => Promise<void>;
   readonly removeBackup?: (directory: string) => Promise<void>;
+  readonly removeChild?: (value: string) => Promise<void>;
+  readonly removeContainer?: (name: string) => Promise<void>;
+  readonly removeFile?: (path: string) => Promise<void>;
 }
 
 type FixturePathKind = "DIRECTORY" | "FILE";
@@ -147,9 +181,9 @@ function postgresBin(): string {
   return found;
 }
 
-async function reserveLoopbackPort(): Promise<number> {
+export async function reserveLoopbackPort(): Promise<number> {
   return new Promise((resolvePort, reject) => {
-    const server = createServer();
+    const server = createNetServer();
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
@@ -170,7 +204,7 @@ export async function assertLoopbackPortAvailable(port: number): Promise<void> {
     throw new Error("E2E_WEB_PORT_INVALID");
   }
   await new Promise<void>((resolveAvailable, reject) => {
-    const probe = createServer();
+    const probe = createNetServer();
     probe.once("error", () => reject(new Error("E2E_WEB_PORT_PREOCCUPIED")));
     probe.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
       probe.close((error) => error ? reject(error) : resolveAvailable());
@@ -193,6 +227,16 @@ export function e2eBaseURL(): string {
     throw new Error("E2E_BASE_URL_INVALID");
   }
   return parsed.origin;
+}
+
+export function hybridE2eDatabaseURLs(): HybridE2eDatabaseURLs {
+  const admin = process.env.GUSTAVO_E2E_ADMIN_DATABASE_URL;
+  const materializer = process.env.GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL;
+  const ordinary = process.env.DATABASE_URL;
+  if (!admin || !materializer || !ordinary) {
+    throw new Error("E2E_HYBRID_DATABASE_URLS_REQUIRED");
+  }
+  return Object.freeze({ admin, materializer, ordinary });
 }
 
 async function runWithoutInheritedPipes(command: string, arguments_: readonly string[]): Promise<void> {
@@ -326,6 +370,197 @@ async function stopWeb(web: ChildProcess): Promise<void> {
   }
 }
 
+function qstashFixtureToken(): string {
+  const token = process.env.QSTASH_TOKEN;
+  if (!token || !/^[A-Za-z0-9_-]{32,128}$/u.test(token)) {
+    throw new Error("E2E_QSTASH_TOKEN_REQUIRED");
+  }
+  return token;
+}
+
+function qstashFixtureURL(): string {
+  const value = process.env.QSTASH_URL;
+  if (!value) throw new Error("E2E_QSTASH_URL_REQUIRED");
+  const parsed = new URL(value);
+  if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1"
+      || parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "") {
+    throw new Error("E2E_QSTASH_URL_INVALID");
+  }
+  return parsed.origin;
+}
+
+async function boundedRequestBody(
+  request: import("node:http").IncomingMessage,
+): Promise<string> {
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const raw of request) {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    length += chunk.byteLength;
+    if (length > 4_096) throw new Error("E2E_QSTASH_BODY_TOO_LARGE");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function startQStashFixture(
+  token: string,
+  hostedWakeURL: string,
+  currentSigningKey: string,
+): Promise<{ readonly server: HttpServer; readonly url: string }> {
+  const state: QStashFixtureState = {
+    marketSchedulePaused: false,
+    publications: [],
+  };
+  const server = createHttpServer((request, response) => {
+    void (async () => {
+      const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      if (request.headers.authorization !== `Bearer ${token}`) {
+        response.writeHead(401, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      if (request.method === "POST" && url.pathname.startsWith("/v2/publish/")) {
+        const destination = decodeURIComponent(url.pathname.slice("/v2/publish/".length));
+        const rawBody = await boundedRequestBody(request);
+        const body: unknown = JSON.parse(rawBody);
+        if (destination !== hostedWakeURL || !body || typeof body !== "object"
+            || Array.isArray(body) || Object.keys(body).join(",") !== "jobId"
+            || typeof (body as { readonly jobId?: unknown }).jobId !== "string"
+            || !/^[0-9a-f-]{36}$/iu.test((body as { readonly jobId: string }).jobId)) {
+          response.writeHead(400, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "invalid publication" }));
+          return;
+        }
+        const publication = Object.freeze({
+          accepted: true,
+          bodyKind: "JOB",
+          destinationVariable: "GUSTAVO_HYBRID_WAKE_URL",
+          jobId: (body as { readonly jobId: string }).jobId,
+          url: destination,
+        } satisfies HostedWakePublication);
+        state.publications.push(publication);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ messageId: `e2e-${state.publications.length}` }));
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/_e2e/publications/next") {
+        const publication = state.publications.shift();
+        response.writeHead(publication ? 200 : 404, { "content-type": "application/json" });
+        response.end(JSON.stringify(publication ?? { error: "empty" }));
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/_e2e/schedules") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          schedules: [
+            {
+              id: "gustavo-hosted-maintenance-v1",
+              cron: "*/15 * * * *",
+              method: "POST",
+              destination: "https://gustavo.lol/api/internal/maintenance",
+              body: { operation: "maintenance" },
+            },
+            {
+              id: "gustavo-market-current-v1",
+              cron: "*/5 * * * *",
+              method: "POST",
+              destination: hostedWakeURL,
+              body: { kind: "MARKET_CURRENT" },
+              paused: state.marketSchedulePaused,
+            },
+          ],
+        }));
+        return;
+      }
+      if (request.method === "POST"
+          && url.pathname === "/_e2e/schedules/gustavo-market-current-v1/deliver") {
+        if (state.marketSchedulePaused) {
+          response.writeHead(409, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "schedule paused" }));
+          return;
+        }
+        const rawControl = await boundedRequestBody(request);
+        const control: unknown = JSON.parse(rawControl);
+        const port = control && typeof control === "object" && !Array.isArray(control)
+          ? (control as { readonly port?: unknown }).port
+          : undefined;
+        if (!Number.isInteger(port) || (port as number) < 1_024 || (port as number) > 65_535) {
+          response.writeHead(400, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "invalid delivery target" }));
+          return;
+        }
+        const rawBody = JSON.stringify({ kind: "MARKET_CURRENT" });
+        const now = Math.floor(Date.now() / 1_000);
+        const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" }))
+          .toString("base64url");
+        const claims = Buffer.from(JSON.stringify({
+          iss: "Upstash",
+          sub: hostedWakeURL,
+          body: createHash("sha256").update(rawBody, "utf8").digest("base64url"),
+          iat: now - 1,
+          nbf: now - 2,
+          exp: now + 3_600,
+          jti: `e2e-market-${randomUUID()}`,
+        })).toString("base64url");
+        const unsigned = `${header}.${claims}`;
+        const signature = `${unsigned}.${createHmac("sha256", currentSigningKey)
+          .update(unsigned, "utf8").digest("base64url")}`;
+        const wakeResponse = await fetch(`http://127.0.0.1:${port as number}/wake`, {
+          method: "POST",
+          headers: {
+            "content-length": String(Buffer.byteLength(rawBody)),
+            "content-type": "application/json",
+            "upstash-message-id": `e2e-market-${randomUUID()}`,
+            "upstash-signature": signature,
+          },
+          body: rawBody,
+          signal: AbortSignal.timeout(2_000),
+        });
+        const wakeBody = await wakeResponse.text();
+        if (wakeBody !== "WAKE_ACCEPTED") throw new Error("E2E_MARKET_DELIVERY_REJECTED");
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          bodyKind: "MARKET_CURRENT",
+          scheduleId: "gustavo-market-current-v1",
+          status: wakeResponse.status,
+        }));
+        return;
+      }
+      if (request.method === "POST"
+          && url.pathname === "/_e2e/schedules/gustavo-market-current-v1/pause") {
+        state.marketSchedulePaused = true;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ schedulePaused: true }));
+        return;
+      }
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "not found" }));
+    })().catch(() => {
+      if (!response.headersSent) response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "fixture failure" }));
+    });
+  });
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string" || address.address !== "127.0.0.1") {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    throw new Error("E2E_QSTASH_BIND_INVALID");
+  }
+  return Object.freeze({ server, url: `http://127.0.0.1:${address.port}` });
+}
+
+async function stopQStashFixture(server: HttpServer): Promise<void> {
+  server.closeIdleConnections();
+  server.closeAllConnections();
+  await new Promise<void>((resolveClose, reject) => {
+    server.close((error) => error ? reject(error) : resolveClose());
+  });
+}
+
 function assertSafeOwnershipRegistry(directory: string): void {
   const expectedParent = resolve(tmpdir());
   const target = resolve(directory);
@@ -413,8 +648,33 @@ function validateOwnership(ownership: FixtureOwnership): FixtureOwnership {
   }
   if (ownership.kind === "VALKEY") assertValkeyContainerName(ownership.value);
   else if (ownership.kind === "BACKUP") assertSafeBackupDirectory(ownership.value);
+  else if (ownership.kind === "CHILD") parseOwnedChild(ownership.value);
+  else if (ownership.kind === "CONTAINER") assertCodexContainerName(ownership.value);
+  else if (ownership.kind === "FILE") assertSafeMaintenanceLauncher(ownership.value);
   else throw new Error("E2E_OWNERSHIP_INVALID");
   return Object.freeze({ kind: ownership.kind, value: ownership.value });
+}
+
+function assertSafeMaintenanceLauncher(path: string): void {
+  const target = resolve(path);
+  const name = target.split(/[\\/]/u).at(-1) ?? "";
+  if (resolve(target, "..") !== resolve(tmpdir())
+      || !/^gustavo-e2e-(?:maintenance-[0-9a-f]{32}\.ps1|settlement-[0-9a-f]{32}\.state)$/u.test(name)) {
+    throw new Error("UNSAFE_E2E_MAINTENANCE_LAUNCHER");
+  }
+}
+
+async function removeOwnedMaintenanceLauncher(path: string): Promise<void> {
+  assertSafeMaintenanceLauncher(path);
+  try {
+    const item = await lstat(path);
+    if (!item.isFile() || item.isSymbolicLink()) {
+      throw new Error("E2E_MAINTENANCE_LAUNCHER_INVALID");
+    }
+    await rm(path, { force: false });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 export async function registerFixtureOwnership(
@@ -490,6 +750,12 @@ export async function readFixtureOwnership(
   return Object.freeze((await ownershipEntries(registry)).map(({ ownership }) => ownership));
 }
 
+export async function assertNoOwnedFixtureResidue(): Promise<true> {
+  const owned = await readFixtureOwnership(currentOwnershipRegistry());
+  if (owned.length !== 0) throw new Error("E2E_OWNED_FIXTURE_RESIDUE");
+  return true;
+}
+
 type DockerInvocation = (arguments_: readonly string[]) => Promise<string>;
 
 function exactNoSuchContainer(error: unknown, name: string): boolean {
@@ -551,6 +817,57 @@ async function removeOwnedBackup(directory: string): Promise<void> {
   await rm(directory, { recursive: true, force: true, maxRetries: 5 });
 }
 
+function parseOwnedChild(value: string): { readonly marker: string; readonly pid: number } {
+  const match = new RegExp(
+    `^([1-9][0-9]{0,9}):(${E2E_HYBRID_CHILD_PREFIX}[0-9a-f]{32})$`,
+    "u",
+  ).exec(value);
+  const pid = Number(match?.[1]);
+  if (!match?.[2] || !Number.isSafeInteger(pid) || pid < 1) {
+    throw new Error("UNSAFE_E2E_HYBRID_CHILD");
+  }
+  return Object.freeze({ pid, marker: match[2] });
+}
+
+async function ownedChildCommandLine(pid: number): Promise<string | undefined> {
+  if (process.platform === "win32") {
+    const script = [
+      "param([int]$TargetPid)",
+      "$item=Get-CimInstance Win32_Process -Filter \"ProcessId=$TargetPid\"",
+      "if($null -ne $item){$item.CommandLine}",
+    ].join(";");
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-Command", `& { ${script} }`, String(pid),
+    ], { windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 });
+    const line = stdout.trim();
+    return line === "" ? undefined : line;
+  }
+  try {
+    return (await readFile(`/proc/${pid}/cmdline`, "utf8")).replaceAll("\u0000", " ").trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function removeOwnedHybridChild(value: string): Promise<void> {
+  const { marker, pid } = parseOwnedChild(value);
+  const commandLine = await ownedChildCommandLine(pid);
+  if (commandLine === undefined) return;
+  if (!commandLine.includes(marker)
+      || !commandLine.includes("gustavo-hybrid-production.spec.ts")) {
+    throw new Error("E2E_HYBRID_CHILD_OWNERSHIP_MISMATCH");
+  }
+  process.kill(pid, "SIGTERM");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const current = await ownedChildCommandLine(pid);
+    if (current === undefined || !current.includes(marker)) return;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  throw new Error("E2E_HYBRID_CHILD_STOP_TIMEOUT");
+}
+
 export async function cleanupFixtureOwnershipRegistry(
   registry: string,
   operations: FixtureOwnershipOperations = {},
@@ -562,8 +879,16 @@ export async function cleanupFixtureOwnershipRegistry(
         await (operations.removeValkey ?? ((name) => removeValkeyContainer(name, registry)))(
           ownership.value,
         );
-      } else {
+      } else if (ownership.kind === "BACKUP") {
         await (operations.removeBackup ?? removeOwnedBackup)(ownership.value);
+      } else if (ownership.kind === "CHILD") {
+        await (operations.removeChild ?? removeOwnedHybridChild)(ownership.value);
+      } else if (ownership.kind === "FILE") {
+        await (operations.removeFile ?? removeOwnedMaintenanceLauncher)(ownership.value);
+      } else {
+        await (operations.removeContainer ?? ((name) => removeCodexContainer(name, registry)))(
+          ownership.value,
+        );
       }
       await rm(record, { force: false });
     } catch (error) {
@@ -594,6 +919,96 @@ async function unregisterFixtureOwnership(
   await rm(target, { force: false });
 }
 
+export async function registerOwnedHybridChild(
+  pid: number,
+  marker: string,
+): Promise<string> {
+  return registerFixtureOwnership(currentOwnershipRegistry(), {
+    kind: "CHILD",
+    value: `${pid}:${marker}`,
+  });
+}
+
+export async function unregisterOwnedHybridChild(record: string): Promise<void> {
+  await unregisterFixtureOwnership(record);
+}
+
+export async function cleanupOwnedHybridChild(record: string): Promise<void> {
+  const raw: unknown = JSON.parse(await readFile(record, "utf8"));
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)
+      || (raw as { readonly kind?: unknown }).kind !== "CHILD"
+      || typeof (raw as { readonly value?: unknown }).value !== "string") {
+    throw new Error("E2E_OWNERSHIP_RECORD_INVALID");
+  }
+  await removeOwnedHybridChild((raw as { readonly value: string }).value);
+  await unregisterFixtureOwnership(record);
+}
+
+export async function createOwnedMaintenanceLauncher(
+  content: string,
+): Promise<{ readonly path: string; readonly ownershipRecord: string }> {
+  if (typeof content !== "string" || content.length < 1 || content.length > 1_000_000) {
+    throw new Error("E2E_MAINTENANCE_LAUNCHER_CONTENT_INVALID");
+  }
+  const path = join(tmpdir(), `gustavo-e2e-maintenance-${randomUUID().replaceAll("-", "")}.ps1`);
+  assertSafeMaintenanceLauncher(path);
+  const ownershipRecord = await registerFixtureOwnership(currentOwnershipRegistry(), {
+    kind: "FILE",
+    value: path,
+  });
+  try {
+    await writeFile(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await protectOwnerOnlyPath(path, "FILE");
+    if (!await fixtureOwnerOnlyPath(path, "FILE")) {
+      throw new Error("E2E_MAINTENANCE_LAUNCHER_PERMISSIONS_INVALID");
+    }
+    return Object.freeze({ path, ownershipRecord });
+  } catch (error) {
+    await removeOwnedMaintenanceLauncher(path).catch(() => undefined);
+    await unregisterFixtureOwnership(ownershipRecord).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function createOwnedChildSettlementAuthority(): Promise<{
+  readonly path: string;
+  readonly ownershipRecord: string;
+}> {
+  const path = join(tmpdir(), `gustavo-e2e-settlement-${randomUUID().replaceAll("-", "")}.state`);
+  assertSafeMaintenanceLauncher(path);
+  const ownershipRecord = await registerFixtureOwnership(currentOwnershipRegistry(), {
+    kind: "FILE",
+    value: path,
+  });
+  try {
+    await writeFile(path, "PENDING", { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await protectOwnerOnlyPath(path, "FILE");
+    if (!await fixtureOwnerOnlyPath(path, "FILE")) {
+      throw new Error("E2E_CHILD_SETTLEMENT_PERMISSIONS_INVALID");
+    }
+    return Object.freeze({ path, ownershipRecord });
+  } catch (error) {
+    await removeOwnedMaintenanceLauncher(path).catch(() => undefined);
+    await unregisterFixtureOwnership(ownershipRecord).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function cleanupOwnedMaintenanceLauncher(
+  path: string,
+  ownershipRecord: string,
+): Promise<true> {
+  await removeOwnedMaintenanceLauncher(path);
+  await unregisterFixtureOwnership(ownershipRecord);
+  try {
+    await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+  throw new Error("E2E_MAINTENANCE_LAUNCHER_RESIDUE");
+}
+
 async function cleanup(runtime: Partial<E2eRuntime>): Promise<void> {
   const failures: unknown[] = [];
   if (runtime.ownershipDirectory) {
@@ -602,6 +1017,9 @@ async function cleanup(runtime: Partial<E2eRuntime>): Promise<void> {
   }
   if (runtime.web) {
     await stopWeb(runtime.web).catch((error: unknown) => failures.push(error));
+  }
+  if (runtime.qstash) {
+    await stopQStashFixture(runtime.qstash).catch((error: unknown) => failures.push(error));
   }
   if (runtime.admin) {
     await runtime.admin.end().catch((error: unknown) => failures.push(error));
@@ -625,6 +1043,40 @@ async function cleanup(runtime: Partial<E2eRuntime>): Promise<void> {
     throw new AggregateError(failures, "E2E_CLEANUP_FAILED");
   }
   delete process.env[E2E_OWNERSHIP_ENV];
+}
+
+function databaseURLForRole(databaseURL: string, role: string): string {
+  const url = new URL(databaseURL);
+  url.username = role;
+  url.password = "";
+  return url.toString();
+}
+
+async function configureHybridE2eDatabaseRoles(
+  admin: Pool,
+  adminDatabaseURL: string,
+): Promise<{ readonly ordinaryURL: string; readonly materializerURL: string }> {
+  const ordinaryRole = "gustavo_e2e_ordinary";
+  const materializerRole = "gustavo_e2e_materializer";
+  await admin.query(`
+    create role ${ordinaryRole}
+      login inherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+    create role ${materializerRole}
+      login inherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+    grant gustavo_market_materializer to ${materializerRole};
+    grant usage on schema public to ${ordinaryRole};
+    grant select,insert,update,delete on all tables in schema public to ${ordinaryRole};
+    grant usage,select,update on all sequences in schema public to ${ordinaryRole};
+    grant execute on all functions in schema public to ${ordinaryRole};
+    revoke insert,update,delete,truncate on
+      market_observation_consumptions,market_instrument_allowlist,
+      market_data_sources,market_observations
+    from ${ordinaryRole};
+  `);
+  return Object.freeze({
+    ordinaryURL: databaseURLForRole(adminDatabaseURL, ordinaryRole),
+    materializerURL: databaseURLForRole(adminDatabaseURL, materializerRole),
+  });
 }
 
 export default async function globalSetup(config: FullConfig): Promise<() => Promise<void>> {
@@ -656,15 +1108,27 @@ export default async function globalSetup(config: FullConfig): Promise<() => Pro
       "-w", "-t", "10", "start",
     ]);
 
-    const databaseURL = `postgresql://postgres@127.0.0.1:${databasePort}/postgres`;
-    runtime.admin = new Pool({ connectionString: databaseURL, max: 4 });
+    const adminDatabaseURL = `postgresql://postgres@127.0.0.1:${databasePort}/postgres`;
+    runtime.admin = new Pool({ connectionString: adminDatabaseURL, max: 4 });
     process.stderr.write("[e2e setup] applying migrations\n");
     await applyMigrations(runtime.admin);
     process.stderr.write("[e2e setup] migrations applied\n");
+    const databaseRoles = await configureHybridE2eDatabaseRoles(
+      runtime.admin,
+      adminDatabaseURL,
+    );
 
     const webPort = await reserveLoopbackPort();
     const baseURL = `http://127.0.0.1:${webPort}`;
-    process.env.DATABASE_URL = databaseURL;
+    const hostedWakeURL = "https://gustavo-fixture.private-fixture.ts.net/wake";
+    const qstashToken = randomBytes(32).toString("base64url");
+    const currentSigningKey = "e2e-current-signing-key-with-at-least-32-bytes";
+    const nextSigningKey = "e2e-next-signing-key-with-at-least-32-bytes";
+    const qstash = await startQStashFixture(qstashToken, hostedWakeURL, currentSigningKey);
+    runtime.qstash = qstash.server;
+    process.env.DATABASE_URL = databaseRoles.ordinaryURL;
+    process.env.GUSTAVO_E2E_ADMIN_DATABASE_URL = adminDatabaseURL;
+    process.env.GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL = databaseRoles.materializerURL;
     process.env.GUSTAVO_APP_ORIGIN = baseURL;
     process.env.GUSTAVO_E2E_BASE_URL = baseURL;
     process.env.GUSTAVO_TEST_FIXTURES_ENABLED = "true";
@@ -672,24 +1136,34 @@ export default async function globalSetup(config: FullConfig): Promise<() => Pro
     process.env.GUSTAVO_EVENT_ROOT_KEY_V1 = randomBytes(32).toString("base64");
     process.env.GUSTAVO_CURSOR_SIGNING_KEY = randomBytes(32).toString("base64");
     process.env.GUSTAVO_OPERATOR_HEALTH_TOKEN = randomBytes(32).toString("base64url");
+    process.env.GUSTAVO_HYBRID_BRIDGE_ENABLED = "true";
+    process.env.GUSTAVO_HYBRID_WAKE_URL = hostedWakeURL;
+    process.env.QSTASH_URL = qstash.url;
+    process.env.QSTASH_TOKEN = qstashToken;
+    process.env.QSTASH_CURRENT_SIGNING_KEY = currentSigningKey;
+    process.env.QSTASH_NEXT_SIGNING_KEY = nextSigningKey;
 
     let serverOutput = "";
     const nextBin = join(process.cwd(), "node_modules", "next", "dist", "bin", "next");
     // This harness always owns a new server. It never reuses an existing process.
     await assertLoopbackPortAvailable(webPort);
-    runtime.web = spawn(process.execPath, [nextBin, "dev", "--hostname", "127.0.0.1", "--port", String(webPort)], {
+    const webEnvironment: NodeJS.ProcessEnv = { ...process.env, NODE_ENV: "development" };
+    delete webEnvironment.GUSTAVO_E2E_ADMIN_DATABASE_URL;
+    delete webEnvironment.GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL;
+    const web = spawn(process.execPath, [nextBin, "dev", "--hostname", "127.0.0.1", "--port", String(webPort)], {
       cwd: process.cwd(),
-      env: { ...process.env, NODE_ENV: "development" },
+      env: webEnvironment,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
+    runtime.web = web;
     const capture = (chunk: Buffer): void => {
       serverOutput = `${serverOutput}${chunk.toString("utf8")}`.slice(-16_384);
     };
-    runtime.web.stdout?.on("data", capture);
-    runtime.web.stderr?.on("data", capture);
+    web.stdout?.on("data", capture);
+    web.stderr?.on("data", capture);
     process.stderr.write("[e2e setup] waiting for Next\n");
-    await waitForWeb(baseURL, runtime.web, () => serverOutput);
+    await waitForWeb(baseURL, web, () => serverOutput);
     process.stderr.write("[e2e setup] Next is ready\n");
     const owned = runtime as E2eRuntime;
     return async () => cleanup(owned);
@@ -705,6 +1179,523 @@ function databaseURL(): string {
   const value = process.env.DATABASE_URL;
   if (!value) throw new Error("E2E_DATABASE_URL_REQUIRED");
   return value;
+}
+
+async function qstashFixtureFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(`${qstashFixtureURL()}${path}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${qstashFixtureToken()}`,
+      ...init.headers,
+    },
+    signal: AbortSignal.timeout(5_000),
+  });
+}
+
+export async function assertHostedWakePublished(): Promise<HostedWakePublication> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const response = await qstashFixtureFetch("/_e2e/publications/next");
+    if (response.status === 200) {
+      const value: unknown = await response.json();
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("E2E_HOSTED_WAKE_PUBLICATION_INVALID");
+      }
+      const publication = value as Record<string, unknown>;
+      if (publication.accepted !== true || publication.bodyKind !== "JOB"
+          || publication.destinationVariable !== "GUSTAVO_HYBRID_WAKE_URL"
+          || typeof publication.jobId !== "string"
+          || typeof publication.url !== "string") {
+        throw new Error("E2E_HOSTED_WAKE_PUBLICATION_INVALID");
+      }
+      return Object.freeze(publication as unknown as HostedWakePublication);
+    }
+    if (response.status !== 404) throw new Error("E2E_HOSTED_WAKE_PUBLICATION_FAILED");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  throw new Error("E2E_HOSTED_WAKE_PUBLICATION_TIMEOUT");
+}
+
+export async function assertMarketScheduleBody(): Promise<{
+  readonly bodyKind: "MARKET_CURRENT";
+  readonly scheduleCount: 2;
+  readonly hasHostedRelay: boolean;
+  readonly maintenanceScheduleExact: true;
+  readonly marketScheduleExact: true;
+  readonly relayCheckSource: "SCHEDULE_INVENTORY";
+  readonly marketScheduleId: "gustavo-market-current-v1";
+  readonly fixtureOwnsSignedDelivery: true;
+}> {
+  const response = await qstashFixtureFetch("/_e2e/schedules");
+  if (!response.ok) throw new Error("E2E_QSTASH_SCHEDULES_UNAVAILABLE");
+  const value = await response.json() as {
+    readonly schedules?: readonly {
+      readonly id?: unknown;
+      readonly body?: unknown;
+      readonly cron?: unknown;
+      readonly destination?: unknown;
+      readonly method?: unknown;
+    }[];
+  };
+  const schedules = value.schedules;
+  const maintenance = schedules?.find(({ id }) => id === "gustavo-hosted-maintenance-v1");
+  const market = schedules?.find(({ id }) => id === "gustavo-market-current-v1");
+  const maintenanceScheduleExact = maintenance !== undefined && schedules?.[0] === maintenance
+    && maintenance.cron === "*/15 * * * *" && maintenance.method === "POST"
+    && maintenance.destination === "https://gustavo.lol/api/internal/maintenance"
+    && JSON.stringify(maintenance.body) === JSON.stringify({ operation: "maintenance" });
+  const marketScheduleExact = market !== undefined && schedules?.[1] === market
+    && market.cron === "*/5 * * * *" && market.method === "POST"
+    && market.destination === process.env.GUSTAVO_HYBRID_WAKE_URL
+    && JSON.stringify(market.body) === JSON.stringify({ kind: "MARKET_CURRENT" });
+  const expectedDestinations = new Map<string, unknown>([
+    ["gustavo-hosted-maintenance-v1", "https://gustavo.lol/api/internal/maintenance"],
+    ["gustavo-market-current-v1", process.env.GUSTAVO_HYBRID_WAKE_URL],
+  ]);
+  const hasHostedRelay = schedules?.some(({ id, destination }) => (
+    typeof id !== "string" || !expectedDestinations.has(id)
+      || expectedDestinations.get(id) !== destination
+  )) ?? true;
+  if (schedules?.length !== 2 || !maintenanceScheduleExact || !marketScheduleExact
+      || hasHostedRelay) {
+    throw new Error("E2E_QSTASH_SCHEDULES_INVALID");
+  }
+  return Object.freeze({
+    bodyKind: "MARKET_CURRENT",
+    scheduleCount: 2,
+    hasHostedRelay,
+    maintenanceScheduleExact: true,
+    marketScheduleExact: true,
+    relayCheckSource: "SCHEDULE_INVENTORY",
+    marketScheduleId: "gustavo-market-current-v1",
+    fixtureOwnsSignedDelivery: true,
+  });
+}
+
+export async function deliverMarketSchedule(port: number): Promise<number> {
+  const response = await qstashFixtureFetch(
+    "/_e2e/schedules/gustavo-market-current-v1/deliver",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ port }),
+    },
+  );
+  if (response.status === 409) throw new Error("E2E_MARKET_SCHEDULE_PAUSED");
+  if (!response.ok) throw new Error("E2E_MARKET_SCHEDULE_DELIVERY_FAILED");
+  const value: unknown = await response.json();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("E2E_MARKET_SCHEDULE_DELIVERY_INVALID");
+  }
+  const delivery = value as Record<string, unknown>;
+  if (delivery.bodyKind !== "MARKET_CURRENT"
+      || delivery.scheduleId !== "gustavo-market-current-v1"
+      || delivery.status !== 202) {
+    throw new Error("E2E_MARKET_SCHEDULE_DELIVERY_INVALID");
+  }
+  return 202;
+}
+
+export async function pauseMarketSchedule(): Promise<{ readonly schedulePaused: true }> {
+  const response = await qstashFixtureFetch(
+    "/_e2e/schedules/gustavo-market-current-v1/pause",
+    { method: "POST" },
+  );
+  if (!response.ok) throw new Error("E2E_MARKET_SCHEDULE_PAUSE_FAILED");
+  const value: unknown = await response.json();
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || (value as { readonly schedulePaused?: unknown }).schedulePaused !== true) {
+    throw new Error("E2E_MARKET_SCHEDULE_PAUSE_INVALID");
+  }
+  return Object.freeze({ schedulePaused: true });
+}
+
+export async function assertFreshHybridInventory(): Promise<{
+  readonly accounts: 0;
+  readonly conversations: 0;
+  readonly bridgeJobs: 0;
+  readonly latestQuotes: 0;
+}> {
+  const pool = new Pool({ connectionString: databaseURL(), max: 1 });
+  try {
+    const rows = await pool.query<{
+      readonly accounts: number;
+      readonly conversations: number;
+      readonly bridge_jobs: number;
+      readonly latest_quotes: number;
+    }>(`select
+      (select count(*)::int from accounts) accounts,
+      (select count(*)::int from conversations) conversations,
+      (select count(*)::int from bridge_model_jobs) bridge_jobs,
+      (select count(*)::int from market_latest_quotes) latest_quotes`);
+    const row = rows.rows[0];
+    if (!row || row.accounts !== 0 || row.conversations !== 0
+        || row.bridge_jobs !== 0 || row.latest_quotes !== 0) {
+      throw new Error("E2E_FRESH_HYBRID_INVENTORY_NOT_EMPTY");
+    }
+    return Object.freeze({
+      accounts: 0,
+      conversations: 0,
+      bridgeJobs: 0,
+      latestQuotes: 0,
+    });
+  } finally {
+    await pool.end();
+  }
+}
+
+interface MarketMaterializerIsolationOptions {
+  readonly poolFactory?: (
+    kind: "admin" | "materializer" | "ordinary",
+    connectionString: string,
+  ) => Pool;
+}
+
+export async function assertMarketMaterializerIsolation(
+  options: MarketMaterializerIsolationOptions = {},
+): Promise<{
+  readonly materializerAccepted: true;
+  readonly materializerProductionPathCleaned: true;
+  readonly materializerProductionPathCommitted: true;
+  readonly materializerProductionPathVerified: true;
+  readonly ordinaryForgeryRejected: true;
+  readonly ordinaryMatchingInsertAttempted: true;
+  readonly ordinaryMatchingInsertRejected: true;
+}> {
+  const urls = hybridE2eDatabaseURLs();
+  const poolFactory = options.poolFactory ?? ((_kind: "admin" | "materializer" | "ordinary",
+    connectionString: string) => new Pool({ connectionString, max: 1 }));
+  const ordinary = poolFactory("ordinary", urls.ordinary);
+  const materializer = poolFactory("materializer", urls.materializer);
+  const admin = poolFactory("admin", urls.admin);
+  const probeAccountId = randomUUID();
+  let probeWindowId: string | undefined;
+  let probeMayOwnGlobalAuthorities = false;
+  let materializerProductionPathCommitted = false;
+  let materializerProductionPathVerified = false;
+  let primaryFailure: unknown;
+  try {
+    const operationFailures: unknown[] = [];
+    try {
+    const ordinaryResult = await ordinary.query<{
+      readonly member: boolean;
+      readonly can_insert: boolean;
+    }>(`select
+      pg_has_role(current_user,'gustavo_market_materializer','MEMBER') member,
+      has_table_privilege(current_user,'market_observation_consumptions','INSERT') can_insert`);
+    let ordinaryMatchingInsertRejected = false;
+    const ordinaryClient = await ordinary.connect();
+    try {
+      await ordinaryClient.query("begin");
+      const digest = "a".repeat(64);
+      await ordinaryClient.query(
+        `insert into market_observation_consumptions(
+           command_event_id,account_id,symbol,latest_context_digest,
+           command_body_digest,observation_id,latest_window_id,latest_data_key_id,
+           latest_source_observed_at,latest_received_at,request_digest
+         ) values ($1,$2,'AAPL',$3,$3,$4,'2026-08-14T12:00Z',$5,
+                   timestamptz '2026-08-14 12:00:00+00',
+                   timestamptz '2026-08-14 12:00:01+00',$3)`,
+        [randomUUID(), randomUUID(), digest, randomUUID(), randomUUID()],
+      );
+    } catch (error) {
+      ordinaryMatchingInsertRejected = error instanceof Error
+        && "code" in error && (error as Error & { readonly code?: unknown }).code === "42501";
+    } finally {
+      await ordinaryClient.query("rollback").catch(() => undefined);
+      ordinaryClient.release();
+    }
+    const materializerResult = await materializer.query<{
+      readonly current_user_name: string;
+      readonly member: boolean;
+      readonly login: boolean;
+      readonly inherit: boolean;
+      readonly superuser: boolean;
+      readonly createdb: boolean;
+      readonly createrole: boolean;
+      readonly replication: boolean;
+      readonly bypassrls: boolean;
+      readonly permission_login: boolean;
+      readonly permission_inherit: boolean;
+      readonly permission_superuser: boolean;
+      readonly permission_createdb: boolean;
+      readonly permission_createrole: boolean;
+      readonly permission_replication: boolean;
+      readonly permission_bypassrls: boolean;
+      readonly login_other_memberships: number;
+      readonly permission_other_memberships: number;
+      readonly permission_member_count: number;
+    }>(`select current_user current_user_name,
+      pg_has_role(current_user,'gustavo_market_materializer','MEMBER') member,
+      login.rolcanlogin login,login.rolinherit inherit,login.rolsuper superuser,
+      login.rolcreatedb createdb,login.rolcreaterole createrole,
+      login.rolreplication replication,login.rolbypassrls bypassrls,
+      permission.rolcanlogin permission_login,
+      permission.rolinherit permission_inherit,
+      permission.rolsuper permission_superuser,
+      permission.rolcreatedb permission_createdb,
+      permission.rolcreaterole permission_createrole,
+      permission.rolreplication permission_replication,
+      permission.rolbypassrls permission_bypassrls,
+      (select count(*)::int from pg_auth_members membership
+        join pg_roles granted on granted.oid=membership.roleid
+       where membership.member=login.oid
+         and granted.rolname<>'gustavo_market_materializer') login_other_memberships,
+      (select count(*)::int from pg_auth_members membership
+       where membership.member=permission.oid) permission_other_memberships,
+      (select count(*)::int from pg_auth_members membership
+       where membership.roleid=permission.oid) permission_member_count
+      from pg_roles login cross join pg_roles permission
+      where login.rolname=current_user
+        and permission.rolname='gustavo_market_materializer'`);
+    const ordinaryRow = ordinaryResult.rows[0];
+    const row = materializerResult.rows[0];
+    const materializerAccepted = row !== undefined
+      && ordinaryRow?.member === false
+      && row.current_user_name !== "gustavo_market_materializer"
+      && row.member === true && row.login === true && row.inherit === true
+      && row.superuser === false && row.createdb === false && row.createrole === false
+      && row.replication === false && row.bypassrls === false
+      && row.login_other_memberships === 0
+      && row.permission_login === false && row.permission_inherit === false
+      && row.permission_superuser === false && row.permission_createdb === false
+      && row.permission_createrole === false && row.permission_replication === false
+      && row.permission_bypassrls === false && row.permission_other_memberships === 0
+      && row.permission_member_count === 1;
+
+    const ordinaryDatabase = databaseFromPool(ordinary);
+    const materializerDatabase = databaseFromPool(materializer);
+    const roleBoundMaterializer: EventDatabase = Object.freeze({
+      query: <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        parameters?: readonly unknown[],
+      ) => materializerDatabase.query<Row>(sql, parameters),
+      one: <Row extends Record<string, unknown> = Record<string, unknown>>(
+        sql: string,
+        parameters?: readonly unknown[],
+      ) => materializerDatabase.one<Row>(sql, parameters),
+      transaction: <Result>(work: (transaction: EventDatabase) => Promise<Result>) => (
+        materializerDatabase.transaction(async (transaction) => {
+          await transaction.query("set local role gustavo_market_materializer");
+          return work(transaction);
+        })
+      ),
+    });
+    const globalAuthorityBefore = await admin.query<{
+      readonly instrument_count: number;
+      readonly source_count: number;
+    }>(`select
+      (select count(*)::int from market_instrument_allowlist
+        where symbol='AAPL') instrument_count,
+      (select count(*)::int from market_data_sources
+        where provider='finnhub' and license_id='finnhub-free-personal') source_count`);
+    if (globalAuthorityBefore.rows[0]?.instrument_count !== 0
+        || globalAuthorityBefore.rows[0]?.source_count !== 0) {
+      throw new Error("E2E_MARKET_MATERIALIZER_GLOBAL_AUTHORITY_PREEXISTED");
+    }
+    const window = await admin.query<{
+      readonly window_id: string;
+      readonly window_started_at: Date;
+    }>(`select
+      to_char(window_started_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI"Z"') window_id,
+      window_started_at
+      from (select date_bin(
+        interval '5 minutes',clock_timestamp(),timestamptz '1970-01-01 00:00:00+00'
+      ) window_started_at) current_window`);
+    const exactWindow = window.rows[0];
+    if (!exactWindow) throw new Error("E2E_MARKET_MATERIALIZER_WINDOW_MISSING");
+    probeWindowId = exactWindow.window_id;
+    const observedAt = new Date(exactWindow.window_started_at.getTime() + 1_000).toISOString();
+    const setup = await admin.connect();
+    try {
+      await setup.query("begin");
+      await setup.query(
+        "insert into accounts(id,display_name,created_at) values ($1,'Materializer probe',clock_timestamp())",
+        [probeAccountId],
+      );
+      await setup.query(
+        `insert into entitlements(id,account_id,active_from,created_at)
+         values ($1,$2,clock_timestamp()-interval '1 second',clock_timestamp())`,
+        [randomUUID(), probeAccountId],
+      );
+      await setup.query("commit");
+    } catch (error) {
+      await setup.query("rollback").catch(() => undefined);
+      throw error;
+    } finally {
+      setup.release();
+    }
+    await storeLatestMarketWindow({ db: ordinaryDatabase, accountId: probeAccountId }, {
+      windowId: probeWindowId,
+      receivedAt: observedAt,
+      items: [Object.freeze({
+        symbol: "AAPL",
+        kind: "STOCK" as const,
+        status: "SUCCESS" as const,
+        price: "813.42",
+        sourceObservedAt: observedAt,
+        safeCode: null,
+      })],
+    });
+    const [latest] = await loadLatestMarket(
+      { db: ordinaryDatabase, accountId: probeAccountId },
+      ["AAPL"],
+    );
+    if (!latest) throw new Error("E2E_MARKET_MATERIALIZER_LATEST_MISSING");
+    const commandBody = Object.freeze({
+      symbol: "AAPL",
+      latestContextDigest: latest.latestContextDigest,
+    });
+    const commandBodyDigest = canonicalContentDigest(commandBody);
+    const command = await appendEvent(ordinaryDatabase, {
+      aggregateId: `market-latest:${probeAccountId}`,
+      accountId: probeAccountId,
+      actor: { type: "SYSTEM", id: "gustavo-decision-orchestrator" },
+      type: "market.observation.consumption.requested",
+      visibility: "PRIVATE_ACCOUNT",
+      body: commandBody,
+      idempotencyKey: `market-consumption-command:e2e-positive:${commandBodyDigest}`,
+      policyVersion: "decision-window-policy-v1",
+    });
+    probeMayOwnGlobalAuthorities = true;
+    const materialized = await materializeMarketObservation({
+      db: roleBoundMaterializer,
+      accountId: probeAccountId,
+    }, { commandEventId: command.id });
+    materializerProductionPathCommitted = true;
+    const committed = await ordinary.query<{
+      readonly binding_count: number;
+      readonly observation_count: number;
+    }>(`select
+      (select count(*)::int from market_observation_consumptions
+        where command_event_id=$1 and account_id=$2 and observation_id=$3) binding_count,
+      (select count(*)::int from market_observations
+        where id=$3 and account_id=$2 and decision_command_event_id=$1) observation_count`,
+    [command.id, probeAccountId, materialized.observationId]);
+    materializerProductionPathVerified = committed.rows[0]?.binding_count === 1
+      && committed.rows[0]?.observation_count === 1;
+    if (!materializerAccepted || ordinaryRow?.can_insert !== false
+        || !ordinaryMatchingInsertRejected || !materializerProductionPathCommitted
+        || !materializerProductionPathVerified) {
+      throw new Error("E2E_MARKET_MATERIALIZER_ISOLATION_INVALID");
+    }
+    } catch (error) {
+      operationFailures.push(error);
+    }
+    try {
+      const cleanup = await admin.connect();
+    try {
+      await cleanup.query("begin");
+      await cleanup.query("set local session_replication_role=replica");
+      await cleanup.query(
+        "delete from market_observation_consumptions where account_id=$1",
+        [probeAccountId],
+      );
+      await cleanup.query("delete from market_observations where account_id=$1", [probeAccountId]);
+      if (probeMayOwnGlobalAuthorities) {
+        await cleanup.query(
+          `delete from market_data_sources
+            where provider='finnhub' and license_id='finnhub-free-personal'
+              and licensed=true and redistribution='ACCOUNT_ONLY'`,
+        );
+        await cleanup.query(
+          `delete from market_instrument_allowlist
+            where symbol='AAPL' and asset_class='US_STOCK' and enabled=true`,
+        );
+      }
+      await cleanup.query(
+        `delete from encrypted_event_bodies
+          where event_id in (select id from events where account_id=$1::text)`,
+        [probeAccountId],
+      );
+      await cleanup.query(
+        `delete from transactional_outbox
+          where event_id in (select id from events where account_id=$1::text)`,
+        [probeAccountId],
+      );
+      await cleanup.query("delete from events where account_id=$1::text", [probeAccountId]);
+      await cleanup.query("delete from market_latest_quotes where account_id=$1", [probeAccountId]);
+      await cleanup.query("delete from aggregate_data_keys where aggregate_id=$1", [
+        `market-latest:${probeAccountId}`,
+      ]);
+      await cleanup.query("delete from entitlements where account_id=$1", [probeAccountId]);
+      await cleanup.query("delete from accounts where id=$1", [probeAccountId]);
+      if (probeWindowId) {
+        await cleanup.query(
+          `delete from market_poll_windows where window_id=$1
+            and not exists (select 1 from market_latest_quotes where window_id=$1)`,
+          [probeWindowId],
+        );
+      }
+      await cleanup.query("commit");
+    } catch (error) {
+      await cleanup.query("rollback").catch(() => undefined);
+      throw error;
+    } finally {
+      cleanup.release();
+    }
+    } catch (error) {
+      operationFailures.push(error);
+    }
+    let materializerProductionPathCleaned = false;
+    try {
+      const residue = await admin.query<{ readonly count: number }>(
+        `select (
+          (select count(*) from accounts where id=$1)
+          +(select count(*) from events where account_id=$1::text)
+          +(select count(*) from market_latest_quotes where account_id=$1)
+          +(select count(*) from market_observation_consumptions where account_id=$1)
+          +(select count(*) from market_observations where account_id=$1)
+          +(select count(*) from market_instrument_allowlist
+            where symbol='AAPL' and asset_class='US_STOCK' and enabled=true)
+          +(select count(*) from market_data_sources
+            where provider='finnhub' and license_id='finnhub-free-personal'
+              and licensed=true and redistribution='ACCOUNT_ONLY')
+        )::int count`,
+        [probeAccountId],
+      );
+      materializerProductionPathCleaned = residue.rows[0]?.count === 0;
+      if (!materializerProductionPathCleaned) {
+        throw new Error("E2E_MARKET_MATERIALIZER_CLEANUP_INVALID");
+      }
+    } catch (error) {
+      operationFailures.push(error);
+    }
+    if (operationFailures.length === 1) throw operationFailures[0];
+    if (operationFailures.length > 1) {
+      throw new AggregateError(operationFailures, "E2E_MARKET_MATERIALIZER_OPERATION_FAILED");
+    }
+    return Object.freeze({
+      materializerAccepted: true,
+      materializerProductionPathCleaned: true,
+      materializerProductionPathCommitted: true,
+      materializerProductionPathVerified: true,
+      ordinaryForgeryRejected: true,
+      ordinaryMatchingInsertAttempted: true,
+      ordinaryMatchingInsertRejected: true,
+    });
+  } catch (error) {
+    primaryFailure = error;
+    throw error;
+  } finally {
+    const settlements = await Promise.allSettled([
+      ordinary.end(),
+      materializer.end(),
+      admin.end(),
+    ]);
+    const settlementFailures = settlements.flatMap((settlement) => (
+      settlement.status === "rejected" ? [settlement.reason] : []
+    ));
+    if (settlementFailures.length > 0) {
+      const priorFailures = primaryFailure instanceof AggregateError
+        ? primaryFailure.errors
+        : primaryFailure === undefined ? [] : [primaryFailure];
+      throw new AggregateError(
+        [...priorFailures, ...settlementFailures],
+        "E2E_MARKET_MATERIALIZER_SETTLEMENT_FAILED",
+      );
+    }
+  }
 }
 
 function backupDatabaseURL(): string {
@@ -753,6 +1744,78 @@ export function operatorHealthToken(): string {
   const token = process.env.GUSTAVO_OPERATOR_HEALTH_TOKEN;
   if (!token || token.length < 32) throw new Error("E2E_OPERATOR_HEALTH_TOKEN_REQUIRED");
   return token;
+}
+
+export async function readOperatorHybridHealth(): Promise<{
+  readonly codex: {
+    readonly status: "OFFLINE" | "DEGRADED";
+    readonly safeCode: "WORKER_OFFLINE" | "QUOTA_EXHAUSTED";
+    readonly leaseFresh: boolean;
+  };
+  readonly codexQuota: { readonly used: number; readonly limit: 100; readonly exhausted: boolean };
+}> {
+  const response = await fetch(`${e2eBaseURL()}/api/operator/health`, {
+    headers: { authorization: `Bearer ${operatorHealthToken()}` },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error("E2E_OPERATOR_HEALTH_UNAVAILABLE");
+  const value: unknown = await response.json();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("E2E_OPERATOR_HEALTH_INVALID");
+  }
+  const hybrid = (value as { readonly hybrid?: unknown }).hybrid;
+  if (!hybrid || typeof hybrid !== "object" || Array.isArray(hybrid)) {
+    throw new Error("E2E_OPERATOR_HEALTH_INVALID");
+  }
+  const components = (hybrid as { readonly components?: unknown }).components;
+  const quotas = (hybrid as { readonly quotas?: unknown }).quotas;
+  if (!Array.isArray(components) || !Array.isArray(quotas)) {
+    throw new Error("E2E_OPERATOR_HEALTH_INVALID");
+  }
+  const rawCodex: unknown = components.find((item) => item && typeof item === "object"
+    && !Array.isArray(item) && (item as { readonly component?: unknown }).component === "CODEX");
+  const rawQuota: unknown = quotas.find((item) => item && typeof item === "object"
+    && !Array.isArray(item) && (item as { readonly name?: unknown }).name === "CODEX_JOBS");
+  const codex = rawCodex as Record<string, unknown> | undefined;
+  const quota = rawQuota as Record<string, unknown> | undefined;
+  const validStatus = codex?.status === "OFFLINE" || codex?.status === "DEGRADED";
+  const validCode = codex?.safeCode === "WORKER_OFFLINE"
+    || codex?.safeCode === "QUOTA_EXHAUSTED";
+  if (!validStatus || !validCode || typeof codex.ageSeconds !== "number"
+      || !Number.isInteger(quota?.used) || quota?.limit !== 100
+      || typeof quota.exhausted !== "boolean") {
+    throw new Error("E2E_OPERATOR_HEALTH_INVALID");
+  }
+  return Object.freeze({
+    codex: Object.freeze({
+      status: codex.status as "OFFLINE" | "DEGRADED",
+      safeCode: codex.safeCode as "WORKER_OFFLINE" | "QUOTA_EXHAUSTED",
+      leaseFresh: codex.ageSeconds < 12 * 60,
+    }),
+    codexQuota: Object.freeze({
+      used: quota.used as number,
+      limit: 100,
+      exhausted: quota.exhausted as boolean,
+    }),
+  });
+}
+
+export function assertNoPublicLeakage(
+  captured: string,
+  forbidden: readonly { readonly label: string; readonly value: string }[],
+): true {
+  if (typeof captured !== "string" || captured.length === 0 || forbidden.length === 0) {
+    throw new Error("E2E_PUBLIC_LEAKAGE_CAPTURE_INVALID");
+  }
+  for (const entry of forbidden) {
+    if (!/^[a-z0-9-]+$/u.test(entry.label) || entry.value.length === 0) {
+      throw new Error("E2E_PUBLIC_LEAKAGE_ENTRY_INVALID");
+    }
+    if (captured.includes(entry.value)) {
+      throw new Error(`E2E_PUBLIC_LEAK:${entry.label}`);
+    }
+  }
+  return true;
 }
 
 export async function createVerifiedBackup(): Promise<VerifiedBackupFixture> {
@@ -855,6 +1918,13 @@ function assertValkeyContainerName(name: string): void {
   }
 }
 
+function assertCodexContainerName(name: string): void {
+  if (!new RegExp(`^${E2E_CODEX_CONTAINER_PREFIX}[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$`, "u")
+    .test(name)) {
+    throw new Error("UNSAFE_E2E_CODEX_CONTAINER");
+  }
+}
+
 async function docker(arguments_: readonly string[]): Promise<string> {
   const { stdout } = await execFileAsync("docker", [...arguments_], {
     cwd: process.cwd(),
@@ -863,6 +1933,52 @@ async function docker(arguments_: readonly string[]): Promise<string> {
     maxBuffer: 4 * 1024 * 1024,
   });
   return stdout.trim();
+}
+
+async function removeCodexContainer(
+  name: string,
+  registry: string,
+  invokeDocker: DockerInvocation = docker,
+): Promise<void> {
+  assertCodexContainerName(name);
+  assertSafeOwnershipRegistry(registry);
+  const registryId = resolve(registry).split(/[\\/]/u).at(-1)!;
+  let labels: string;
+  try {
+    labels = await invokeDocker([
+      "container", "inspect", "--format",
+      `{{ index .Config.Labels "${E2E_CODEX_OWNER_LABEL}" }}|{{ index .Config.Labels "com.gustavo.codex-runner" }}`,
+      name,
+    ]);
+  } catch (error) {
+    if (exactNoSuchContainer(error, name)) return;
+    throw error;
+  }
+  if (labels.trim() !== `${registryId}|v1`) {
+    throw new Error("E2E_CODEX_CONTAINER_OWNERSHIP_LABEL_INVALID");
+  }
+  await invokeDocker(["rm", "--force", name]);
+}
+
+export async function registerOwnedCodexContainer(name: string): Promise<string> {
+  assertCodexContainerName(name);
+  return registerFixtureOwnership(currentOwnershipRegistry(), {
+    kind: "CONTAINER",
+    value: name,
+  });
+}
+
+export async function cleanupOwnedCodexContainer(
+  name: string,
+  ownershipRecord: string,
+): Promise<void> {
+  const registry = resolve(ownershipRecord, "..");
+  await removeCodexContainer(name, registry);
+  await unregisterFixtureOwnership(ownershipRecord, registry);
+}
+
+export function currentFixtureOwnershipId(): string {
+  return resolve(currentOwnershipRegistry()).split(/[\\/]/u).at(-1)!;
 }
 
 interface OwnedValkeyContainer {
