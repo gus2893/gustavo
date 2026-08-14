@@ -241,10 +241,62 @@ function snapshotProviderUsage(
   ) {
     throw modelExecutionError(invalidCode);
   }
+  const providerMetering = readProviderProperty(rawUsage, "providerMetering");
+  let meteringSnapshot: ModelProviderUsage["providerMetering"];
+  if (providerMetering !== undefined) {
+    const status = readProviderProperty(providerMetering, "status");
+    let keys: string[];
+    try {
+      keys = Object.keys(providerMetering as object).sort();
+    } catch {
+      throw modelExecutionError(invalidCode);
+    }
+    if (status === "UNKNOWN") {
+      if (keys.length !== 1 || keys[0] !== "status") {
+        throw modelExecutionError(invalidCode);
+      }
+      meteringSnapshot = Object.freeze({ status });
+    } else if (status === "REPORTED") {
+      const reportedInputTokens = readProviderProperty(
+        providerMetering,
+        "inputTokens",
+      );
+      const reportedOutputTokens = readProviderProperty(
+        providerMetering,
+        "outputTokens",
+      );
+      if (
+        keys.length !== 3
+        || keys[0] !== "inputTokens"
+        || keys[1] !== "outputTokens"
+        || keys[2] !== "status"
+        || typeof reportedInputTokens !== "number"
+        || !Number.isSafeInteger(reportedInputTokens)
+        || reportedInputTokens < 0
+        || reportedInputTokens > POSTGRES_INT_MAX
+        || typeof reportedOutputTokens !== "number"
+        || !Number.isSafeInteger(reportedOutputTokens)
+        || reportedOutputTokens < 0
+        || reportedOutputTokens > POSTGRES_INT_MAX
+      ) {
+        throw modelExecutionError(invalidCode);
+      }
+      meteringSnapshot = Object.freeze({
+        status,
+        inputTokens: reportedInputTokens,
+        outputTokens: reportedOutputTokens,
+      });
+    } else {
+      throw modelExecutionError(invalidCode);
+    }
+  }
   return Object.freeze({
     inputTokens,
     outputTokens,
     estimatedCostMicrousd,
+    ...(meteringSnapshot === undefined
+      ? {}
+      : { providerMetering: meteringSnapshot }),
   });
 }
 

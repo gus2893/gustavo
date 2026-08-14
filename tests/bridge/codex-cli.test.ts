@@ -4,6 +4,7 @@ import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createCodexCliProvider } from "../../lib/server/models/codex-cli";
 import {
   isCodexContainerLaunchLocked,
   reconcileCodexContainers as reconcileProduction,
@@ -210,6 +211,270 @@ afterEach(async () => {
   await clearLaunchLock();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+});
+
+describe("Codex model provider", () => {
+  it("maps one bounded role request and never exposes a paid fallback", async () => {
+    const run = vi.fn().mockResolvedValue({ response: "Node answer" });
+    const provider = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      run,
+    });
+
+    const events = [];
+    for await (const event of provider.stream({
+      role: "NODE",
+      modelId: "gpt-5.6-sol",
+      input: "encrypted-source prompt after authorized load",
+      maxOutputTokens: 800,
+    })) events.push(event);
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      role: "NODE",
+      prompt: "encrypted-source prompt after authorized load",
+      model: "gpt-5.6-sol",
+      timeoutMs: 90_000,
+    }));
+    expect(events).toEqual([
+      { type: "DELTA", text: "Node answer", outputTokens: 11 },
+      {
+        type: "COMPLETED",
+        usage: {
+          inputTokens: 45,
+          outputTokens: 11,
+          estimatedCostMicrousd: 0n,
+          providerMetering: { status: "UNKNOWN" },
+        },
+      },
+    ]);
+    expect(provider.providerId).toBe("codex-cli");
+    expect(provider).not.toHaveProperty("fallback");
+  });
+
+  it("preserves bounded runner-reported usage separately from zero-cost observed counts", async () => {
+    const provider = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      run: vi.fn().mockResolvedValue({
+        response: "reported answer",
+        usage: { inputTokens: 77, outputTokens: 9 },
+      }),
+    });
+
+    const events = [];
+    for await (const event of provider.stream({
+      role: "EVALUATOR",
+      modelId: "gpt-5.6-sol",
+      input: "observed input",
+      maxOutputTokens: 20,
+    })) events.push(event);
+
+    expect(events.at(-1)).toEqual({
+      type: "COMPLETED",
+      usage: {
+        inputTokens: 14,
+        outputTokens: 15,
+        estimatedCostMicrousd: 0n,
+        providerMetering: {
+          status: "REPORTED",
+          inputTokens: 77,
+          outputTokens: 9,
+        },
+      },
+    });
+  });
+
+  it.each([
+    ["NODE", 90_000],
+    ["EVALUATOR", 180_000],
+    ["MAIN", 300_000],
+  ] as const)("uses the fixed %s deadline", async (role, timeoutMs) => {
+    const run = vi.fn().mockResolvedValue({ response: "ok" });
+    const provider = createCodexCliProvider({ model: "gpt-5.6-sol", run });
+
+    for await (const _event of provider.stream({
+      role,
+      modelId: "gpt-5.6-sol",
+      input: "prompt",
+      maxOutputTokens: 2,
+    })) {
+      // Drain the adapter so the runner call and completion are observed.
+    }
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ role, timeoutMs }));
+  });
+
+  it("rejects the wrong model and an over-limit response before yielding output", async () => {
+    const wrongModelRun = vi.fn().mockResolvedValue({ response: "unused" });
+    const provider = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      run: wrongModelRun,
+    });
+    const wrongModel = provider.stream({
+      role: "NODE",
+      modelId: "another-model",
+      input: "prompt",
+      maxOutputTokens: 10,
+    })[Symbol.asyncIterator]();
+    await expect(wrongModel.next()).rejects.toThrow("PROVIDER_REQUEST_INVALID");
+    expect(wrongModelRun).not.toHaveBeenCalled();
+
+    const overLimitRun = vi.fn().mockResolvedValue({ response: "two tokens" });
+    const bounded = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      run: overLimitRun,
+    }).stream({
+      role: "MAIN",
+      modelId: "gpt-5.6-sol",
+      input: "prompt",
+      maxOutputTokens: 1,
+    })[Symbol.asyncIterator]();
+    await expect(bounded.next()).rejects.toThrow("PROVIDER_REQUEST_INVALID");
+  });
+
+  it("rejects an unsupported runtime role before invoking the local runner", async () => {
+    const run = vi.fn().mockResolvedValue({ response: "unused" });
+    const provider = createCodexCliProvider({ model: "gpt-5.6-sol", run });
+    const iterator = provider.stream({
+      role: "ADMIN" as "NODE",
+      modelId: "gpt-5.6-sol",
+      input: "prompt",
+      maxOutputTokens: 10,
+    })[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).rejects.toThrow("PROVIDER_REQUEST_INVALID");
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("uses conservative allocation-bounded UTF-8 counts for every model bound", () => {
+    const provider = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      run: vi.fn().mockResolvedValue({ response: "unused" }),
+    });
+
+    expect(provider.countInputTokens("")).toBe(0);
+    expect(provider.countInputTokens(" \t\n")).toBe(3);
+    expect(provider.countInputTokens("你好")).toBe(6);
+    expect(provider.countInputTokens("a,b!")).toBe(4);
+    expect(provider.countInputTokens("x".repeat(65_536))).toBe(65_536);
+    expect(provider.estimateUsage("你好", "a,b!", "gpt-5.6-sol")).toEqual({
+      inputTokens: 6,
+      outputTokens: 4,
+      estimatedCostMicrousd: 0n,
+      providerMetering: { status: "UNKNOWN" },
+    });
+  });
+
+  it("rejects conservative CJK output overflow before yielding a delta", async () => {
+    const provider = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      run: vi.fn().mockResolvedValue({ response: "你好" }),
+    });
+    const iterator = provider.stream({
+      role: "NODE",
+      modelId: "gpt-5.6-sol",
+      input: "prompt",
+      maxOutputTokens: 5,
+    })[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).rejects.toThrow("PROVIDER_REQUEST_INVALID");
+  });
+
+  it.each([
+    ["CODEX_QUOTA_EXHAUSTED", "PROVIDER_RATE_LIMITED"],
+    ["CODEX_AUTH_UNAVAILABLE", "PROVIDER_AUTHENTICATION_FAILED"],
+    ["CODEX_MODEL_UNAVAILABLE", "UPSTREAM_UNAVAILABLE"],
+    ["CODEX_TIMEOUT", "UPSTREAM_UNAVAILABLE"],
+    ["CODEX_OUTPUT_INVALID", "UPSTREAM_UNAVAILABLE"],
+    ["CODEX_CONTAINER_TERMINATION_UNPROVEN", "UPSTREAM_UNAVAILABLE"],
+    ["CODEX_CONTAINER_LOCKED", "UPSTREAM_UNAVAILABLE"],
+    ["SECRET_DOCKER_FAILURE", "UPSTREAM_UNAVAILABLE"],
+  ] as const)("maps %s to only the safe provider error %s", async (runnerCode, safeCode) => {
+    const provider = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      run: vi.fn().mockRejectedValue(new Error(runnerCode)),
+    });
+    const iterator = provider.stream({
+      role: "NODE",
+      modelId: "gpt-5.6-sol",
+      input: "prompt",
+      maxOutputTokens: 10,
+    })[Symbol.asyncIterator]();
+
+    let caught: unknown;
+    try {
+      await iterator.next();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ message: safeCode, code: safeCode });
+    expect(String(caught)).not.toContain("SECRET");
+    expect(provider).not.toHaveProperty("fallback");
+  });
+
+  it("normalizes an unreadable runner result without exposing its error", async () => {
+    const secretResult = Object.defineProperty({}, "usage", {
+      get() {
+        throw new Error("SECRET_RUNNER_USAGE");
+      },
+    });
+    let responseReads = 0;
+    Object.defineProperty(secretResult, "response", {
+      get() {
+        responseReads += 1;
+        return "answer";
+      },
+    });
+    const provider = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      run: vi.fn().mockResolvedValue(secretResult),
+    });
+    const iterator = provider.stream({
+      role: "NODE",
+      modelId: "gpt-5.6-sol",
+      input: "prompt",
+      maxOutputTokens: 10,
+    })[Symbol.asyncIterator]();
+
+    let caught: unknown;
+    try {
+      await iterator.next();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({
+      message: "UPSTREAM_UNAVAILABLE",
+      code: "UPSTREAM_UNAVAILABLE",
+    });
+    expect(String(caught)).not.toContain("SECRET");
+    expect(responseReads).toBe(1);
+  });
+
+  it("snapshots and validates the local runner exactly once at construction", async () => {
+    const pinnedRun = vi.fn().mockResolvedValue({ response: "pinned" });
+    const swappedRun = vi.fn().mockResolvedValue({ response: "fallback" });
+    let runReads = 0;
+    const provider = createCodexCliProvider({
+      model: "gpt-5.6-sol",
+      get run() {
+        runReads += 1;
+        return runReads === 1 ? pinnedRun : swappedRun;
+      },
+    });
+    expect(runReads).toBe(1);
+
+    const events = [];
+    for await (const event of provider.stream({
+      role: "NODE",
+      modelId: "gpt-5.6-sol",
+      input: "prompt",
+      maxOutputTokens: 20,
+    })) events.push(event);
+
+    expect(runReads).toBe(1);
+    expect(pinnedRun).toHaveBeenCalledOnce();
+    expect(swappedRun).not.toHaveBeenCalled();
+    expect(events[0]).toMatchObject({ type: "DELTA", text: "pinned" });
+  });
 });
 
 describe("container-isolated Codex runner", () => {
@@ -834,11 +1099,23 @@ describe("container-isolated Codex runner", () => {
         type: "item.completed",
         item: { type: "agent_message", text: JSON.stringify({ response: "event response" }) },
       }),
-      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 12, output_tokens: 3 } }),
+      JSON.stringify({
+        type: "turn.completed",
+        usage: {
+          input_tokens: 12,
+          cached_input_tokens: 4,
+          cache_write_input_tokens: 1,
+          output_tokens: 3,
+          reasoning_output_tokens: 2,
+        },
+      }),
       "",
     ].join("\n");
     await expect(invoke(commandResult({ stdout: Buffer.from(events) })))
-      .resolves.toEqual({ response: "event response" });
+      .resolves.toEqual({
+        response: "event response",
+        usage: { inputTokens: 12, outputTokens: 3 },
+      });
     for (const invalid of [
       commandResult({ stdout: Buffer.from("not-json\n") }),
       commandResult({ stdout: Buffer.from('{"response":"answer","extra":true}\n') }),
@@ -847,6 +1124,216 @@ describe("container-isolated Codex runner", () => {
       commandResult({ stdout: Buffer.alloc(0), overflow: "STDOUT" }),
       commandResult({ stdout: Buffer.alloc(1_048_577) }),
     ]) await expect(invoke(invalid)).rejects.toThrow("CODEX_OUTPUT_INVALID");
+  });
+
+  it("returns an explicit absence of provider usage when turn completion omits it", async () => {
+    const events = [
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: JSON.stringify({ response: "no usage" }) },
+      }),
+      JSON.stringify({ type: "turn.completed" }),
+      "",
+    ].join("\n");
+
+    await expect(runIsolatedCodex({
+      role: "NODE",
+      prompt: "private prompt",
+      image: IMAGE,
+      authVolume: AUTH_VOLUME,
+      timeoutMs: 30_000,
+      controller: completedLifecycleController({ stdout: Buffer.from(events) }),
+    })).resolves.toEqual({ response: "no usage" });
+  });
+
+  it.each([
+    {
+      input_tokens: -1,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 1,
+      reasoning_output_tokens: 0,
+    },
+    {
+      input_tokens: 1,
+      cache_write_input_tokens: 0,
+      output_tokens: 1,
+      reasoning_output_tokens: 0,
+    },
+    {
+      input_tokens: 1,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 1.5,
+      reasoning_output_tokens: 0,
+    },
+    {
+      input_tokens: 1,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 1_000_000_001,
+      output_tokens: 1,
+      reasoning_output_tokens: 0,
+    },
+    {
+      input_tokens: 1,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 1,
+      reasoning_output_tokens: -1,
+    },
+    {
+      input_tokens: 1,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 1,
+      reasoning_output_tokens: 0,
+      extra: 1,
+    },
+  ])("rejects malformed reported usage before returning output: $usage", async (usage) => {
+    const events = [
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: JSON.stringify({ response: "discard me" }) },
+      }),
+      JSON.stringify({ type: "turn.completed", usage }),
+      "",
+    ].join("\n");
+
+    await expect(runIsolatedCodex({
+      role: "MAIN",
+      prompt: "private prompt",
+      image: IMAGE,
+      authVolume: AUTH_VOLUME,
+      timeoutMs: 30_000,
+      controller: completedLifecycleController({ stdout: Buffer.from(events) }),
+    })).rejects.toThrow("CODEX_OUTPUT_INVALID");
+  });
+
+  it("rejects duplicate reported usage before returning output", async () => {
+    const events = [
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: JSON.stringify({ response: "discard me" }) },
+      }),
+      JSON.stringify({
+        type: "turn.completed",
+        usage: {
+          input_tokens: 1,
+          cached_input_tokens: 0,
+          cache_write_input_tokens: 0,
+          output_tokens: 1,
+          reasoning_output_tokens: 0,
+        },
+      }),
+      JSON.stringify({
+        type: "turn.completed",
+        usage: {
+          input_tokens: 1,
+          cached_input_tokens: 0,
+          cache_write_input_tokens: 0,
+          output_tokens: 1,
+          reasoning_output_tokens: 0,
+        },
+      }),
+      "",
+    ].join("\n");
+
+    await expect(runIsolatedCodex({
+      role: "EVALUATOR",
+      prompt: "private prompt",
+      image: IMAGE,
+      authVolume: AUTH_VOLUME,
+      timeoutMs: 30_000,
+      controller: completedLifecycleController({ stdout: Buffer.from(events) }),
+    })).rejects.toThrow("CODEX_OUTPUT_INVALID");
+  });
+
+  it.each([
+    ["response", [
+      '{"response":"safe","response":"evil"}',
+    ]],
+    ["escaped response", [
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "agent_message",
+          text: '{"response":"safe","\\u0072esponse":"evil"}',
+        },
+      }),
+    ]],
+    ["event type", [
+      '{"type":"turn.started","type":"item.completed","item":{"type":"agent_message","text":"{\\"response\\":\\"evil\\"}"}}',
+    ]],
+    ["escaped event type", [
+      '{"type":"turn.started","ty\\u0070e":"item.completed","item":{"type":"agent_message","text":"{\\"response\\":\\"evil\\"}"}}',
+    ]],
+    ["event item", [
+      '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"response\\":\\"safe\\"}"},"item":{"type":"agent_message","text":"{\\"response\\":\\"evil\\"}"}}',
+    ]],
+    ...[
+      "input_tokens",
+      "cached_input_tokens",
+      "cache_write_input_tokens",
+      "output_tokens",
+      "reasoning_output_tokens",
+    ].map((key) => [key, [
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: JSON.stringify({ response: "discard me" }) },
+      }),
+      `{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"${key}":2}}`,
+    ]] as const),
+  ] as const)("rejects a duplicate JSON %s key before normalization", async (_key, lines) => {
+    await expect(runIsolatedCodex({
+      role: "NODE",
+      prompt: "private prompt",
+      image: IMAGE,
+      authVolume: AUTH_VOLUME,
+      timeoutMs: 30_000,
+      controller: completedLifecycleController({
+        stdout: Buffer.from(`${lines.join("\n")}\n`),
+      }),
+    })).rejects.toThrow("CODEX_OUTPUT_INVALID");
+  });
+
+  it("accepts escaped string content and repeated names only across distinct JSON objects", async () => {
+    const events = [
+      JSON.stringify({
+        type: "thread.started",
+        thread_id: "thread-1",
+        metadata: [{ type: "one" }, { type: "two", text: "{ \\\"type\\\": 1 }" }],
+      }),
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "agent_message",
+          text: JSON.stringify({ response: 'escaped "quote" and { brace }' }),
+        },
+      }),
+      JSON.stringify({
+        type: "turn.completed",
+        usage: {
+          input_tokens: 2,
+          cached_input_tokens: 1,
+          cache_write_input_tokens: 0,
+          output_tokens: 3,
+          reasoning_output_tokens: 1,
+        },
+      }),
+      "",
+    ].join("\n");
+
+    await expect(runIsolatedCodex({
+      role: "NODE",
+      prompt: "private prompt",
+      image: IMAGE,
+      authVolume: AUTH_VOLUME,
+      timeoutMs: 30_000,
+      controller: completedLifecycleController({ stdout: Buffer.from(events) }),
+    })).resolves.toEqual({
+      response: 'escaped "quote" and { brace }',
+      usage: { inputTokens: 2, outputTokens: 3 },
+    });
   });
 
   it("starts wait before start, handles fast exit, inspects exited, removes, and proves absence", async () => {
@@ -1401,6 +1888,7 @@ describe("container-isolated Codex runner", () => {
 
   it.each([
     { stderr: "authentication required: private detail", error: "CODEX_AUTH_UNAVAILABLE" },
+    { stderr: "usage limit reached: private detail", error: "CODEX_QUOTA_EXHAUSTED" },
     { stderr: "model gpt-5.6-sol is unavailable: private detail", error: "CODEX_MODEL_UNAVAILABLE" },
   ])("does not permanently lock after a proven $error Codex failure", async ({ stderr, error }) => {
     await expect(runIsolatedCodex({

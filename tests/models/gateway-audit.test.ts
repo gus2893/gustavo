@@ -4,6 +4,7 @@ import {
   createModelGateway,
   loadProductionModelRoleConfigs,
 } from "../../lib/server/models/gateway";
+import { createCodexCliProvider } from "../../lib/server/models/codex-cli";
 import { fakeModelProvider } from "../../lib/server/models/fake";
 import type {
   ModelProviderEvent,
@@ -52,6 +53,37 @@ async function settleWithin<Result>(
 }
 
 describe("model gateway audit", () => {
+  it("uses the Codex adapter's conservative UTF-8 input count before invoking its runner", async () => {
+    const ctx = await testContext();
+    const run = vi.fn().mockResolvedValue({ response: "unused" });
+    const provider = createCodexCliProvider({ model: "gpt-5.6-sol", run });
+    const gateway = createModelGateway(ctx.db, provider, {
+      roleConfigs: configs({
+        providerId: "codex-cli",
+        modelId: "gpt-5.6-sol",
+        maxInputTokens: 6,
+      }),
+    });
+
+    await expect(gateway.generate({
+      role: "NODE",
+      promptVersion: "p-codex-conservative-input",
+      policyVersion: "v1",
+      input: "你好!",
+    })).rejects.toThrow("MODEL_INPUT_TOKEN_LIMIT");
+    expect(run).not.toHaveBeenCalled();
+    expect(
+      await ctx.db.one(
+        `select input_tokens, completion_status, error_code from model_runs
+         where prompt_version='p-codex-conservative-input'`,
+      ),
+    ).toEqual({
+      input_tokens: 7,
+      completion_status: "TOKEN_REJECTED",
+      error_code: "MODEL_INPUT_TOKEN_LIMIT",
+    });
+  }, 30_000);
+
   it.each(roles)("records every %s generation using its role configuration", async (role) => {
     const ctx = await testContext();
     const provider = fakeModelProvider("fixed response");
@@ -1283,6 +1315,170 @@ describe("model gateway audit", () => {
       provider_reported_input_tokens: "1",
       provider_reported_output_tokens: "0",
       provider_reported_cost_microusd: "1",
+    });
+  }, 30_000);
+
+  it("snapshots and freezes reported provider metering independently of observed usage", async () => {
+    const ctx = await testContext();
+    const base = fakeModelProvider("unused");
+    const reads = {
+      providerMetering: 0,
+      status: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+    };
+    const mutableMetering = {
+      get status() {
+        reads.status += 1;
+        return reads.status === 1 ? "REPORTED" as const : "UNKNOWN" as const;
+      },
+      get inputTokens() {
+        reads.inputTokens += 1;
+        return reads.inputTokens === 1 ? 77 : -1;
+      },
+      get outputTokens() {
+        reads.outputTokens += 1;
+        return reads.outputTokens === 1 ? 9 : -1;
+      },
+    };
+    const mutableUsage = {
+      inputTokens: 1,
+      outputTokens: 0,
+      estimatedCostMicrousd: 0n,
+      get providerMetering() {
+        reads.providerMetering += 1;
+        return mutableMetering;
+      },
+    };
+    const provider: ModelProviderAdapter = {
+      ...base,
+      async *stream() {
+        yield { type: "COMPLETED", usage: mutableUsage } as ModelProviderEvent;
+      },
+    };
+    const gateway = createModelGateway(ctx.db, provider, {
+      roleConfigs: configs(),
+    });
+
+    const result = await gateway.generate({
+      role: "NODE",
+      promptVersion: "p-reported-metering",
+      policyVersion: "v1",
+      input: "test",
+    });
+    const usage = result.usage as typeof result.usage & {
+      readonly providerMetering: {
+        readonly status: "REPORTED";
+        readonly inputTokens: number;
+        readonly outputTokens: number;
+      };
+    };
+    expect(reads).toEqual({
+      providerMetering: 1,
+      status: 1,
+      inputTokens: 1,
+      outputTokens: 1,
+    });
+    expect(usage.providerMetering).toEqual({
+      status: "REPORTED",
+      inputTokens: 77,
+      outputTokens: 9,
+    });
+    expect(Object.isFrozen(usage.providerMetering)).toBe(true);
+    expect(Object.isFrozen(usage)).toBe(true);
+  }, 30_000);
+
+  it("snapshots and freezes explicit unknown metering while legacy providers stay unchanged", async () => {
+    const unknownContext = await testContext();
+    const base = fakeModelProvider("unused");
+    const unknownProvider: ModelProviderAdapter = {
+      ...base,
+      async *stream() {
+        yield {
+          type: "COMPLETED",
+          usage: {
+            inputTokens: 1,
+            outputTokens: 0,
+            estimatedCostMicrousd: 0n,
+            providerMetering: { status: "UNKNOWN" },
+          },
+        } as ModelProviderEvent;
+      },
+    };
+    const unknownResult = await createModelGateway(unknownContext.db, unknownProvider, {
+      roleConfigs: configs(),
+    }).generate({
+      role: "EVALUATOR",
+      promptVersion: "p-unknown-metering",
+      policyVersion: "v1",
+      input: "test",
+    });
+    const unknownUsage = unknownResult.usage as typeof unknownResult.usage & {
+      readonly providerMetering: { readonly status: "UNKNOWN" };
+    };
+    expect(unknownUsage.providerMetering).toEqual({ status: "UNKNOWN" });
+    expect(Object.isFrozen(unknownUsage.providerMetering)).toBe(true);
+
+    const legacyContext = await testContext();
+    const legacyResult = await createModelGateway(
+      legacyContext.db,
+      fakeModelProvider("legacy response"),
+      { roleConfigs: configs() },
+    ).generate({
+      role: "MAIN",
+      promptVersion: "p-legacy-metering",
+      policyVersion: "v1",
+      input: "test",
+    });
+    expect(legacyResult.usage).toEqual({
+      inputTokens: 1,
+      outputTokens: 2,
+      estimatedCostMicrousd: 3n,
+    });
+    expect(legacyResult.usage).not.toHaveProperty("providerMetering");
+  }, 30_000);
+
+  it.each([
+    { status: "REPORTED", inputTokens: 1 },
+    { status: "REPORTED", inputTokens: -1, outputTokens: 0 },
+    { status: "UNKNOWN", outputTokens: 0 },
+    { status: "INFERRED" },
+  ])("rejects malformed provider metering without exposing it: $status", async (providerMetering) => {
+    const ctx = await testContext();
+    const base = fakeModelProvider("unused");
+    const provider: ModelProviderAdapter = {
+      ...base,
+      async *stream() {
+        yield {
+          type: "COMPLETED",
+          usage: {
+            inputTokens: 1,
+            outputTokens: 0,
+            estimatedCostMicrousd: 0n,
+            providerMetering,
+          },
+        } as ModelProviderEvent;
+      },
+    };
+    const gateway = createModelGateway(ctx.db, provider, {
+      roleConfigs: configs(),
+    });
+
+    await expect(gateway.generate({
+      role: "NODE",
+      promptVersion: `p-malformed-metering-${String(providerMetering.status)}`,
+      policyVersion: "v1",
+      input: "test",
+    })).rejects.toThrow("MODEL_PROVIDER_EVENT_INVALID");
+    expect(
+      await ctx.db.one(
+        `select completion_status, error_code from model_runs
+         where prompt_version=$1`,
+        [`p-malformed-metering-${String(providerMetering.status)}`],
+      ),
+    ).toEqual({
+      completion_status: "FAILED",
+      error_code: "MODEL_PROVIDER_EVENT_INVALID",
     });
   }, 30_000);
 

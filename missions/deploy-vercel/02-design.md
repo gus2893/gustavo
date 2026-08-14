@@ -20,6 +20,7 @@
    - Run one Codex subprocess at a time in priority order: Node, Evaluator, Main.
    - Use standalone `codex exec` authenticated by ChatGPT sign-in. Never use an OpenAI API key, paid fallback, Ollama, or provider substitution.
    - Run that CLI only inside a pinned, ephemeral Docker container with a read-only image, a fresh tmpfs workspace, a dedicated Codex-auth volume, no repository or application-secret mounts, and container-level process/resource deadlines.
+   - Preserve bounded Codex-reported input/output token counts when the pinned CLI emits them. When it does not, return explicit `UNKNOWN` provider metering while separately retaining gateway-observed token counts; incremental billable cost is the known constant zero, never an inferred provider charge.
    - Persist prompt/output only through existing encrypted event bodies; queue rows contain identifiers, digests, leases, bounded status, and safe error codes.
 
 4. **R4 — Check the fixed 95-symbol personal-use universe every five minutes** → Story 4 / AC1–AC5.
@@ -312,6 +313,11 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
   - Revised intent: exclusive `\\.\pipe\gustavo-codex-runner-v1` ownership is required before any run/reconcile Docker action and is held through actual settlement; the fixed Docker name remains durable residue authority after a crash.
   - Test-fixture cleanup is additionally exact-ID-only and may never remove a singleton it did not successfully create and validate.
 - 2026-08-13 named-pipe authority update approved under the user's standing instruction to proceed autonomously; T7 plan delta regenerated before implementation.
+- 2026-08-13 prompt-update: add explicit provider-metering provenance after T8 proved the existing concrete-only `ModelProviderUsage` type could not represent missing Codex usage without inventing billable estimates.
+  - Previous intent: T8 would “return bounded usage metadata only when Codex reports it; otherwise return explicit unknown usage,” but the gateway required concrete token/cost values and T7 discarded validated CLI usage.
+  - Revised intent: gateway-observed bounded input/output counts remain concrete for limit enforcement and the deployment's incremental cost remains known zero; a separate frozen metering discriminator is `REPORTED` with bounded CLI counts or `UNKNOWN`. T7 preserves optional reported counts. Legacy providers may omit the discriminator and retain existing behavior.
+  - Fixed adapter deadlines are Node 90 seconds, Evaluator 180 seconds, and Main 300 seconds, all within T7's container ceiling; output-token limits remain request-scoped and are enforced before any delta/completion is exposed.
+- 2026-08-13 Codex-metering contract update approved under the user's standing instruction to proceed autonomously; T8 and the minimum gateway/runner contract tests were regenerated before production edits.
 
 ## Self-review checklist
 

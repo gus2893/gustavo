@@ -40,7 +40,16 @@ export interface ModelProviderUsage {
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly estimatedCostMicrousd: bigint;
+  readonly providerMetering?: ModelProviderMetering;
 }
+
+export type ModelProviderMetering =
+  | {
+      readonly status: "REPORTED";
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+    }
+  | { readonly status: "UNKNOWN" };
 
 export const MODEL_PROVIDER_SAFE_ERROR_CODES = [
   "UPSTREAM_UNAVAILABLE",

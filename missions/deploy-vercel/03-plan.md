@@ -490,7 +490,7 @@ Yes. It is a standalone local container boundary and does not yet read or write 
 ### T8 — Adapt isolated Codex output to the existing model gateway
 
 **Maps to:** R3, R6
-**Files touched:** `lib/server/models/codex-cli.ts` (new), `tests/bridge/codex-cli.test.ts` (modify)
+**Files touched:** `lib/server/models/codex-cli.ts` (new), `lib/server/models/types.ts` (modify), `lib/server/models/gateway.ts` (modify), `worker/hybrid/codex-runner.ts` (modify), `tests/bridge/codex-cli.test.ts` (modify), `tests/models/gateway-audit.test.ts` (modify)
 
 #### Red — failing test
 
@@ -508,19 +508,33 @@ describe("Codex model provider", () => {
       run,
     });
 
-    const response = await provider.generate({
+    const events = [];
+    for await (const event of provider.stream({
       role: "NODE",
-      prompt: "encrypted-source prompt after authorized load",
+      modelId: "gpt-5.6-sol",
+      input: "encrypted-source prompt after authorized load",
       maxOutputTokens: 800,
-      correlationId: "018f7b22-9f76-7b4d-a4e8-1a2b3c4d5e6f",
-    });
+    })) events.push(event);
 
     expect(run).toHaveBeenCalledWith(expect.objectContaining({
       role: "NODE",
       prompt: "encrypted-source prompt after authorized load",
       model: "gpt-5.6-sol",
+      timeoutMs: 90_000,
     }));
-    expect(response).toMatchObject({ text: "Node answer", provider: "codex-cli" });
+    expect(events).toEqual([
+      { type: "DELTA", text: "Node answer", outputTokens: 2 },
+      {
+        type: "COMPLETED",
+        usage: {
+          inputTokens: 5,
+          outputTokens: 2,
+          estimatedCostMicrousd: 0n,
+          providerMetering: { status: "UNKNOWN" },
+        },
+      },
+    ]);
+    expect(provider.providerId).toBe("codex-cli");
     expect(provider).not.toHaveProperty("fallback");
   });
 });
@@ -530,11 +544,14 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 
 #### Green — minimum implementation
 
-- Implement the existing `ModelProviderAdapter` shape using an injected local runner and the single configured model `gpt-5.6-sol`.
-- Map NODE, MAIN, and EVALUATOR to separate strict output schemas and existing gateway token/time limits.
-- Return bounded usage metadata only when Codex reports it; otherwise return explicit unknown usage rather than estimated billable cost.
+- Extend `ModelProviderUsage` with optional frozen `providerMetering`: `{ status: "REPORTED", inputTokens, outputTokens } | { status: "UNKNOWN" }`. Existing providers may omit it. Gateway snapshotting accepts only these exact bounded shapes, freezes nested data, retains existing observed-count/cost validation, and introduces no database/schema change.
+- Make `runIsolatedCodex` return optional exact bounded usage from the pinned CLI's `turn.completed` event (`input_tokens`, `output_tokens`) while preserving its one-response rule. Missing usage is allowed; duplicate/malformed usage remains `CODEX_OUTPUT_INVALID`.
+- Implement the existing streaming `ModelProviderAdapter` shape using an injected local runner and the single configured model `gpt-5.6-sol`. The provider has no `generate`, fallback, alternate provider, or generic execution seam.
+- Use gateway-observed deterministic input/output counts for existing bounds. `estimateMaximumCostMicrousd` and all completed usage costs are the fixed known `0n`. Preserve runner counts only inside `providerMetering: REPORTED`; otherwise emit explicit `UNKNOWN` and never invent billable usage.
+- Map NODE, EVALUATOR, MAIN to fixed deadlines 90,000 / 180,000 / 300,000 milliseconds and their T7 role schemas. Reject the wrong model or a response exceeding request `maxOutputTokens` before yielding any delta.
 - Map CLI quota/auth/model-unavailable/timeout/malformed cases to safe provider errors; do not instantiate another provider.
-- Map unproven container termination or Docker/image unavailability to a non-retryable local-provider unavailable result for that drain; never downgrade it to an ordinary model error or launch a fallback.
+- Map unproven container termination, lockout, or Docker/image unavailability to `UPSTREAM_UNAVAILABLE` and expose a bounded adapter-local unavailable classification for that drain; never downgrade it to a request error or launch a fallback.
+- Add gateway regressions proving reported/unknown metering snapshot/freeze, malformed metering fail-closed behavior, and unchanged legacy-provider results.
 
 #### Refactor
 

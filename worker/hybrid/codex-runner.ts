@@ -26,6 +26,7 @@ const MAX_STDOUT_BYTES = 1_048_576;
 const MAX_STDERR_BYTES = 65_536;
 const MAX_JSON_EVENTS = 256;
 const MAX_JSON_LINE_BYTES = 65_536;
+const MAX_JSON_DEPTH = 64;
 const MAX_RESPONSE_BYTES = 32_768;
 const MAX_USAGE_COUNT = 1_000_000_000;
 const MAX_TIMEOUT_MS = 300_000;
@@ -37,6 +38,16 @@ const EMPTY_BYTES = new Uint8Array(0);
 
 export type CodexRole = typeof ROLES[number];
 export type CodexOutputOverflow = "STDOUT" | "STDERR";
+
+export interface CodexReportedUsage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+}
+
+export interface IsolatedCodexResult {
+  readonly response: string;
+  readonly usage?: CodexReportedUsage;
+}
 
 export interface CodexContainerIdentity {
   readonly name: string;
@@ -485,31 +496,173 @@ function exactResponse(value: unknown): { readonly response: string } {
   return Object.freeze({ response: record.response });
 }
 
+function assertStrictJson(value: string): void {
+  const whitespace = (character: string | undefined): boolean =>
+    character === " " || character === "\t" || character === "\n" || character === "\r";
+  const skipWhitespace = (start: number): number => {
+    let index = start;
+    while (whitespace(value[index])) index += 1;
+    return index;
+  };
+  const stringEnd = (start: number): number => {
+    if (value[start] !== '"') throw safeError("CODEX_OUTPUT_INVALID");
+    let index = start + 1;
+    while (index < value.length) {
+      const character = value[index];
+      if (character === '"') return index + 1;
+      if (character === "\\") {
+        const escaped = value[index + 1];
+        if (escaped === "u") {
+          if (!/^[0-9a-fA-F]{4}$/u.test(value.slice(index + 2, index + 6))) {
+            throw safeError("CODEX_OUTPUT_INVALID");
+          }
+          index += 6;
+          continue;
+        }
+        if (!escaped || !'"\\/bfnrt'.includes(escaped)) {
+          throw safeError("CODEX_OUTPUT_INVALID");
+        }
+        index += 2;
+        continue;
+      }
+      if (character.charCodeAt(0) <= 0x1f) {
+        throw safeError("CODEX_OUTPUT_INVALID");
+      }
+      index += 1;
+    }
+    throw safeError("CODEX_OUTPUT_INVALID");
+  };
+  const decodedKey = (start: number, end: number): string => {
+    try {
+      const key = JSON.parse(value.slice(start, end)) as unknown;
+      if (typeof key !== "string") throw safeError("CODEX_OUTPUT_INVALID");
+      return key;
+    } catch {
+      throw safeError("CODEX_OUTPUT_INVALID");
+    }
+  };
+  const primitiveEnd = (start: number): number => {
+    let index = start;
+    while (
+      index < value.length
+      && !whitespace(value[index])
+      && value[index] !== ","
+      && value[index] !== "]"
+      && value[index] !== "}"
+    ) index += 1;
+    if (index === start) throw safeError("CODEX_OUTPUT_INVALID");
+    try {
+      const primitive = JSON.parse(value.slice(start, index)) as unknown;
+      if (
+        primitive !== null
+        && typeof primitive !== "boolean"
+        && (typeof primitive !== "number" || !Number.isFinite(primitive))
+      ) throw safeError("CODEX_OUTPUT_INVALID");
+    } catch {
+      throw safeError("CODEX_OUTPUT_INVALID");
+    }
+    return index;
+  };
+  const parseValue = (start: number, depth: number): number => {
+    if (depth > MAX_JSON_DEPTH) throw safeError("CODEX_OUTPUT_INVALID");
+    let index = skipWhitespace(start);
+    if (value[index] === '"') return stringEnd(index);
+    if (value[index] === "{") {
+      index = skipWhitespace(index + 1);
+      const keys = new Set<string>();
+      if (value[index] === "}") return index + 1;
+      for (;;) {
+        const keyStart = index;
+        const keyEnd = stringEnd(keyStart);
+        const key = decodedKey(keyStart, keyEnd);
+        if (keys.has(key)) throw safeError("CODEX_OUTPUT_INVALID");
+        keys.add(key);
+        index = skipWhitespace(keyEnd);
+        if (value[index] !== ":") throw safeError("CODEX_OUTPUT_INVALID");
+        index = skipWhitespace(parseValue(index + 1, depth + 1));
+        if (value[index] === "}") return index + 1;
+        if (value[index] !== ",") throw safeError("CODEX_OUTPUT_INVALID");
+        index = skipWhitespace(index + 1);
+      }
+    }
+    if (value[index] === "[") {
+      index = skipWhitespace(index + 1);
+      if (value[index] === "]") return index + 1;
+      for (;;) {
+        index = skipWhitespace(parseValue(index, depth + 1));
+        if (value[index] === "]") return index + 1;
+        if (value[index] !== ",") throw safeError("CODEX_OUTPUT_INVALID");
+        index = skipWhitespace(index + 1);
+      }
+    }
+    return primitiveEnd(index);
+  };
+
+  const end = skipWhitespace(parseValue(0, 0));
+  if (end !== value.length) throw safeError("CODEX_OUTPUT_INVALID");
+}
+
 function parseJson(value: string): unknown {
   try {
+    assertStrictJson(value);
     return JSON.parse(value) as unknown;
   } catch {
     throw safeError("CODEX_OUTPUT_INVALID");
   }
 }
 
-function assertUsageBounded(value: unknown): void {
+function exactUsage(value: unknown): CodexReportedUsage {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw safeError("CODEX_OUTPUT_INVALID");
   }
-  for (const count of Object.values(value as Record<string, unknown>)) {
-    if (!Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > MAX_USAGE_COUNT) {
-      throw safeError("CODEX_OUTPUT_INVALID");
-    }
+  let keys: string[];
+  let inputTokens: unknown;
+  let outputTokens: unknown;
+  let cachedInputTokens: unknown;
+  let cacheWriteInputTokens: unknown;
+  let reasoningOutputTokens: unknown;
+  try {
+    const usage = value as Record<string, unknown>;
+    keys = Object.keys(usage).sort();
+    inputTokens = Reflect.get(usage, "input_tokens");
+    outputTokens = Reflect.get(usage, "output_tokens");
+    cachedInputTokens = Reflect.get(usage, "cached_input_tokens");
+    cacheWriteInputTokens = Reflect.get(usage, "cache_write_input_tokens");
+    reasoningOutputTokens = Reflect.get(usage, "reasoning_output_tokens");
+  } catch {
+    throw safeError("CODEX_OUTPUT_INVALID");
   }
+  // @openai/codex@0.146.0 serializes this exact five-field Usage shape.
+  const counts = [
+    inputTokens,
+    cachedInputTokens,
+    cacheWriteInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+  ];
+  if (
+    keys.length !== 5
+    || keys[0] !== "cache_write_input_tokens"
+    || keys[1] !== "cached_input_tokens"
+    || keys[2] !== "input_tokens"
+    || keys[3] !== "output_tokens"
+    || keys[4] !== "reasoning_output_tokens"
+    || counts.some((count) =>
+      !Number.isSafeInteger(count)
+      || (count as number) < 0
+      || (count as number) > MAX_USAGE_COUNT)
+  ) {
+    throw safeError("CODEX_OUTPUT_INVALID");
+  }
+  return Object.freeze({
+    inputTokens: inputTokens as number,
+    outputTokens: outputTokens as number,
+  });
 }
 
 function responseFromEvent(value: unknown): { readonly response: string } | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const event = value as Record<string, unknown>;
-  if (event.type === "turn.completed" && Object.prototype.hasOwnProperty.call(event, "usage")) {
-    assertUsageBounded(event.usage);
-  }
   if (event.type !== "item.completed") return undefined;
   if (!event.item || typeof event.item !== "object" || Array.isArray(event.item)) {
     throw safeError("CODEX_OUTPUT_INVALID");
@@ -519,7 +672,7 @@ function responseFromEvent(value: unknown): { readonly response: string } | unde
   return exactResponse(parseJson(item.text));
 }
 
-function parseOutput(stdoutBytes: Uint8Array): { readonly response: string } {
+function parseOutput(stdoutBytes: Uint8Array): IsolatedCodexResult {
   if (stdoutBytes.byteLength === 0 || stdoutBytes.byteLength > MAX_STDOUT_BYTES) {
     throw safeError("CODEX_OUTPUT_INVALID");
   }
@@ -529,9 +682,20 @@ function parseOutput(stdoutBytes: Uint8Array): { readonly response: string } {
     throw safeError("CODEX_OUTPUT_INVALID");
   }
   const responses: { readonly response: string }[] = [];
+  let usage: CodexReportedUsage | undefined;
   for (const line of lines) {
     if (byteLength(line) > MAX_JSON_LINE_BYTES) throw safeError("CODEX_OUTPUT_INVALID");
     const value = parseJson(line);
+    if (
+      value
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && (value as Record<string, unknown>).type === "turn.completed"
+      && Object.prototype.hasOwnProperty.call(value, "usage")
+    ) {
+      if (usage !== undefined) throw safeError("CODEX_OUTPUT_INVALID");
+      usage = exactUsage((value as Record<string, unknown>).usage);
+    }
     if (
       value
       && typeof value === "object"
@@ -545,7 +709,10 @@ function parseOutput(stdoutBytes: Uint8Array): { readonly response: string } {
     if (response) responses.push(response);
   }
   if (responses.length !== 1) throw safeError("CODEX_OUTPUT_INVALID");
-  return responses[0];
+  return Object.freeze({
+    response: responses[0].response,
+    ...(usage === undefined ? {} : { usage }),
+  });
 }
 
 function processFailure(stderrBytes: Uint8Array): Error {
@@ -553,7 +720,10 @@ function processFailure(stderrBytes: Uint8Array): Error {
   if (/model[\s\S]{0,120}(?:unavailable|not found|unsupported|does not exist)/iu.test(stderr)) {
     return safeError("CODEX_MODEL_UNAVAILABLE");
   }
-  if (/(?:not signed in|authentication|unauthorized|login required|usage limit|quota|rate limit)/iu.test(stderr)) {
+  if (/(?:usage limit|quota|rate limit)/iu.test(stderr)) {
+    return safeError("CODEX_QUOTA_EXHAUSTED");
+  }
+  if (/(?:not signed in|authentication|unauthorized|login required)/iu.test(stderr)) {
     return safeError("CODEX_AUTH_UNAVAILABLE");
   }
   return safeError("CODEX_PROCESS_FAILED");
@@ -1410,7 +1580,7 @@ export async function reconcileCodexContainers(
 
 export async function runIsolatedCodex(
   input: RunIsolatedCodexOptions,
-): Promise<{ readonly response: string }> {
+): Promise<IsolatedCodexResult> {
   if (!ROLES.includes(input.role)) throw safeError("CODEX_ROLE_UNSUPPORTED");
   if (input.model !== undefined && input.model !== CONFIGURED_MODEL) {
     throw safeError("CODEX_MODEL_UNAVAILABLE");
