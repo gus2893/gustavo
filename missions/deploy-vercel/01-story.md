@@ -93,6 +93,7 @@ Ship a usable single-operator Gustavo production instance at `https://gustavo.lo
 - [ ] With the local computer disconnected, `https://gustavo.lol` and authenticated stored history remain reachable.
 - [ ] Chat submissions and market refreshes show an explicit local-bridge unavailable state without losing already committed messages or observations.
 - [ ] Reconnecting and signing into Windows automatically restores the bridge, market poller, and tunnel without changing the production URL.
+- [ ] Reconnect recovery never re-polls an expired five-minute market window: an incomplete retained window becomes a bounded failed summary with no latest-row mutation, while an already pruned window is skipped.
 - [ ] Replayed or expired signed bridge requests are rejected and do not start Codex work.
 - [ ] Operator health distinguishes hosted-service health from local-bridge health without returning secret values.
 
@@ -133,4 +134,4 @@ Ship a usable single-operator Gustavo production instance at `https://gustavo.lo
 
 ## Status
 
-Story approved by the user on 2026-08-13. Next: `mcax-design`.
+Story approved by the user on 2026-08-13. Recovery clarification approved on 2026-08-14 under the standing instruction to proceed autonomously. Next: `mcax-design`.

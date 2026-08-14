@@ -954,7 +954,7 @@ Yes. This task owns only encrypted projection authority and consumption material
 ### T14 — Poll the complete market window while keeping Neon disconnected during network work
 
 **Maps to:** R4, R5, R6
-**Files touched:** `worker/hybrid/market-poller.ts` (new), `lib/server/market-data/session.ts` (modify), `tests/market-data/finnhub-poller.test.ts` (modify)
+**Files touched:** `worker/hybrid/market-poller.ts` (new), `lib/server/market-data/session.ts` (modify), `db/migrations/0022_hybrid_deployment.sql` (modify), `tests/market-data/finnhub-poller.test.ts` (modify)
 
 #### Red — failing test
 
@@ -963,7 +963,12 @@ File: `tests/market-data/finnhub-poller.test.ts`
 ```ts
 import { describe, expect, it, vi } from "vitest";
 import { MARKET_UNIVERSE } from "../../config/market-universe";
-import { runMarketPollWindow } from "../../worker/hybrid/market-poller";
+import { marketWindowId } from "../../lib/server/market-data/session";
+import {
+  persistMarketPollWindow, reserveMarketPollWindow, runMarketPollWindow,
+  writeMarketHeartbeat,
+} from "../../worker/hybrid/market-poller";
+import { createConversationFixture } from "../helpers/postgres";
 
 describe("local market poller", () => {
   it("opens Neon only after all provider calls and persists one complete bounded window", async () => {
@@ -976,35 +981,69 @@ describe("local market poller", () => {
         items: MARKET_UNIVERSE.map(({ symbol, kind }) => ({
           symbol,
           kind,
-          status: "UNAVAILABLE" as const,
+          status: "PROVIDER_ERROR" as const,
           price: null,
           sourceObservedAt: null,
           safeCode: "PROVIDER_ERROR" as const,
         })),
       };
     });
+    let databaseOpen = false;
     const withDatabase = vi.fn(async (work) => {
+      expect(databaseOpen).toBe(false);
+      databaseOpen = true;
       order.push("db:open");
-      const value = await work({ marker: "db" } as never);
-      order.push("db:close");
-      return value;
+      try {
+        return await work({ marker: "db" } as never);
+      } finally {
+        databaseOpen = false;
+        order.push("db:close");
+      }
+    });
+    const reserve = vi.fn(async () => {
+      order.push("db:reserve");
+      return { disposition: "POLL" as const, windowId: "2026-08-13T13:30Z" };
     });
     const store = vi.fn(async () => { order.push("db:store"); });
 
-    await runMarketPollWindow({ poll, withDatabase, store, heartbeat: vi.fn() });
+    await runMarketPollWindow({ poll, withDatabase, reserve, store, heartbeat: vi.fn() });
 
-    expect(order).toEqual(["provider:start", "provider:finish", "db:open", "db:store", "db:close"]);
+    expect(order).toEqual([
+      "db:open", "db:reserve", "db:close",
+      "provider:start", "provider:finish",
+      "db:open", "db:store", "db:close",
+    ]);
     expect(store).toHaveBeenCalledWith({ marker: "db" }, expect.objectContaining({ callsUsed: 96 }));
   });
+
+  it("finalizes a prior-window crash as failed during reconnect recovery", async () => {
+    const fixture = await createConversationFixture("market-poller-late-recovery");
+    const windowId = marketWindowId(new Date(Date.now() - 10 * 60_000));
+    await fixture.db.transaction((database) => reserveMarketPollWindow(database, windowId));
+    const poll = vi.fn();
+
+    await expect(runMarketPollWindow({
+      withDatabase: (work) => fixture.db.transaction(work),
+      reserve: (database) => reserveMarketPollWindow(database, windowId),
+      poll,
+      store: (database, window) => persistMarketPollWindow(database, fixture.accountId, window),
+      heartbeat: writeMarketHeartbeat,
+    })).resolves.toMatchObject({
+      status: "FAILED", safeCode: "PROVIDER_ERROR", resultCount: 0, mutateLatest: false,
+    });
+    expect(poll).not.toHaveBeenCalled();
+  }, 30_000);
 });
 ```
 
-Expected initial state: module resolution fails with `Cannot find module '../../worker/hybrid/market-poller'`.
+Expected initial state: the first test fails at module resolution with `Cannot find module '../../worker/hybrid/market-poller'`; after the initial worker implementation, the recovery test fails with PostgreSQL check `market_poll_windows_check3` because database time is outside the original interval.
 
 #### Green — minimum implementation
 
 - Reserve the fixed five-minute window/quota in a short transaction, close the connection, perform status/quote work, then open one short transaction to store all 95 results, summary, counter, and MARKET heartbeat.
-- Recover incomplete windows by filling missing catalog items with a safe status; never begin a second poll for the same window.
+- Keep `COMPLETED.completed_at` inside the original five-minute interval. Permit only `PENDING`→`FAILED` late recovery with database-owned completion before `prune_after`; keep every terminal row immutable.
+- Recover a retained incomplete prior window with a failed summary and no provider call, quota re-reservation, or latest mutation. At/after `prune_after`, make it cleanup-only and never begin a second poll for that window.
+- For an in-window current poll, fill missing catalog items with a safe status and fail the summary without latest mutation.
 - If calls would exceed 96 or results differ from 95, store a failed summary without latest-row mutation.
 - Close and release the pool after each wake so the local process holds no idle Neon connection.
 - Keep the next window pending after 429/provider failure; do not increase pacing or switch provider.
@@ -1015,9 +1054,13 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 
 #### Verify
 
-Command: `pnpm vitest run tests/market-data/finnhub-poller.test.ts -t "opens Neon only after all provider calls and persists one complete bounded window"`
+Commands:
 
-Expected: one selected test passes, zero fail, exit code 0; the full Finnhub poller file passes.
+1. `pnpm vitest run tests/market-data/finnhub-poller.test.ts -t "opens Neon only after all provider calls and persists one complete bounded window"`
+2. `pnpm vitest run tests/market-data/finnhub-poller.test.ts -t "finalizes a prior-window crash as failed during reconnect recovery"`
+3. `pnpm vitest run tests/market-data/finnhub-poller.test.ts`
+
+Expected: each selected test passes with zero failures; the full Finnhub poller file passes and exits 0.
 
 #### Reviewable as a unit?
 
@@ -1071,6 +1114,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 
 - Bind only `127.0.0.1`; accept only `POST /wake`, bound body bytes, and T6 verification before calling a coalesced runtime wake.
 - Runtime startup verifies Docker Desktop, the exact locally recorded image digest, the dedicated auth volume, and absence of stale exact-label containers before it drains expired/pending work. It permits one active Codex container, coalesces additional wakes, and can run one market window independently of model work.
+- Runtime startup invokes market recovery before accepting a current market wake: retained prior windows become failed without provider calls, and pruned prior windows are cleanup-only.
 - Runtime stop aborts wake acceptance, kills/waits the exact active container, stops any poll/follow-up/pool/server, and proves no exact-label container remains inside a fixed 25-second host bound. Unproven termination leaves the CODEX component offline and blocks further claims.
 - Setup script validates a dedicated Windows account, Docker Desktop Personal, Node 24, pnpm 11, Tailscale sign-in, and owner-only local configuration before building the nested Dockerfile with `--pull --no-cache`. It records the resulting immutable local image digest, creates only the exact `gustavo-codex-auth-v1` volume, and performs interactive ChatGPT device authentication inside a one-shot container before creating the exact task.
 - Setup requires a second pooled Neon URL whose login is a member only of `gustavo_market_materializer`, stores it solely in the owner-only local worker configuration, and proves the ordinary `DATABASE_URL` cannot assume that role. Start validates `current_user`/membership in a short transaction before accepting work; missing/misgranted credentials leave market materialization offline with no ordinary-role fallback.
@@ -1288,6 +1332,7 @@ Expected initial state: module resolution fails with `Cannot find module '../../
 - Extend the account DAL with auth-first `bridge` summary and `loadAccountMarket` that returns exactly the fixed 95 safe private DTOs after key/tenant checks.
 - Add `/market` as a server-authenticated page; unauthenticated requests stop before market, heartbeat, or quote queries.
 - Render symbol, kind, price only for success, provider observation time, receipt time, age/freshness, and safe unavailable state. Never serialize ciphertext, keys, raw provider responses, hostnames, tunnel URLs, or prompt data.
+- Render a recovered failed poll summary as unavailable/stale; never relabel its previous latest rows as fresh.
 - Add a market link and bridge availability/queued status to `/chat`; keep committed USER messages visible when wake/model work is offline or quota-limited.
 - Preserve the hydration POST guard and exact Main/Node attribution behavior.
 
@@ -1492,6 +1537,7 @@ Expected initial state: `readFileSync("docs/VERCEL_DEPLOYMENT.md")` fails with `
 - Write one command-ordered runbook: create Free resources, link the existing Vercel team/project, set Node 24/Corepack, set secrets through dashboards/CLI stdin, migrate, bootstrap, install Docker Desktop/local worker, build and record the pinned local Codex image digest, create/sign into the exact auth volume, start Funnel, configure two QStash schedules, deploy Preview, smoke, promote, and verify domains.
 - Document daily/provider dashboard checks and application caps: QStash 900/day, Codex 100/day/one active, Finnhub 96/window/exactly 95 results, Redis TTL/key bounds, latest quote and seven-day poll bounds.
 - Document PC-offline behavior: public/history hosted, messages durable/queued, market stale, local health offline; document reconnect recovery.
+- Document that reconnect never re-polls an expired window: retained incomplete rows fail once before seven-day pruning, while already pruned rows are skipped and only the newly reserved current window may call Finnhub.
 - Document backup-before-cutover, flags-first rollback, exact schedule/task/Funnel cleanup, previous Ready promotion or exact safe-shell commit, and additive migration retention.
 - Add only blank secret names and deployment-profile examples to `infra/env.example`; state that the containerized standalone Codex uses interactive ChatGPT sign-in through the dedicated volume and remains an unsupported application backend. Document image rebuild/re-auth, exact-label reconciliation, and termination-failure shutdown without printing volume/image/container identifiers in application health.
 - Document creating the local-only Neon materializer login, granting only `gustavo_market_materializer`, copying its pooled URL into the protected worker configuration, rotation/revocation, and safe degradation. Explicitly forbid setting `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL` in Vercel or forwarding it to Codex/Finnhub/QStash.
@@ -1567,6 +1613,7 @@ Expected initial state: the message remains queued because no local hybrid E2E c
 - The disposable fixture creates distinct ordinary and materializer login roles, grants only the migration-created permission role to the latter, passes the materializer URL only to the local test worker, and proves an ordinary-role matching-binding forgery is rejected before the browser story.
 - Run one market wake, then verify 95 rows, timestamps/freshness, exact chat attribution, Main/Evaluator priority fixture, one active Codex container, and no local data copied at bootstrap.
 - Stop the local controller to verify hosted public/history plus queued/offline status; restart it and verify exactly-once drain/recovery.
+- Seed a retained incomplete prior market window before restart; assert recovery writes one failed summary, performs zero provider calls/latest mutations for that prior window, then allows only the newly reserved current window to poll. Repeat at the post-retention boundary and assert cleanup-only behavior.
 - Capture public request URLs, post bodies, HTML, RSC, and feed payloads and assert absence of the canary, live quote fixture, ciphertext markers, tokens, and tunnel data.
 - Reuse the existing cross-process owned-resource registry for deterministic cleanup of every child/temp resource. An opt-in real-Docker fixture proves one exact labeled descendant container is removed and no repository/application-secret mount is present.
 
@@ -1635,6 +1682,7 @@ Expected initial state: with live verification enabled before cutover, the curre
 - Link the existing Vercel team/project, set Node 24.x and `ENABLE_EXPERIMENTAL_COREPACK=1`, push the reviewed mission branch, deploy Preview, run migrations/bootstrap, and redeem the single invitation.
 - Install/sign in the isolated local worker account, Docker Desktop, the pinned local Codex image/auth volume, Tailscale, and Finnhub key; verify the recorded image digest and internal timeout, start the exact loopback/Funnel controller, and create only the 15-minute maintenance and five-minute market QStash schedules.
 - Run Preview smoke, public artifact leakage scan, authenticated chat/market/health smoke, PC-offline/reconnect recovery, container kill/wait and startup-reconciliation rehearsal, and quota boundary checks before production promotion.
+- Rehearse a retained prior market window and an already pruned one: prove no historical repoll or quota re-reservation, one bounded failed summary before retention expiry, cleanup-only afterward, and a normal current-window poll.
 - Promote that exact Ready deployment, verify apex TLS and `www` redirect, then rehearse flags-first local/schedule rollback while confirming the hosted public/history surfaces remain available; restore the verified production state afterward.
 - Run the live test with the Vercel token supplied through the process environment; never write tokens or resource URLs containing credentials to disk or command arguments.
 

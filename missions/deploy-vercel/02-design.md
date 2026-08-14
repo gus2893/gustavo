@@ -29,6 +29,7 @@
    - ETFs: `SPY, QQQ, DIA, IWM, VTI, VO, VB, VOO, IVV, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XLB, XLRE, ARKK`.
    - Keep one encrypted latest row per symbol plus bounded poll summaries. Create an append-only `market_observations` row only when a decision consumes a quote.
    - Ordinary application/database writers cannot author latest-to-observation consumption bindings. A separate local-only Neon login inherits only the `gustavo_market_materializer` NOLOGIN role and is the sole database identity permitted to create those bindings; its credential never enters Vercel.
+   - A retained incomplete window is recovered without provider calls or latest-row mutation: before its seven-day `prune_after`, it transitions once from `PENDING` to `FAILED` with a database-owned recovery completion time and bounded safe code; at or after `prune_after`, it is cleanup-only and never re-polled. `COMPLETED` windows must still finish inside their original five-minute interval.
    - Render prices/status only after operator authentication; public routes never load them.
 
 5. **R5 — Use free-tier-compatible background dispatch** → Story 5 / AC1–AC5 and Story 6 / AC1–AC4.
@@ -145,6 +146,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 - QStash wakes the local endpoint every five minutes. The worker verifies signature/replay/quota, calls market status, and skips quotes when closed.
 - When open, it schedules one quote start every three seconds with a sub-three-second timeout. Every catalog entry becomes `SUCCESS`, `UNAVAILABLE`, `RATE_LIMITED`, or `PROVIDER_ERROR`; finalization fills any missing result.
 - One short Neon transaction encrypts/upserts all latest rows, writes summary/heartbeat, then closes. No DB connection remains open while polling.
+- Startup/reconnect first reserves or inspects the exact five-minute window in a short transaction. A retained prior `PENDING` window is terminalized as `FAILED` without Finnhub work, quota re-reservation, or latest-row mutation; a prior window at/after `prune_after` is skipped for bounded cleanup. Only the current newly reserved window may proceed to provider polling.
 - Latest polling and reads use the ordinary bounded `DATABASE_URL`. Explicit decision consumption uses a separate bounded `GUSTAVO_MARKET_MATERIALIZER_DATABASE_URL`, verifies `current_user` membership inside the transaction, creates the exact binding/observation, and closes immediately. Failure or absence of that local-only credential leaves the quote unmaterialized with a safe unavailable state; it never falls back to the ordinary role.
 - `/market` authenticates before reading/decrypting and renders source time, receipt time, age, freshness, and explicit unavailable state for all 95.
 
@@ -209,6 +211,7 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
 
 - Duplicate QStash delivery uses a unique receipt; duplicate claims replay the same job/cycle/message.
 - Wake-before-visibility triggers a scan; startup/reconnect recovery finds durable jobs.
+- Market recovery never re-polls a prior window. `COMPLETED` retains the within-window completion bound; late `FAILED` recovery uses database time only before `prune_after`, remains immutable after transition, and cannot change latest rows or consume another Finnhub quota reservation.
 - Offline/auth/quota/malformed output/timeouts/429/unsupported symbol/Neon pause/Redis loss become bounded safe states without deleting history.
 - The in-container supervisor bounds Codex independently; host abort kills and waits for the exact labeled container. Unproven termination disables further claims, and partial output never commits.
 - Redis loss recovers from PostgreSQL; SSE reconnects through DB replay.
@@ -329,6 +332,11 @@ Neon is authoritative. QStash, Funnel, Redis pub/sub, and SSE accelerate deliver
   - Revised intent: the schema creates a NOLOGIN `gustavo_market_materializer` permission role; a separately authenticated local-only login is its sole member and sole binding writer. Ordinary application/Vercel identities cannot author bindings, while Node still decrypts and compares the exact latest version before materialization and replay.
   - Preserved intent: exactly 95 encrypted latest rows, no plaintext latest projection, observations only on explicit decision consumption, exact idempotent provenance, free Neon operation, privacy erasure, and no public quote redistribution remain unchanged.
 - 2026-08-14 market-materializer role update approved under the user's standing instruction to “Proceed with all without needed input”; T13, T15, T21, T22, and T23 require regeneration before their affected execution resumes.
+- 2026-08-14 prompt-update: permit bounded late failure finalization after `debug-t14-late-window-recovery.md` proved the original database clock rule made startup/reconnect recovery impossible once a five-minute window elapsed.
+  - Previous intent: “Neon is the correctness boundary: lost wake/pubsub messages leave durable work pending for startup/reconnect recovery,” while every non-pending row was forced to use current database time and every `completed_at` was constrained to the original five-minute interval.
+  - Revised intent: successful windows still complete inside their five-minute interval; a retained prior `PENDING` row may transition exactly once to `FAILED` using database time before its seven-day `prune_after`, with no provider call, latest mutation, quota re-reservation, or second poll. Rows at/after `prune_after` are cleanup-only.
+  - Preserved intent: fixed 95-symbol results for live polls, 96-call ceiling, one reservation per window, database-owned transition time, terminal immutability, seven-day summary retention, and explicit safe degraded state.
+- 2026-08-14 late-market-recovery update approved under the user's standing instruction to “Proceed with all without needed input”; T14, T15, T18, T21, T22, and T23 require regeneration before their affected execution resumes.
 
 ## Self-review checklist
 
