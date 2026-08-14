@@ -4,6 +4,9 @@
   "functions": {
     "app/api/feed/stream/route.ts": {
       "maxDuration": 60
+    },
+    "app/api/internal/maintenance/route.ts": {
+      "maxDuration": 60
     }
   }
 }

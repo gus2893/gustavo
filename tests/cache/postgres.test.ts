@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import type { Pool } from "pg";
 import { appendChallengeLedgerEvent, loadChallengeLedgerEvents, replaceProjectionCheckpoint } from "../../lib/server/challenge/ledger";
 import { INITIAL_PROFILE } from "../../lib/server/challenge/profile";
 import { replayStoredLedgerEvents } from "../../lib/server/challenge/projection";
@@ -48,6 +49,15 @@ import {
 } from "../../lib/server/cache/runtime";
 import { processNextCacheJob } from "../../worker/cache/invalidate";
 import { createConversationFixture, openTestDb, type TestDatabase } from "../helpers/postgres";
+import {
+  deadlineBoundDatabase,
+  recordMaintenanceDelivery,
+  runBoundedMaintenance,
+  settleStaleBridgeLeases,
+  withMaintenanceLock,
+} from "../../app/api/internal/maintenance/route";
+import { claimNextBridgeJob } from "../../lib/server/bridge/jobs";
+import { databaseFromPool } from "../../lib/server/db/postgres";
 
 const CACHE_KEY = Buffer.alloc(32, 19);
 const MAIN_STATE_VERSION = 8_240_001;
@@ -448,6 +458,467 @@ beforeAll(async () => {
 }, 40_000);
 
 describe("PostgreSQL cache authority", { timeout: 40_000 }, () => {
+  it("maintenance does not acquire a pooled client without connection headroom", async () => {
+    const client = {
+      query: vi.fn(async () => ({ rows: [] })),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn(async () => client),
+      query: vi.fn(async () => ({ rows: [] })),
+    } as unknown as Pool;
+    const maintenanceDb = databaseFromPool(pool, {
+      transactionBudget: {
+        remainingMilliseconds: () => 5_000,
+        expirationError: () => new Error("MAINTENANCE_DEADLINE_REACHED"),
+        maximumConnectionMilliseconds: 5_000,
+        maximumQueryMilliseconds: 5_000,
+        minimumOperationHeadroomMilliseconds: 1,
+      },
+    });
+
+    await expect(maintenanceDb.transaction(async () => "NEVER"))
+      .rejects.toThrow("MAINTENANCE_DEADLINE_REACHED");
+    expect(pool.connect).not.toHaveBeenCalled();
+    expect(client.release).not.toHaveBeenCalled();
+  });
+
+  it("maintenance bounds commit observation inside the route deadline", async () => {
+    let monotonicNow = 1_000;
+    let metricSettled = false;
+    const clientQueries: Array<{ readonly text: string; readonly query_timeout?: number }> = [];
+    const metricQueries: Array<{ readonly text: string; readonly query_timeout?: number }> = [];
+    const client = {
+      query: vi.fn(async (input: string | { readonly text: string; readonly query_timeout?: number }) => {
+        const query = typeof input === "string" ? { text: input } : input;
+        clientQueries.push(query);
+        if (query.text === "commit") monotonicNow = 9_900;
+        if (query.text.includes("database_commit_metric_buckets")) {
+          await Promise.resolve();
+          monotonicNow = 10_000;
+          metricSettled = true;
+          throw new Error("QUERY_TIMEOUT");
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn(async () => client),
+      query: vi.fn(async (input: string | { readonly text: string; readonly query_timeout?: number }) => {
+        const query = typeof input === "string" ? { text: input } : input;
+        metricQueries.push(query);
+        throw new Error("SECOND_POOL_ACQUISITION_FORBIDDEN");
+      }),
+    } as unknown as Pool;
+    const maintenanceDb = databaseFromPool(pool, {
+      transactionBudget: {
+        remainingMilliseconds: () => 10_000 - monotonicNow,
+        expirationError: () => new Error("MAINTENANCE_DEADLINE_REACHED"),
+        maximumConnectionMilliseconds: 5_000,
+        maximumQueryMilliseconds: 5_000,
+        minimumOperationHeadroomMilliseconds: 1,
+      },
+    });
+
+    await expect(runBoundedMaintenance({
+      deadline: new Date(10_000),
+      now: () => new Date(monotonicNow),
+      verify: async () => undefined,
+      withLock: async (work) => maintenanceDb.transaction(work),
+      cache: async () => ({ processed: 0 }),
+      privacy: async () => ({ processed: 0 }),
+      stream: async () => ({ processed: 0 }),
+      schedules: async () => ({ processed: 0 }),
+      bridgeLeases: async () => ({ processed: 0 }),
+    })).rejects.toThrow("MAINTENANCE_DEADLINE_REACHED");
+
+    expect(clientQueries.map(({ text }) => text)).toEqual([
+      "begin", "commit", expect.stringContaining("database_commit_metric_buckets"),
+    ]);
+    expect(clientQueries.every(({ query_timeout }) => (
+      Number.isInteger(query_timeout) && query_timeout! > 0 && query_timeout! <= 5_000
+    ))).toBe(true);
+    expect(clientQueries[2]?.query_timeout).toBeGreaterThan(0);
+    expect(clientQueries[2]?.query_timeout).toBeLessThan(100);
+    expect(metricQueries).toHaveLength(0);
+    expect(metricSettled).toBe(true);
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it("maintenance rechecks the route deadline after the locked transaction returns", async () => {
+    let now = 1_000;
+    const laterStep = vi.fn(async () => ({ processed: 0 }));
+    await expect(runBoundedMaintenance({
+      deadline: new Date(10_000),
+      now: () => new Date(now),
+      verify: async () => undefined,
+      withLock: async (work) => {
+        const result = await work();
+        now = 10_000;
+        return result;
+      },
+      cache: laterStep,
+      privacy: laterStep,
+      stream: laterStep,
+      schedules: laterStep,
+      bridgeLeases: laterStep,
+    })).rejects.toThrow("MAINTENANCE_DEADLINE_REACHED");
+    expect(laterStep).toHaveBeenCalledTimes(5);
+  });
+
+  it("maintenance treats a timed-out commit as ambiguous and never rolls it back", async () => {
+    let now = 1_000;
+    const commands: Array<{ readonly text: string; readonly query_timeout?: number }> = [];
+    const client = {
+      query: vi.fn(async (input: string | { readonly text: string; readonly query_timeout?: number }) => {
+        const query = typeof input === "string" ? { text: input } : input;
+        commands.push(query);
+        if (query.text === "commit") {
+          await Promise.resolve();
+          now = 10_000;
+          throw new Error("QUERY_TIMEOUT");
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn(async () => client),
+      query: vi.fn(async () => ({ rows: [] })),
+    } as unknown as Pool;
+    const maintenanceDb = databaseFromPool(pool, {
+      transactionBudget: {
+        remainingMilliseconds: () => 10_000 - now,
+        expirationError: () => new Error("MAINTENANCE_DEADLINE_REACHED"),
+        maximumConnectionMilliseconds: 5_000,
+        maximumQueryMilliseconds: 5_000,
+        minimumOperationHeadroomMilliseconds: 1,
+      },
+    });
+
+    await expect(maintenanceDb.transaction(async () => "AMBIGUOUS"))
+      .rejects.toThrow("MAINTENANCE_DEADLINE_REACHED");
+    expect(commands.map(({ text }) => text)).toEqual(["begin", "commit"]);
+    expect(commands[1]?.query_timeout).toBe(5_000);
+    expect(client.release).toHaveBeenCalledWith(expect.any(Error));
+    expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it("maintenance skips the observer when a successful commit reaches exact expiry", async () => {
+    let now = 1_000;
+    const commands: string[] = [];
+    const client = {
+      query: vi.fn(async (input: string | { readonly text: string }) => {
+        const text = typeof input === "string" ? input : input.text;
+        commands.push(text);
+        if (text === "commit") now = 10_000;
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn(async () => client),
+      query: vi.fn(async () => ({ rows: [] })),
+    } as unknown as Pool;
+    const maintenanceDb = databaseFromPool(pool, {
+      transactionBudget: {
+        remainingMilliseconds: () => 10_000 - now,
+        expirationError: () => new Error("MAINTENANCE_DEADLINE_REACHED"),
+        maximumConnectionMilliseconds: 5_000,
+        maximumQueryMilliseconds: 5_000,
+        minimumOperationHeadroomMilliseconds: 1,
+      },
+    });
+
+    await expect(maintenanceDb.transaction(async () => "COMMITTED"))
+      .rejects.toThrow("MAINTENANCE_DEADLINE_REACHED");
+    expect(commands).toEqual(["begin", "commit"]);
+    expect(pool.query).not.toHaveBeenCalled();
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(undefined);
+  });
+
+  it("maintenance keeps bounded commit metrics best-effort before expiry", async () => {
+    const run = async (metricFailure: boolean) => {
+      const client = {
+        query: vi.fn(async (input: string | { readonly text: string; readonly query_timeout?: number }) => {
+          const query = typeof input === "string" ? { text: input } : input;
+          if (metricFailure && query.text.includes("database_commit_metric_buckets")) {
+            throw new Error("METRIC_UNAVAILABLE");
+          }
+          return { rows: [] };
+        }),
+        release: vi.fn(),
+      };
+      const pool = {
+        connect: vi.fn(async () => client),
+        query: vi.fn(async () => { throw new Error("SECOND_POOL_ACQUISITION_FORBIDDEN"); }),
+      } as unknown as Pool;
+      const maintenanceDb = databaseFromPool(pool, {
+        transactionBudget: {
+          remainingMilliseconds: () => 9_000,
+          expirationError: () => new Error("MAINTENANCE_DEADLINE_REACHED"),
+          maximumConnectionMilliseconds: 5_000,
+          maximumQueryMilliseconds: 5_000,
+          minimumOperationHeadroomMilliseconds: 1,
+        },
+      });
+      await expect(maintenanceDb.transaction(async () => "COMMITTED"))
+        .resolves.toBe("COMMITTED");
+      expect(client.release).toHaveBeenCalledTimes(1);
+      expect(client.release).toHaveBeenCalledWith(
+        metricFailure ? expect.any(Error) : undefined,
+      );
+      expect(pool.query).not.toHaveBeenCalled();
+      const metricQuery = vi.mocked(client.query).mock.calls[2]?.[0] as unknown as {
+        readonly text: string;
+        readonly query_timeout?: number;
+      };
+      expect(metricQuery.text).toContain("database_commit_metric_buckets");
+      expect(metricQuery.query_timeout).toBe(5_000);
+    };
+
+    await run(false);
+    await run(true);
+  });
+
+  it("maintenance observes a commit without a second pooled-client acquisition", async () => {
+    let now = 1_000;
+    let metricSettled = false;
+    const clientQueries: Array<{ readonly text: string; readonly query_timeout?: number }> = [];
+    const client = {
+      query: vi.fn(async (input: string | { readonly text: string; readonly query_timeout?: number }) => {
+        const query = typeof input === "string" ? { text: input } : input;
+        clientQueries.push(query);
+        if (query.text === "commit") now = 6_000;
+        if (query.text.includes("database_commit_metric_buckets")) {
+          now += query.query_timeout!;
+          metricSettled = true;
+          throw new Error("QUERY_TIMEOUT");
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn(async () => client),
+      query: vi.fn(async (input: { readonly query_timeout?: number }) => {
+        const staleQueryTimeout = input.query_timeout!;
+        now += staleQueryTimeout;
+        now += staleQueryTimeout;
+        metricSettled = true;
+        throw new Error("QUERY_TIMEOUT");
+      }),
+    } as unknown as Pool;
+    const maintenanceDb = databaseFromPool(pool, {
+      transactionBudget: {
+        remainingMilliseconds: () => 10_000 - now,
+        expirationError: () => new Error("MAINTENANCE_DEADLINE_REACHED"),
+        maximumConnectionMilliseconds: 5_000,
+        maximumQueryMilliseconds: 5_000,
+        minimumOperationHeadroomMilliseconds: 1,
+      },
+    });
+
+    const outcome = await maintenanceDb.transaction(async () => "COMMITTED")
+      .catch((error: unknown) => error instanceof Error ? error.message : "UNKNOWN");
+
+    expect(outcome).toBe("COMMITTED");
+    expect(now).toBeLessThan(10_000);
+    expect(pool.query).not.toHaveBeenCalled();
+    expect(clientQueries.map(({ text }) => text)).toEqual([
+      "begin", "commit", expect.stringContaining("database_commit_metric_buckets"),
+    ]);
+    expect(metricSettled).toBe(true);
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("maintenance bounds rollback before returning an application failure", async () => {
+    let now = 1_000;
+    const commands: Array<{ readonly text: string; readonly query_timeout?: number }> = [];
+    const client = {
+      query: vi.fn(async (input: string | { readonly text: string; readonly query_timeout?: number }) => {
+        const query = typeof input === "string" ? { text: input } : input;
+        commands.push(query);
+        return { rows: [] };
+      }),
+      release: vi.fn(),
+    };
+    const pool = {
+      connect: vi.fn(async () => client),
+      query: vi.fn(async () => ({ rows: [] })),
+    } as unknown as Pool;
+    const maintenanceDb = databaseFromPool(pool, {
+      transactionBudget: {
+        remainingMilliseconds: () => 10_000 - now,
+        expirationError: () => new Error("MAINTENANCE_DEADLINE_REACHED"),
+        maximumConnectionMilliseconds: 5_000,
+        maximumQueryMilliseconds: 5_000,
+        minimumOperationHeadroomMilliseconds: 1,
+      },
+    });
+
+    await expect(maintenanceDb.transaction(async () => {
+      now = 9_900;
+      throw new Error("WORK_FAILED");
+    })).rejects.toThrow("WORK_FAILED");
+    expect(commands.map(({ text }) => text)).toEqual(["begin", "rollback"]);
+    expect(commands[1]?.query_timeout).toBeGreaterThan(0);
+    expect(commands[1]?.query_timeout).toBeLessThan(100);
+    expect(client.release).toHaveBeenCalledWith(undefined);
+  });
+
+  it("maintenance uses one non-blocking PostgreSQL overlap lock", async () => {
+    let entered!: () => void;
+    const lockEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const first = withMaintenanceLock(db, async () => {
+      entered();
+      await released;
+      return "FIRST";
+    });
+    await lockEntered;
+
+    await expect(withMaintenanceLock(db, async () => "SECOND")).resolves.toBeNull();
+    release();
+    await expect(first).resolves.toBe("FIRST");
+  });
+
+  it("maintenance records replay once and terminalizes bounded exhausted leases", async () => {
+    const retainedRootKey = process.env.GUSTAVO_EVENT_ROOT_KEY_V1;
+    const maintenanceDb = await openTestDb();
+    try {
+      const fixture = await createConversationFixture(
+        "cache-maintenance-stale-lease", maintenanceDb,
+      );
+      await appendMessage(fixture, {
+        role: "USER", text: "maintenance lease", idempotencyKey: "maintenance-lease-source",
+      });
+      const expire = async (jobId: string) => {
+        await maintenanceDb.transaction(async (transaction) => {
+          await transaction.query(
+            "alter table bridge_model_jobs disable trigger bridge_model_jobs_are_semantically_immutable",
+          );
+          await transaction.query(
+            `update bridge_model_jobs set updated_at=created_at,
+               lease_expires_at=created_at+interval '1 millisecond' where job_id=$1`,
+            [jobId],
+          );
+          await transaction.query(
+            "alter table bridge_model_jobs enable trigger bridge_model_jobs_are_semantically_immutable",
+          );
+        });
+      };
+      const first = await claimNextBridgeJob(maintenanceDb, {
+        workerId: "maintenance-local-1", now: new Date(),
+      });
+      await expire(first!.jobId);
+      const second = await claimNextBridgeJob(maintenanceDb, {
+        workerId: "maintenance-local-2", now: new Date(),
+      });
+      await expire(second!.jobId);
+      const third = await claimNextBridgeJob(maintenanceDb, {
+        workerId: "maintenance-local-3", now: new Date(),
+      });
+      await expire(third!.jobId);
+
+      const delivery = {
+        messageId: "maintenance-replay-authority-1",
+        bodyDigest: "a".repeat(64),
+        publishedAt: new Date(),
+      } as const;
+      await expect(withMaintenanceLock(maintenanceDb, async (transaction) => {
+        await recordMaintenanceDelivery(transaction, delivery);
+        return settleStaleBridgeLeases(transaction, 8);
+      })).resolves.toEqual({ processed: 1 });
+      await expect(maintenanceDb.one(
+        "select status,safe_code from bridge_model_jobs where job_id=$1", [third!.jobId],
+      )).resolves.toEqual({ status: "FAILED", safe_code: "ATTEMPT_LIMIT_EXHAUSTED" });
+      await expect(withMaintenanceLock(maintenanceDb, async (transaction) => {
+        await recordMaintenanceDelivery(transaction, delivery);
+        return settleStaleBridgeLeases(transaction, 8);
+      })).rejects.toThrow("MAINTENANCE_REQUEST_REPLAYED");
+      await expect(maintenanceDb.one<{ readonly used_count: number }>(
+        `select used_count from deployment_quota_counters
+          where quota_name='QSTASH_MESSAGES'
+            and bucket_date=(clock_timestamp() at time zone 'UTC')::date`,
+      )).resolves.toEqual({ used_count: 1 });
+    } finally {
+      if (retainedRootKey === undefined) delete process.env.GUSTAVO_EVENT_ROOT_KEY_V1;
+      else process.env.GUSTAVO_EVENT_ROOT_KEY_V1 = retainedRootKey;
+    }
+  }, 60_000);
+
+  it("maintenance deadline rejects deferred statements and rolls back receipt and quota", async () => {
+    const retainedRootKey = process.env.GUSTAVO_EVENT_ROOT_KEY_V1;
+    const deadlineDb = await openTestDb();
+    let monotonicNow = 1_000;
+    const delivery = {
+      messageId: "maintenance-deadline-rollback-1",
+      bodyDigest: "b".repeat(64),
+      publishedAt: new Date(),
+    } as const;
+    try {
+      await expect(withMaintenanceLock(deadlineDb, async (transaction) => {
+        const bounded = deadlineBoundDatabase(transaction, {
+          deadlineMonotonicMs: 2_000,
+          monotonicNow: () => monotonicNow,
+        });
+        await recordMaintenanceDelivery(bounded, delivery);
+        await bounded.transaction(async (nested) => {
+          monotonicNow = 2_000;
+          await settleStaleBridgeLeases(nested, 8);
+        });
+      })).rejects.toThrow("MAINTENANCE_DEADLINE_REACHED");
+      await expect(deadlineDb.one<{ readonly receipts: number; readonly quota: number }>(
+        `select
+           (select count(*)::int from bridge_wake_receipts where message_id=$1) receipts,
+           (select count(*)::int from deployment_quota_counters
+             where quota_name='QSTASH_MESSAGES') quota`,
+        [delivery.messageId],
+      )).resolves.toEqual({ receipts: 0, quota: 0 });
+    } finally {
+      if (retainedRootKey === undefined) delete process.env.GUSTAVO_EVENT_ROOT_KEY_V1;
+      else process.env.GUSTAVO_EVENT_ROOT_KEY_V1 = retainedRootKey;
+    }
+  }, 60_000);
+
+  it("maintenance deadline rolls back when the final statement reaches expiry before commit", async () => {
+    const retainedRootKey = process.env.GUSTAVO_EVENT_ROOT_KEY_V1;
+    const finalStatementDb = await openTestDb();
+    let monotonicNow = 3_000;
+    const delivery = {
+      messageId: "maintenance-final-statement-rollback-1",
+      bodyDigest: "c".repeat(64),
+      publishedAt: new Date(),
+    } as const;
+    try {
+      const bounded = deadlineBoundDatabase(finalStatementDb, {
+        deadlineMonotonicMs: 4_000,
+        monotonicNow: () => monotonicNow,
+      });
+      await expect(withMaintenanceLock(bounded, async (transaction) => {
+        await recordMaintenanceDelivery(transaction, delivery);
+        await transaction.query("select 1 as final_statement");
+        monotonicNow = 4_000;
+        return "SHOULD_NOT_COMMIT";
+      })).rejects.toThrow("MAINTENANCE_DEADLINE_REACHED");
+      await expect(finalStatementDb.one<{ readonly receipts: number; readonly quota: number }>(
+        `select
+           (select count(*)::int from bridge_wake_receipts where message_id=$1) receipts,
+           (select count(*)::int from deployment_quota_counters
+             where quota_name='QSTASH_MESSAGES') quota`,
+        [delivery.messageId],
+      )).resolves.toEqual({ receipts: 0, quota: 0 });
+    } finally {
+      if (retainedRootKey === undefined) delete process.env.GUSTAVO_EVENT_ROOT_KEY_V1;
+      else process.env.GUSTAVO_EVENT_ROOT_KEY_V1 = retainedRootKey;
+    }
+  }, 60_000);
+
   it("builds bounded source-linked records and independent required category manifests", async () => {
     const source = createPostgresProjectionSource(db);
     const manifest = await source.readManifest("CURRENT");

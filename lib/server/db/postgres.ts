@@ -1,5 +1,11 @@
 import { attachDatabasePool as attachVercelDatabasePool } from "@vercel/functions";
-import { Pool, type PoolClient, type PoolConfig, type QueryResultRow } from "pg";
+import {
+  Pool,
+  type PoolClient,
+  type PoolConfig,
+  type QueryConfig,
+  type QueryResultRow,
+} from "pg";
 import type { EventDatabase } from "../events/types";
 import type { CommitMeasurement } from "../observability/metrics";
 
@@ -12,6 +18,18 @@ interface Queryable {
 
 let sharedPool: Pool | undefined;
 let sharedDatabase: EventDatabase | undefined;
+
+export interface DatabaseTransactionBudget {
+  readonly remainingMilliseconds: () => number;
+  readonly expirationError: () => Error;
+  readonly maximumConnectionMilliseconds: number;
+  readonly maximumQueryMilliseconds: number;
+  readonly minimumOperationHeadroomMilliseconds: number;
+}
+
+export interface DatabaseAccessOptions {
+  readonly transactionBudget?: DatabaseTransactionBudget;
+}
 
 const COMMIT_LATENCY_BUCKETS_MS = Object.freeze([
   1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
@@ -34,6 +52,80 @@ async function persistCommitMeasurement(pool: Pool, measurement: CommitMeasureme
          value_max=greatest(database_commit_metric_buckets.value_max,excluded.value_max),
          observed_at=excluded.observed_at`,
     [measurement.outcome, latencyBucketMs, durationMs],
+  );
+}
+
+type TimeoutQueryConfig = QueryConfig<unknown[]> & { readonly query_timeout: number };
+
+function remainingQueryTimeout(budget: DatabaseTransactionBudget): number {
+  const remainingMilliseconds = budget.remainingMilliseconds();
+  if (!Number.isFinite(remainingMilliseconds)) throw budget.expirationError();
+  const timeout = Math.min(
+    budget.maximumQueryMilliseconds,
+    Math.floor(remainingMilliseconds - budget.minimumOperationHeadroomMilliseconds),
+  );
+  if (!Number.isSafeInteger(timeout) || timeout <= 0) throw budget.expirationError();
+  return timeout;
+}
+
+function assertRemainingBudget(budget: DatabaseTransactionBudget): void {
+  const remainingMilliseconds = budget.remainingMilliseconds();
+  if (!Number.isFinite(remainingMilliseconds) || remainingMilliseconds <= 0) {
+    throw budget.expirationError();
+  }
+}
+
+function assertConnectionHeadroom(budget: DatabaseTransactionBudget): void {
+  const remainingMilliseconds = budget.remainingMilliseconds();
+  if (!Number.isFinite(remainingMilliseconds)
+      || remainingMilliseconds - budget.minimumOperationHeadroomMilliseconds
+        <= budget.maximumConnectionMilliseconds) {
+    throw budget.expirationError();
+  }
+}
+
+async function boundedQuery(
+  queryable: Pool | PoolClient,
+  text: string,
+  budget: DatabaseTransactionBudget,
+  values?: unknown[],
+  onResolved?: () => void,
+): Promise<void> {
+  const query: TimeoutQueryConfig = {
+    text,
+    ...(values ? { values } : {}),
+    query_timeout: remainingQueryTimeout(budget),
+  };
+  await queryable.query(query);
+  onResolved?.();
+  assertRemainingBudget(budget);
+}
+
+async function persistBoundedCommitMeasurement(
+  queryable: Pool | PoolClient,
+  measurement: CommitMeasurement,
+  budget: DatabaseTransactionBudget,
+  onResolved?: () => void,
+): Promise<void> {
+  const durationMs = Math.max(0, measurement.durationMs);
+  const latencyBucketMs = COMMIT_LATENCY_BUCKETS_MS.find((upper) => durationMs <= upper) ?? 60_000;
+  await boundedQuery(
+    queryable,
+    `with pruned as (
+       delete from database_commit_metric_buckets
+       where bucket_start<date_trunc('minute',clock_timestamp()-interval '48 hours')
+     )
+     insert into database_commit_metric_buckets (
+       outcome,latency_bucket_ms,bucket_start,sample_count,value_sum,value_max,observed_at
+     ) values ($1,$2,date_trunc('minute',clock_timestamp()),1,$3,$3,clock_timestamp())
+     on conflict (outcome,latency_bucket_ms,bucket_start) do update
+     set sample_count=database_commit_metric_buckets.sample_count+1,
+         value_sum=database_commit_metric_buckets.value_sum+excluded.value_sum,
+         value_max=greatest(database_commit_metric_buckets.value_max,excluded.value_max),
+         observed_at=excluded.observed_at`,
+    budget,
+    [measurement.outcome, latencyBucketMs, durationMs],
+    onResolved,
   );
 }
 
@@ -71,7 +163,88 @@ function clientDatabase(client: PoolClient): EventDatabase {
   return database;
 }
 
-export function databaseFromPool(pool: Pool): EventDatabase {
+export function databaseFromPool(pool: Pool, options: DatabaseAccessOptions = {}): EventDatabase {
+  const transactionBudget = options.transactionBudget;
+  if (transactionBudget) {
+    if (!Number.isSafeInteger(transactionBudget.maximumConnectionMilliseconds)
+        || transactionBudget.maximumConnectionMilliseconds <= 0
+        || !Number.isSafeInteger(transactionBudget.maximumQueryMilliseconds)
+        || transactionBudget.maximumQueryMilliseconds <= 0
+        || !Number.isSafeInteger(transactionBudget.minimumOperationHeadroomMilliseconds)
+        || transactionBudget.minimumOperationHeadroomMilliseconds < 0) {
+      throw new Error("DATABASE_TRANSACTION_BUDGET_INVALID");
+    }
+    return databaseFor(pool, async (work) => {
+      assertRemainingBudget(transactionBudget);
+      const { measureCommit } = await import("../observability/metrics");
+      assertConnectionHeadroom(transactionBudget);
+      const client = await pool.connect();
+      let commitAttempted = false;
+      let committed = false;
+      let commitMeasurement: CommitMeasurement | undefined;
+      let releaseError: Error | undefined;
+      let transactionError: unknown;
+      let result: Awaited<ReturnType<typeof work>> | undefined;
+      try {
+        try {
+          await boundedQuery(client, "begin", transactionBudget);
+          result = await work(clientDatabase(client));
+          assertRemainingBudget(transactionBudget);
+          commitAttempted = true;
+          await measureCommit(
+            () => boundedQuery(
+              client, "commit", transactionBudget, undefined, () => { committed = true; },
+            ),
+            (measurement) => { commitMeasurement = measurement; },
+          );
+          assertRemainingBudget(transactionBudget);
+        } catch (error) {
+          transactionError = error;
+          if (!commitAttempted) {
+            try {
+              await boundedQuery(client, "rollback", transactionBudget);
+            } catch (rollbackError) {
+              releaseError = rollbackError instanceof Error
+                ? rollbackError
+                : new Error("DATABASE_ROLLBACK_FAILED");
+            }
+          } else if (!committed) {
+            releaseError = error instanceof Error ? error : new Error("DATABASE_COMMIT_FAILED");
+          }
+        }
+
+        if (transactionError === undefined && committed && commitMeasurement) {
+          let metricResolved = false;
+          try {
+            await persistBoundedCommitMeasurement(
+              client, commitMeasurement, transactionBudget, () => { metricResolved = true; },
+            );
+          } catch (error) {
+            if (!metricResolved) {
+              releaseError = error instanceof Error
+                ? error
+                : new Error("DATABASE_COMMIT_METRIC_FAILED");
+            }
+            try {
+              assertRemainingBudget(transactionBudget);
+            } catch (deadlineError) {
+              transactionError = deadlineError;
+            }
+          }
+        }
+
+        try {
+          assertRemainingBudget(transactionBudget);
+        } catch (error) {
+          transactionError = error;
+        }
+        if (transactionError !== undefined) throw transactionError;
+        return result as Awaited<ReturnType<typeof work>>;
+      } finally {
+        client.release(releaseError);
+      }
+    });
+  }
   return databaseFor(pool, async (work) => {
     // Resolve the observer before opening a transaction so first-load module work
     // can never extend the database transaction lifetime.
@@ -135,12 +308,14 @@ function configuredPool(): Pool {
   return pool;
 }
 
-export function getDatabase(): EventDatabase {
+export function getDatabase(options: DatabaseAccessOptions = {}): EventDatabase {
   if (!sharedDatabase) {
     sharedPool = configuredPool();
     sharedDatabase = databaseFromPool(sharedPool);
   }
-  return sharedDatabase;
+  return options.transactionBudget
+    ? databaseFromPool(sharedPool!, options)
+    : sharedDatabase;
 }
 
 export async function closeDatabase(): Promise<void> {

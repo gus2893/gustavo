@@ -1,5 +1,13 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  MAINTENANCE_BODY,
+  MAINTENANCE_PRODUCTION_URL,
+  createMaintenanceHandler,
+  runBoundedMaintenance,
+  verifyMaintenanceRequest,
+} from "../../app/api/internal/maintenance/route";
 import { appendEvent, readEventBody } from "../../lib/server/events/store";
 import { canonicalJson } from "../../lib/server/events/integrity";
 import type { EventDatabase } from "../../lib/server/events/types";
@@ -70,6 +78,222 @@ import { POST as postMemory } from "../../app/api/memory/route";
 import { appendMessage } from "../../lib/server/history/messages";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+describe("Vercel one-shot maintenance", () => {
+  it("verifies first, holds one overlap lock, and stops all steps before 55 seconds", async () => {
+    const order: string[] = [];
+    const verify = vi.fn(async () => { order.push("verify"); });
+    const withLock = vi.fn(async (work) => {
+      order.push("lock");
+      return work();
+    });
+    const step = (name: string) => vi.fn(async () => {
+      order.push(name);
+      return { processed: 1 };
+    });
+    const result = await runBoundedMaintenance({
+      deadline: new Date("2026-08-13T12:00:54.000Z"),
+      now: () => new Date("2026-08-13T12:00:00.000Z"),
+      verify,
+      withLock,
+      cache: step("cache"),
+      privacy: step("privacy"),
+      stream: step("stream"),
+      schedules: step("schedules"),
+      bridgeLeases: step("bridgeLeases"),
+    });
+
+    expect(order).toEqual([
+      "verify", "lock", "cache", "privacy", "stream", "schedules", "bridgeLeases",
+    ]);
+    expect(result).toEqual({ processed: 5, deadlineReached: false });
+    const vercel = JSON.parse(readFileSync("vercel.json", "utf8")) as {
+      readonly functions?: Readonly<Record<string, unknown>>;
+    };
+    expect(vercel.functions).toMatchObject({
+      "app/api/feed/stream/route.ts": { maxDuration: 60 },
+      "app/api/internal/maintenance/route.ts": { maxDuration: 60 },
+    });
+  });
+
+  it("rejects every non-exact maintenance request before database work", async () => {
+    const now = new Date();
+    const currentSigningKey = "maintenance-current-signing-key-at-least-32-bytes";
+    const nextSigningKey = "maintenance-next-signing-key-at-least-32-bytes";
+    const encode = (value: unknown) => Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+    const sign = (url: string, body: string, messageId: string) => {
+      const issuedAt = Math.floor(now.getTime() / 1_000) - 1;
+      const unsigned = `${encode({ alg: "HS256", typ: "JWT" })}.${encode({
+        iss: "Upstash",
+        sub: url,
+        body: createHash("sha256").update(body, "utf8").digest("base64url"),
+        iat: issuedAt,
+        nbf: issuedAt - 1,
+        exp: issuedAt + 3_600,
+        jti: messageId,
+      })}`;
+      return `${unsigned}.${createHmac("sha256", currentSigningKey).update(unsigned).digest("base64url")}`;
+    };
+    const request = (url: string, body: string, signedUrl = url, signedBody = body) => new Request(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "upstash-message-id": "maintenance-delivery-1",
+        "upstash-signature": sign(signedUrl, signedBody, "maintenance-signed-1"),
+      },
+      body,
+    });
+    const options = { now, currentSigningKey, nextSigningKey } as const;
+
+    await expect(verifyMaintenanceRequest(
+      request(MAINTENANCE_PRODUCTION_URL, MAINTENANCE_BODY), options,
+    )).resolves.toMatchObject({ messageId: "maintenance-signed-1" });
+    await expect(verifyMaintenanceRequest(
+      request("https://preview.example.test/api/internal/maintenance", MAINTENANCE_BODY), options,
+    )).rejects.toThrow("MAINTENANCE_REQUEST_UNAUTHORIZED");
+    await expect(verifyMaintenanceRequest(
+      request(MAINTENANCE_PRODUCTION_URL, "{}", MAINTENANCE_PRODUCTION_URL, MAINTENANCE_BODY),
+      options,
+    )).rejects.toThrow("MAINTENANCE_REQUEST_UNAUTHORIZED");
+    await expect(verifyMaintenanceRequest(
+      request(MAINTENANCE_PRODUCTION_URL, MAINTENANCE_BODY,
+        MAINTENANCE_PRODUCTION_URL, "{}"), options,
+    )).rejects.toThrow("MAINTENANCE_REQUEST_UNAUTHORIZED");
+  });
+
+  it("cancels a stalled maintenance body at the overall deadline", async () => {
+    let close!: () => void;
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { close = () => controller.close(); },
+      pull() { /* Intentionally stalled until abort or test cleanup. */ },
+      cancel,
+    });
+    const request = new Request(MAINTENANCE_PRODUCTION_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "upstash-message-id": "maintenance-stalled-delivery",
+        "upstash-signature": "header.payload.signature",
+      },
+      body,
+      duplex: "half",
+    } as RequestInit & { readonly duplex: "half" });
+    const controller = new AbortController();
+    const verifying = verifyMaintenanceRequest(request, {
+      now: new Date(),
+      currentSigningKey: "maintenance-current-signing-key-at-least-32-bytes",
+      nextSigningKey: "maintenance-next-signing-key-at-least-32-bytes",
+      signal: controller.signal,
+    }).then(() => "accepted", (error: unknown) => (
+      error instanceof Error ? error.message : "unknown"
+    ));
+    controller.abort(new Error("MAINTENANCE_DEADLINE_REACHED"));
+    const outcome = await Promise.race([
+      verifying,
+      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 25)),
+    ]);
+    if (outcome === "pending") close();
+    await verifying;
+
+    expect(outcome).toBe("MAINTENANCE_DEADLINE_REACHED");
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports overlap distinctly and rejects invalid aggregate counts", async () => {
+    const base = {
+      deadline: new Date("2026-08-13T12:00:54.000Z"),
+      now: () => new Date("2026-08-13T12:00:00.000Z"),
+      verify: vi.fn(async () => undefined),
+      cache: vi.fn(async () => ({ processed: 0 })),
+      privacy: vi.fn(async () => ({ processed: 0 })),
+      stream: vi.fn(async () => ({ processed: 0 })),
+      schedules: vi.fn(async () => ({ processed: 0 })),
+      bridgeLeases: vi.fn(async () => ({ processed: 0 })),
+    } as const;
+    await expect(runBoundedMaintenance({
+      ...base,
+      withLock: vi.fn(async () => null),
+    })).resolves.toEqual({ processed: 0, deadlineReached: false, overlap: true });
+    await expect(runBoundedMaintenance({
+      ...base,
+      withLock: vi.fn(async (work) => work()),
+      cache: vi.fn(async () => ({ processed: -1 })),
+    })).rejects.toThrow("MAINTENANCE_STEP_RESULT_INVALID");
+
+    let current = new Date("2026-08-13T12:00:00.000Z");
+    const later = vi.fn(async () => ({ processed: 1 }));
+    await expect(runBoundedMaintenance({
+      ...base,
+      now: () => current,
+      withLock: vi.fn(async (work) => work()),
+      cache: vi.fn(async () => {
+        current = new Date("2026-08-13T12:00:54.000Z");
+        return { processed: 1 };
+      }),
+      privacy: later,
+      stream: later,
+      schedules: later,
+      bridgeLeases: later,
+    })).rejects.toThrow("MAINTENANCE_DEADLINE_REACHED");
+    expect(later).not.toHaveBeenCalled();
+  });
+
+  it("returns only no-store aggregate statuses and generic failures", async () => {
+    const request = new Request(MAINTENANCE_PRODUCTION_URL, {
+      method: "POST", body: MAINTENANCE_BODY,
+    });
+    const logged: string[] = [];
+    const response = async (result: Parameters<typeof createMaintenanceHandler>[0]["run"]) => (
+      createMaintenanceHandler({
+        now: () => new Date("2026-08-13T12:00:00.000Z"),
+        run: result,
+        log: (code) => { logged.push(code); },
+      })(request.clone())
+    );
+
+    const processed = await response(async () => ({ processed: 5, deadlineReached: false }));
+    expect(processed.status).toBe(200);
+    expect(processed.headers.get("cache-control")).toBe("no-store");
+    expect(await processed.json()).toEqual({ processed: 5, deadlineReached: false });
+
+    const idle = await response(async () => ({ processed: 0, deadlineReached: false }));
+    expect(idle.status).toBe(204);
+    expect(await idle.text()).toBe("");
+
+    const overlap = await response(async () => ({
+      processed: 0, deadlineReached: false, overlap: true,
+    }));
+    expect(overlap.status).toBe(409);
+    expect(await overlap.json()).toEqual({ code: "MAINTENANCE_OVERLAP" });
+
+    const unauthorized = await response(async () => {
+      throw new Error("MAINTENANCE_REQUEST_UNAUTHORIZED");
+    });
+    expect(unauthorized.status).toBe(401);
+    expect(await unauthorized.json()).toEqual({ code: "MAINTENANCE_UNAUTHORIZED" });
+
+    const replay = await response(async () => {
+      throw new Error("MAINTENANCE_REQUEST_REPLAYED");
+    });
+    expect(replay.status).toBe(204);
+    expect(await replay.text()).toBe("");
+
+    const deadline = await response(async () => {
+      throw new Error("MAINTENANCE_DEADLINE_REACHED");
+    });
+    expect(deadline.status).toBe(503);
+    expect(await deadline.json()).toEqual({ code: "MAINTENANCE_UNAVAILABLE" });
+
+    const failed = await response(async () => {
+      throw new Error("private tenant database detail");
+    });
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toEqual({ code: "MAINTENANCE_UNAVAILABLE" });
+    expect(logged).toEqual(["MAINTENANCE_FAILED", "MAINTENANCE_FAILED"]);
+    expect(JSON.stringify([...processed.headers, ...failed.headers])).not.toContain("private tenant");
+  });
+});
 
 afterEach(() => {
   exportRouteState.db = undefined;
